@@ -1,0 +1,15 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: amr-exporter
+resources:
+  - namespace.yaml
+  - serviceaccount.yaml
+  - shared-secret.yaml
+  - clusters-config.yaml
+  - ../../base
+images:
+  - name: amr-slowquery-exporter
+    newName: ${IMAGE_REPO}
+    newTag: ${IMAGE_TAG}
+patches:
+  - path: replicas-patch.yaml

@@ -1,0 +1,62 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: amr-slowquery-exporter
+  labels:
+    app: amr-slowquery-exporter
+spec:
+  serviceName: amr-slowquery-exporter
+  replicas: 1  # override in overlay to match cluster count
+  selector:
+    matchLabels:
+      app: amr-slowquery-exporter
+  template:
+    metadata:
+      labels:
+        app: amr-slowquery-exporter
+        azure.workload.identity/use: "true"
+    spec:
+      serviceAccountName: amr-slowquery-exporter
+      securityContext:
+        runAsUser: 65534
+        runAsGroup: 65534
+        fsGroup: 65534
+      containers:
+        - name: exporter
+          image: amr-slowquery-exporter:latest
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: CLUSTERS_CONFIG_FILE
+              value: /config/clusters.json
+          envFrom:
+            - secretRef:
+                name: amr-slowquery-shared
+          volumeMounts:
+            - name: clusters-config
+              mountPath: /config
+              readOnly: true
+            - name: data
+              mountPath: /data
+          resources:
+            requests:
+              cpu: 20m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+      volumes:
+        - name: clusters-config
+          secret:
+            secretName: amr-clusters-config
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 1Gi

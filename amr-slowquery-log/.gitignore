@@ -1,0 +1,21 @@
+# Local dev config — contains real credentials, never commit
+.env
+.claude
+
+# Generated Kustomize overlay — built from k8s/overlays/template via envsubst
+k8s/overlays/prod/
+
+# Runtime output
+*.jsonl
+.slowquery_state.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Editor
+.vscode/
+.idea/

@@ -10,19 +10,19 @@
 
 **跨集群概览** — KPI 指标卡 + 集群对比表
 
-![跨集群概览](docs/overview.png)
+![跨集群概览](https://raw.githubusercontent.com/lprincewhn/azureops/main/amr-slowquery-log/docs/overview.png)
 
 **趋势分析** — 慢查询次数与平均耗时并排时序图
 
-![趋势分析](docs/trend.png)
+![趋势分析](https://raw.githubusercontent.com/lprincewhn/azureops/main/amr-slowquery-log/docs/trend.png)
 
 **命令分析** — Top 20 慢命令表格与命令分布饼图
 
-![命令分析](docs/command.png)
+![命令分析](https://raw.githubusercontent.com/lprincewhn/azureops/main/amr-slowquery-log/docs/command.png)
 
 **明细查询** — 全量明细，支持列筛选，按耗时降序
 
-![明细查询](docs/details.png)
+![明细查询](https://raw.githubusercontent.com/lprincewhn/azureops/main/amr-slowquery-log/docs/details.png)
 
 ---
 
@@ -30,9 +30,9 @@
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│  AKS 集群  namespace: amr-exporter                                  │
+│  AKS namespace: amr-exporter                                        │
 │                                                                     │
-│  StatefulSet: amr-slowquery-exporter (replicas = 集群数量)          │
+│  StatefulSet: amr-slowquery-exporter (replicas = Number of ARM)     │
 │  ┌──────────────────────┐  ┌──────────────────────┐                 │
 │  │  Pod-0               │  │  Pod-1               │  ...            │
 │  │  → clusters.json[0]  │  │  → clusters.json[1]  │                 │
@@ -155,6 +155,12 @@ k8s/
 ```
 
 单集群快速部署可直接使用根目录的 `k8s.yaml`（all-in-one）。
+
+---
+
+## 部署步骤
+
+详见 [部署指南](https://github.com/lprincewhn/azureops/tree/main/amr-slowquery-log/docs/deployment.md)。
 
 ---
 

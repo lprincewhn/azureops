@@ -34,8 +34,6 @@ az monitor log-analytics workspace table create \
     {"name":"Duration_us",    "type":"long"},
     {"name":"Duration_ms",    "type":"real"},
     {"name":"Command",        "type":"string"},
-    {"name":"ClientAddress",  "type":"string"},
-    {"name":"ClientName",     "type":"string"},
     {"name":"RedisHost",      "type":"string"},
     {"name":"ClusterName",    "type":"string"},
     {"name":"Node",           "type":"string"},
@@ -58,21 +56,42 @@ az monitor data-collection endpoint create \
 
 ### 1.3 创建 Data Collection Rule（DCR）
 
-使用项目目录下的 `dcr-rule.json`（替换其中的 `workspaceResourceId`）：
-
 ```bash
 DCE_RESOURCE_ID=$(az monitor data-collection endpoint show \
   --name amr-slowquery-dce \
   --resource-group "$RESOURCE_GROUP" \
   --query id -o tsv)
 
+WORKSPACE_RESOURCE_ID="/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.OperationalInsights/workspaces/${WORKSPACE_NAME}"
+
 az monitor data-collection rule create \
   --subscription "$SUBSCRIPTION_ID" \
   --resource-group "$RESOURCE_GROUP" \
   --name "amr-slowquery-dcr" \
-  --location "<location>" \
+  --location "$LOCATION" \
   --data-collection-endpoint-id "$DCE_RESOURCE_ID" \
-  --rule-file dcr-rule.json
+  --stream-declarations '{
+    "Custom-AMRSlowQuery_CL": {
+      "columns": [
+        {"name":"TimeGenerated",  "type":"datetime"},
+        {"name":"SlowlogId",      "type":"int"},
+        {"name":"Duration_us",    "type":"long"},
+        {"name":"Duration_ms",    "type":"real"},
+        {"name":"Command",        "type":"string"},
+        {"name":"RedisHost",      "type":"string"},
+        {"name":"ClusterName",    "type":"string"},
+        {"name":"Node",           "type":"string"},
+        {"name":"ExportedAt",     "type":"datetime"}
+      ]
+    }
+  }' \
+  --destinations "{\"logAnalytics\":[{\"workspaceResourceId\":\"${WORKSPACE_RESOURCE_ID}\",\"name\":\"defaultWorkspace\"}]}" \
+  --data-flows '[{
+    "streams":      ["Custom-AMRSlowQuery_CL"],
+    "destinations": ["defaultWorkspace"],
+    "transformKql": "source | project TimeGenerated, SlowlogId, Duration_us, Duration_ms, Command, ClientAddress, ClientName, RedisHost, ClusterName, Node, ExportedAt",
+    "outputStream": "Custom-AMRSlowQuery_CL"
+  }]'
 ```
 
 记录输出中的 `immutableId`（格式：`dcr-xxxxxxxx`），配置为 `DCR_RULE_ID`。
@@ -156,9 +175,30 @@ docker push "$IMAGE"
 
 ## 步骤四：配置集群列表并部署
 
-### 4.1 编辑集群配置
+`k8s/overlays/template/` 为模板目录，使用 `${VAR}` 占位符；实际部署目录 `k8s/overlays/prod/` 由 `envsubst` 生成，不纳入版本管理。
 
-编辑 `k8s/overlays/prod/clusters-config.yaml`，在 `clusters.json` 数组中为每个 AMR 集群添加一个对象：
+### 4.1 确认环境变量已加载
+
+确保以下变量已在当前 Shell 中导出（可通过 `.env` 文件加载）：
+
+```bash
+set -a && source .env && set +a
+```
+
+涉及变量：`DCE_ENDPOINT`、`DCR_RULE_ID`、`IMAGE_REPO`、`IMAGE_TAG`、`UAMI_CLIENT_ID`、`POLL_INTERVAL_SECONDS`、`SLOWLOG_BATCH_SIZE`。
+
+### 4.2 编辑集群配置
+
+用 envsubst 将模板渲染为实际配置
+
+```bash
+mkdir -p k8s/overlays/prod
+for f in k8s/overlays/template/*.yaml; do
+  envsubst < "$f" > "k8s/overlays/prod/$(basename $f)"
+done
+```
+
+编辑 `k8s/overlays/template/clusters-config.yaml`，在 `clusters.json` 数组中为每个 AMR 集群添加一个对象：
 
 ```yaml
 stringData:
@@ -183,11 +223,9 @@ stringData:
     ]
 ```
 
-同步更新 `k8s/overlays/prod/replicas-patch.yaml` 中的 `replicas` 值，使其等于数组长度。
+同步更新 `k8s/overlays/template/replicas-patch.yaml` 中的 `replicas` 值，使其等于数组长度。
 
-编辑 `k8s/overlays/prod/shared-secret.yaml`，填入实际的 `DCE_ENDPOINT` 和 `DCR_RULE_ID`。
-
-### 4.2 部署至 AKS
+### 4.3 生成部署目录并部署至 AKS
 
 ```bash
 az aks get-credentials \
@@ -244,7 +282,7 @@ python deploy-workbook.py
 
 ---
 
-## 新增集群
+## 新增 AMR 集群
 
 1. 在 `clusters-config.yaml` 的 `clusters.json` **末尾**追加新集群对象
 2. 将 `replicas-patch.yaml` 的 `replicas` 值加 1
@@ -252,7 +290,7 @@ python deploy-workbook.py
 
 StatefulSet 仅创建新增的 Pod（最高序号），已有 Pod 不重启。
 
-## 移除集群
+## 移除 AMR 集群
 
 1. 从 `clusters.json` **末尾**删除对应对象（只能安全移除最后一个集群）
 2. 将 `replicas` 值减 1

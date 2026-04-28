@@ -1,0 +1,7 @@
+redis>=5.0.0
+python-dotenv>=1.0.0
+azure-monitor-ingestion>=1.0.0
+azure-identity>=1.15.0
+
+# Only required when AMR_USE_ENTRA=true (Microsoft Entra ID authentication)
+# redis-entraid>=0.1.0
