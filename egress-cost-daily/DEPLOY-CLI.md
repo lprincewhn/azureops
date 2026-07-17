@@ -99,7 +99,7 @@ ACS_CONN=$(az communication list-key -g $RG --name $ACS_NAME \
 
 ## 2. Logic App 工作流部署
 
-Logic App 工作流本身是一段 JSON 定义（本仓库 `logicapp/azuredeploy.json` 内含）。这里用 **az cli** 建资源：
+Logic App 工作流本身是一段 JSON 定义（本仓库 `azuredeploy.json` 内含）。这里用 **az cli** 建资源：
 先建 `acsemail` API 连接，再用 `az logic workflow create` 建工作流。
 
 该工作流每天拉取「前一天」出网费用，并额外产出：

@@ -21,10 +21,9 @@
 
 ```
 egress-cost-daily/
-├── DEPLOY-CLI.md                     # 纯 Azure CLI 部署手册（推荐）
-└── logicapp/
-    ├── azuredeploy.json              # 工作流 ARM 定义（参考；CLI 部署以 DEPLOY-CLI.md 为准）
-    └── azuredeploy.parameters.json   # 参数示例（发件人/收件人/计费类别/触发时刻）
+├── DEPLOY-CLI.md                 # 纯 Azure CLI 部署手册（推荐）
+├── azuredeploy.json              # 工作流 ARM 定义（参考；CLI 部署以 DEPLOY-CLI.md 为准）
+└── azuredeploy.parameters.json   # 参数示例（发件人/收件人/计费类别/触发时刻）
 ```
 
 ## 部署
@@ -40,7 +39,7 @@ egress-cost-daily/
 
 发件域获取与收件人填写方式详见 `DEPLOY-CLI.md`（收件人多个用**分号 `;`** 分隔）。
 
-## 关键参数（`logicapp/azuredeploy.parameters.json` / 工作流参数）
+## 关键参数（`azuredeploy.parameters.json` / 工作流参数）
 
 | 名称 | 说明 |
 |------|------|
