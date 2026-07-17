@@ -77,6 +77,24 @@ az policy assignment create \
   --params "{\"actionGroupId\": {\"value\": \"$ACTION_GROUP_ID\"}}"
 ```
 
+**可用参数**（在 `--params` 中传入以覆盖默认值）：
+
+| 参数 | 适用策略 | 默认值 | 说明 |
+|------|----------|--------|------|
+| `actionGroupId` | 全部 | 无（必填） | 接收告警的 Action Group 资源 ID |
+| `cpuThreshold` | 全部 | 80 | CPU 使用率百分比阈值（`GreaterThan`） |
+| `memoryAvailablePercentThreshold` | VM | 20 | 可用内存百分比阈值（`LessThan`，可用低于该值触发） |
+| `memoryThreshold` | MySQL / Redis | 80 | 内存使用率百分比阈值（`GreaterThan`） |
+| `storageThreshold` | MySQL | 85 | 存储使用率百分比阈值（`GreaterThan`） |
+| `serverLoadThreshold` | Redis | 80 | 服务器负载百分比阈值（`GreaterThan`） |
+| `effect` | 全部 | DeployIfNotExists | `DeployIfNotExists` 或 `Disabled` |
+
+覆盖阈值示例（分配时把 `cpuThreshold` 改为 90）：
+
+```bash
+--params "{\"actionGroupId\": {\"value\": \"$ACTION_GROUP_ID\"}, \"cpuThreshold\": {\"value\": 90}}"
+```
+
 获取分配自动生成的托管标识 principalId：
 
 ```bash
@@ -187,25 +205,7 @@ az policy assignment create \
 # 步骤 3~6 同 VM，替换名称为 auto-redis-metric-alert，告警前缀为 redis-
 ```
 
-## 六、参数说明
-
-| 参数 | 适用策略 | 默认值 | 说明 |
-|------|----------|--------|------|
-| `actionGroupId` | 全部 | 无（必填） | 接收告警的 Action Group 资源 ID |
-| `cpuThreshold` | 全部 | 80 | CPU 使用率百分比阈值（`GreaterThan`） |
-| `memoryAvailablePercentThreshold` | VM | 20 | 可用内存百分比阈值（`LessThan`，可用低于该值触发） |
-| `memoryThreshold` | MySQL / Redis | 80 | 内存使用率百分比阈值（`GreaterThan`） |
-| `storageThreshold` | MySQL | 85 | 存储使用率百分比阈值（`GreaterThan`） |
-| `serverLoadThreshold` | Redis | 80 | 服务器负载百分比阈值（`GreaterThan`） |
-| `effect` | 全部 | DeployIfNotExists | `DeployIfNotExists` 或 `Disabled` |
-
-覆盖阈值示例（分配时）：
-
-```bash
---params "{\"actionGroupId\": {\"value\": \"$ACTION_GROUP_ID\"}, \"cpuThreshold\": {\"value\": 90}}"
-```
-
-## 七、设计要点与注意事项
+## 六、设计要点与注意事项
 
 - **管理组范围覆盖所有订阅**：定义与分配的作用范围扩大到管理组下的**所有订阅**，修复会覆盖更多资源；授予角色的主体是每个分配自动生成的系统托管标识，需在管理组范围授权。
 - **定义必须位于管理组**：订阅范围创建的定义无法在管理组分配，必须使用 `--management-group` 创建定义。
@@ -216,7 +216,7 @@ az policy assignment create \
 - **Action Group 跨订阅可达**：管理组下多订阅可共用同一个 Action Group，AG 无跨订阅限制。
 - **告警内容**：短信为 Azure 固定精简格式，无法自定义；邮件 / Webhook / Logic App 可获得完整告警上下文。
 
-## 八、卸载（回滚，管理组范围）
+## 七、卸载（回滚，管理组范围）
 
 ```bash
 NAME="auto-vm-metric-alert"   # 或 auto-mysql-metric-alert / auto-redis-metric-alert
