@@ -1,95 +1,61 @@
-# 每日出网流量费用采集（Azure Functions · Python）
+# 每日出网流量费用日报（Azure Logic App · 低代码）
 
-> 说明：**Azure Logic App 不支持 Python 运行时**（Logic App 是可视化工作流）。
-> Python 定时任务在 Azure 上对应 **Azure Functions**，本项目即以 Python Function
-> （Timer 触发）实现你的需求：每天拉取「前一天」的出网流量费用并发送到 Action Group。
+用 **Azure Logic App（Consumption）** 实现的定时任务：每天拉取「前一天」的出网流量费用，
+计算与前一天的**环比差异**并按 `MeterSubCategory` 生成**分项明细表**，通过
+**Azure Communication Services（ACS）Email** 连接器发送富文本（HTML）邮件。
+无需写代码，无需邮箱账号。
 
 ## 工作流程
 
-1. **Timer 触发**：默认每天 UTC 02:00（`SCHEDULE` = `0 0 2 * * *`）。
-2. **查询成本**：调用 Cost Management Query API，取前一天 `MeterCategory=Bandwidth`
-   （出网流量）的 `PreTaxCost`，按 `MeterSubCategory` 分组汇总。
-3. **发送通知**：
-   - **优先(推荐)**：若配置 `ACS_CONNECTION_STRING` + `EMAIL_SENDER` + `EMAIL_RECIPIENTS`，
-     通过 **Azure Communication Services** 直接发送邮件,正文含**真实金额与分项明细**(HTML 表格)。
-   - 若配置 `ACTION_GROUP_WEBHOOK_URL`：直接 POST 富文本 JSON 报告（Teams/Slack/Logic App）。
-   - 若配置 `ACTION_GROUP_ID`：通过 `createNotifications` API 触发 Action Group(注意:测试
-     通知模板**不含**真实金额,仅验证通道连通)。
+1. **Recurrence 触发**：默认每天 UTC 02:00（`scheduleHour` 可调）。
+2. **查询成本**（3 次 Cost Management Query，托管标识鉴权）：
+   - `Query_detail`：昨日 `MeterCategory=Bandwidth`，按 `MeterSubCategory` 分组的明细；
+   - `Query_yesterday_total`：昨日合计；
+   - `Query_prev_total`：前天合计（用于环比）。
+   - HTTP 动作配置了指数退避重试，以应对 Cost API 429 限流。
+3. **计算与拼装**：算出合计、货币、环比百分比（`▲ +x%` / `▼ -x%`，含除零保护），
+   用 `Select`+`join` 拼出 HTML 明细表。
+4. **发送邮件**：ACS Email 连接器（`acsemail`，密钥）发送富文本日报。
 
 ## 目录结构
 
 ```
 egress-cost-daily/
-├── function_app.py        # Python v2 编程模型，Timer 触发主逻辑
-├── requirements.txt
-├── host.json
-├── local.settings.json    # 本地调试配置（勿提交真实密钥）
-└── logicapp/              # 备选实现：纯低代码 Logic App（无 Python/无邮箱账号）
-    ├── azuredeploy.json           # 工作流定义（Recurrence -> HTTP(Cost, MI) -> ACS Email）
-    └── azuredeploy.parameters.json
+├── DEPLOY-CLI.md                     # 纯 Azure CLI 部署手册（推荐）
+└── logicapp/
+    ├── azuredeploy.json              # 工作流 ARM 定义（参考；CLI 部署以 DEPLOY-CLI.md 为准）
+    └── azuredeploy.parameters.json   # 参数示例（发件人/收件人/计费类别/触发时刻）
 ```
 
-> 部署（含所有基础设施资源）统一使用 **Azure CLI**，详见 [`DEPLOY-CLI.md`](DEPLOY-CLI.md)。
+## 部署
 
-## 两种实现对比
+所有资源（ACS 三资源、`acsemail` 连接、Logic App 工作流）统一使用 **Azure CLI** 部署，
+完整分步手册见 [`DEPLOY-CLI.md`](DEPLOY-CLI.md)：
 
-| | **Function + ACS**（当前默认） | **Logic App + ACS**（`logicapp/`） |
-|---|---|---|
-| 运行时 | Python | 低代码工作流(无代码) |
-| 发邮件 | ACS SDK | ACS Email 连接器(`acsemail`,密钥) |
-| 邮件正文 | 真实金额 + 分项明细表 | 真实金额 + 分项明细表 + 环比差异(较前一天百分比) |
-| 是否需要 ACS | 是 | 是(复用同一个 ACS) |
-| 发件人 | `DoNotReply@…azurecomm.net` | `DoNotReply@…azurecomm.net` |
-| 鉴权 | 托管标识查成本 | 托管标识查成本 + ACS 连接串(密钥) |
-| 需授予角色 | Cost Management Reader | Cost Management Reader |
-| 额外手动步骤 | 无 | **无**(连接用密钥,部署即配好) |
+1. 公共前置：登录、变量、资源组、CLI 扩展。
+2. 创建共用 ACS（Email Service / 托管发件域 / Communication Service），取发件域与连接串。
+3. 建 `acsemail` API 连接（密钥）。
+4. `az logic workflow create` 建工作流（`--mi-system-assigned true` 开系统托管标识）。
+5. 给工作流托管标识授予 `Cost Management Reader`（`az role assignment create`）。
 
-### Logic App 部署
+发件域获取与收件人填写方式详见 `DEPLOY-CLI.md`（收件人多个用**分号 `;`** 分隔）。
 
-Logic App（含 ACS 连接与工作流）的完整 Azure CLI 部署步骤见
-[`DEPLOY-CLI.md` · 方案 B](DEPLOY-CLI.md)。部署后仅需给工作流托管标识授予
-`Cost Management Reader` 即可。发件域获取与收件人填写方式同见该文档。
-
-## 关键配置（App Settings / 环境变量）
+## 关键参数（`logicapp/azuredeploy.parameters.json` / 工作流参数）
 
 | 名称 | 说明 |
 |------|------|
-| `SUBSCRIPTION_ID` | 要统计费用的订阅 ID |
-| `ACS_CONNECTION_STRING` | Azure Communication Services 连接字符串(直接发邮件) |
-| `EMAIL_SENDER` | 发件地址,如 `DoNotReply@<域>.azurecomm.net` |
-| `EMAIL_RECIPIENTS` | 收件人,多个用逗号分隔 |
-| `ACTION_GROUP_ID` | (可选) Action Group 资源 ID,走测试通知(不含金额) |
-| `ACTION_GROUP_WEBHOOK_URL` | (可选) 直接推送富文本报告的 Webhook |
-| `METER_CATEGORY` | 计费类别过滤，默认 `Bandwidth` |
-| `SCHEDULE` | NCRONTAB 表达式，默认 `0 0 2 * * *` |
-
-## 部署步骤
-
-所有基础设施资源与代码发布均使用 **Azure CLI**，完整分步手册见
-[`DEPLOY-CLI.md`](DEPLOY-CLI.md)：
-
-- **方案 A（Function + Python）**：`az storage account create` / `az functionapp create` 建资源 →
-  配置 App Settings → 授 `Cost Management Reader` → `func azure functionapp publish <name> --build remote`。
-- **方案 B（Logic App 低代码）**：`az resource create` 建 `acsemail` 连接 →
-  `az logic workflow create` 建工作流 → 授 `Cost Management Reader`。
-
-## 本地调试
-
-```bash
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-# 填好 local.settings.json 后
-func start
-```
+| `emailSender` | ACS 发件地址，如 `DoNotReply@<发件域>.azurecomm.net`（由 ACS 托管域自动生成） |
+| `emailRecipients` | 收件人，多个用分号 `;` 分隔 |
+| `meterCategory` | 计费类别过滤，默认 `Bandwidth`（捕获出网流量） |
+| `scheduleHour` | 每天触发的小时（UTC，0-23），默认 `2` |
+| `acsConnectionString` | ACS 连接字符串（`endpoint=…;accesskey=…`），用于 `acsemail` 连接 |
 
 ## 说明与前提
 
-- **鉴权**：使用 Function App 系统托管标识（`DefaultAzureCredential`），需
-  `Cost Management Reader` 角色（部署后用 `az role assignment create` 授予，见 `DEPLOY-CLI.md`）。
+- **鉴权**：Logic App 系统托管标识查成本，需订阅级 `Cost Management Reader`
+  （部署后用 `az role assignment create` 授予，需执行者具备角色分配权限）。
+- **发邮件**：ACS Email 连接器用密钥（连接串），无需邮箱账号或额外授权。
 - **出网口径**：Azure 计费中出网流量归于 `MeterCategory=Bandwidth`
-  （如 Data Transfer Out、Inter-Region）。如需更细口径，可改用
-  `MeterSubCategory` 过滤或调整 `METER_CATEGORY`。
+  （如 Data Transfer Out、Inter-Region）。如需更细口径，可调整 `meterCategory`。
 - **成本数据延迟**：Cost Management 数据通常有数小时延迟，02:00 拉取前一天数据可覆盖。
-- `createNotifications` 为 Action Group 测试通知 API，会真实投递；若需在邮件正文中
-  包含完整费用明细，建议给 Action Group 配置 Webhook 接收方并使用
-  `ACTION_GROUP_WEBHOOK_URL`。
+- **ACS 邮件连接器 404**：`Send_email` 动作必须带 `api-version=2023-03-31` 查询参数（模板已含）。
