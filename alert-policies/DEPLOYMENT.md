@@ -207,7 +207,80 @@ az policy assignment create \
 - **新分配需先评估再修复**：合规评估完成后，`ExistingNonCompliant` 才能识别到不合规资源。
 - **告警内容**：短信为 Azure 固定精简格式，无法自定义；邮件 / Webhook / Logic App 可获得完整告警上下文。
 
-## 八、卸载（回滚）
+## 八、在管理组（Management Group）范围部署（可选）
+
+如需将策略应用到管理组下的**所有订阅**，需将定义创建到该管理组（或其祖先管理组）后再在管理组范围分配。
+**注意**：订阅范围创建的定义无法在管理组分配，必须把定义建到管理组。
+
+```bash
+# 目标管理组 ID
+MG="<management-group-id>"
+MG_SCOPE="/providers/Microsoft.Management/managementGroups/$MG"
+
+# 通知用的 Action Group 资源 ID（位于某个具体订阅，跨订阅可达）
+ACTION_GROUP_ID="/subscriptions/<sub>/resourceGroups/<ag-rg>/providers/microsoft.insights/actionGroups/<ag-name>"
+```
+
+### 步骤 1：将定义创建到管理组
+
+```bash
+az policy definition create \
+  --name "auto-vm-metric-alert" \
+  --display-name "自动为虚拟机创建指标告警" \
+  --mode Indexed \
+  --rules @auto-vm-metric-alert.rules.json \
+  --params @auto-vm-metric-alert.params.json \
+  --management-group "$MG"
+```
+
+### 步骤 2：在管理组范围创建分配
+
+```bash
+az policy assignment create \
+  --name "auto-vm-metric-alert" \
+  --display-name "自动为虚拟机创建指标告警" \
+  --policy "auto-vm-metric-alert" \
+  --scope "$MG_SCOPE" \
+  --mi-system-assigned --location "eastus" \
+  --params "{\"actionGroupId\": {\"value\": \"$ACTION_GROUP_ID\"}}"
+
+PRINCIPAL_ID=$(az policy assignment show \
+  --name "auto-vm-metric-alert" --scope "$MG_SCOPE" \
+  --query identity.principalId -o tsv)
+```
+
+### 步骤 3：在管理组范围授予 Monitoring Contributor
+
+```bash
+az role assignment create \
+  --assignee-object-id "$PRINCIPAL_ID" \
+  --assignee-principal-type ServicePrincipal \
+  --role "Monitoring Contributor" \
+  --scope "$MG_SCOPE"
+```
+
+### 步骤 4~6：扫描、修复与验证
+
+```bash
+# 触发合规扫描（可指定订阅逐个扫描，或依赖后台周期评估）
+az policy state trigger-scan --subscription "<sub-under-mg>"
+
+# 修复任务在管理组范围创建
+az policy remediation create \
+  --name "remediate-vm-metric-alert-$(date +%Y%m%d%H%M%S)" \
+  --policy-assignment "/providers/Microsoft.Management/managementGroups/$MG/providers/Microsoft.Authorization/policyAssignments/auto-vm-metric-alert" \
+  --resource-discovery-mode ExistingNonCompliant
+```
+
+MySQL / Redis 同理，仅替换名称与文件。
+
+> **管理组部署注意点**
+> - 定义与分配的范围随之扩大到管理组下的**所有订阅**，修复会覆盖更多资源。
+> - 策略规则中的 `resourceGroup().name`、`field('name')` 与范围无关，逐资源评估照常生效。
+> - Action Group 是具体订阅内的资源，多订阅共用同一个 AG 时请确认跨订阅可达（AG 无跨订阅限制）。
+> - 授予角色的主体是每个分配自动生成的系统托管标识，需在管理组范围授权，RBAC 传播可能需数分钟。
+
+## 九、卸载（回滚）
 
 ```bash
 NAME="auto-vm-metric-alert"   # 或 auto-mysql-metric-alert / auto-redis-metric-alert
