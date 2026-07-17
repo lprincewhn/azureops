@@ -24,13 +24,12 @@ egress-cost-daily/
 ├── requirements.txt
 ├── host.json
 ├── local.settings.json    # 本地调试配置（勿提交真实密钥）
-├── infra/
-│   ├── main.bicep         # Function App + 存储 + App Insights + ACS(邮件)
-│   └── roles.bicep        # 订阅级角色授权（托管标识）
 └── logicapp/              # 备选实现：纯低代码 Logic App（无 Python/无邮箱账号）
-    ├── azuredeploy.json           # Recurrence -> HTTP(Cost, MI) -> ACS Email 发邮件
+    ├── azuredeploy.json           # 工作流定义（Recurrence -> HTTP(Cost, MI) -> ACS Email）
     └── azuredeploy.parameters.json
 ```
+
+> 部署（含所有基础设施资源）统一使用 **Azure CLI**，详见 [`DEPLOY-CLI.md`](DEPLOY-CLI.md)。
 
 ## 两种实现对比
 
@@ -46,38 +45,9 @@ egress-cost-daily/
 
 ### Logic App 部署
 
-**部署前：填写 `logicapp/azuredeploy.parameters.json`**（`emailSender` 与 `emailRecipients` 默认是占位符）：
-
-```bash
-# 1) 获取 ACS 托管发件域，拼出发件地址
-SENDER_DOMAIN=$(az resource show \
-  -g <rg> --name "<emailService名>/AzureManagedDomain" \
-  --resource-type Microsoft.Communication/emailServices/domains \
-  --api-version 2023-04-01 --query properties.fromSenderDomain -o tsv)
-echo "发件人: DoNotReply@${SENDER_DOMAIN}"
-
-# 2) 把上面的发件地址填入 emailSender，把真实收件人填入 emailRecipients
-#    （Logic App 收件人多个用分号 ; 分隔）
-```
-
-`logicapp/azuredeploy.parameters.json` 示例：
-```jsonc
-"emailSender":     { "value": "DoNotReply@<你的发件域>.azurecomm.net" },  // ← 用上面 SENDER_DOMAIN
-"emailRecipients": { "value": "you@example.com;teammate@example.com" }    // ← 真实收件人，分号分隔
-```
-
-**部署：**
-```bash
-CS=$(az communication list-key --name <acs名> -g <rg> --query primaryConnectionString -o tsv)
-az deployment group create -g <rg> \
-  --template-file logicapp/azuredeploy.json \
-  --parameters logicapp/azuredeploy.parameters.json \
-  --parameters acsConnectionString="$CS"
-```
-部署后仅需一步：给输出的 `principalId` 授予 `Cost Management Reader`。
-
-> **不想用 Bicep/ARM？** 两套方案的**纯 Azure CLI** 逐步部署手册见
-> [`DEPLOY-CLI.md`](DEPLOY-CLI.md)（用 `az cli` 创建全部基础设施资源）。
+Logic App（含 ACS 连接与工作流）的完整 Azure CLI 部署步骤见
+[`DEPLOY-CLI.md` · 方案 B](DEPLOY-CLI.md)。部署后仅需给工作流托管标识授予
+`Cost Management Reader` 即可。发件域获取与收件人填写方式同见该文档。
 
 ## 关键配置（App Settings / 环境变量）
 
@@ -94,28 +64,13 @@ az deployment group create -g <rg> \
 
 ## 部署步骤
 
-> 两种方式二选一：
-> - **Bicep/ARM**（本节）：一条 `az deployment` 命令建全部资源。
-> - **纯 Azure CLI**：逐步用 `az cli` 创建资源，见 [`DEPLOY-CLI.md`](DEPLOY-CLI.md)。
+所有基础设施资源与代码发布均使用 **Azure CLI**，完整分步手册见
+[`DEPLOY-CLI.md`](DEPLOY-CLI.md)：
 
-```bash
-# 1. 部署 Function App 基础设施
-az deployment group create \
-  --resource-group <rg> \
-  --template-file infra/main.bicep \
-  --parameters functionAppName=<name> \
-               actionGroupId=/subscriptions/<sub>/resourceGroups/<rg>/providers/microsoft.insights/actionGroups/<ag>
-
-# 2. 记录输出的 principalId，授予订阅级角色
-az deployment sub create \
-  --location <region> \
-  --template-file infra/roles.bicep \
-  --parameters principalId=<principalId>
-
-# 3. 发布函数代码
-cd egress-cost-daily
-func azure functionapp publish <name>
-```
+- **方案 A（Function + Python）**：`az storage account create` / `az functionapp create` 建资源 →
+  配置 App Settings → 授 `Cost Management Reader` → `func azure functionapp publish <name> --build remote`。
+- **方案 B（Logic App 低代码）**：`az resource create` 建 `acsemail` 连接 →
+  `az logic workflow create` 建工作流 → 授 `Cost Management Reader`。
 
 ## 本地调试
 
@@ -129,7 +84,7 @@ func start
 ## 说明与前提
 
 - **鉴权**：使用 Function App 系统托管标识（`DefaultAzureCredential`），需
-  `Cost Management Reader` + `Monitoring Contributor` 角色（roles.bicep 已包含）。
+  `Cost Management Reader` 角色（部署后用 `az role assignment create` 授予，见 `DEPLOY-CLI.md`）。
 - **出网口径**：Azure 计费中出网流量归于 `MeterCategory=Bandwidth`
   （如 Data Transfer Out、Inter-Region）。如需更细口径，可改用
   `MeterSubCategory` 过滤或调整 `METER_CATEGORY`。
