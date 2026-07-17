@@ -16,7 +16,7 @@
 
 ## 二、前置条件
 
-1. 已安装并登录 Azure CLI（`az login`）。
+1. 在 [Azure 门户](https://portal.azure.com) 右上角点击 **Cloud Shell** 图标（或访问 [https://shell.azure.com](https://shell.azure.com)），选择 **Bash** 环境。Cloud Shell 已预装 Azure CLI 并自动完成登录，无需 `az login`。首次使用需按提示创建或选择一个存储账户。可用 `az account set --subscription "<订阅ID>"` 切换到目标订阅。
 2. 部署账号需具备以下权限（在目标订阅范围）：
    - **Resource Policy Contributor**：创建策略定义与分配。
    - **User Access Administrator** / **Owner** / **Role Based Access Control Administrator**：为策略托管标识授予 `Monitoring Contributor`（DINE 修复所需）。
