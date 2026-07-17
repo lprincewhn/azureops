@@ -1,0 +1,45 @@
+{
+  "actionGroupId": {
+    "metadata": {
+      "description": "用于接收 Redis 告警的 Action Group 资源 ID。",
+      "displayName": "Action Group Resource ID"
+    },
+    "type": "String"
+  },
+  "cpuThreshold": {
+    "defaultValue": 80,
+    "metadata": {
+      "description": "CPU（percentProcessorTime）百分比平均值超过该值时触发告警。",
+      "displayName": "CPU 阈值"
+    },
+    "type": "Integer"
+  },
+  "memoryThreshold": {
+    "defaultValue": 80,
+    "metadata": {
+      "description": "内存使用率（usedmemorypercentage）平均值超过该值时触发告警。",
+      "displayName": "内存阈值"
+    },
+    "type": "Integer"
+  },
+  "serverLoadThreshold": {
+    "defaultValue": 80,
+    "metadata": {
+      "description": "服务器负载（serverLoad）百分比平均值超过该值时触发告警。",
+      "displayName": "服务器负载阈值"
+    },
+    "type": "Integer"
+  },
+  "effect": {
+    "allowedValues": [
+      "DeployIfNotExists",
+      "Disabled"
+    ],
+    "defaultValue": "DeployIfNotExists",
+    "metadata": {
+      "description": "启用自动部署或禁用策略。",
+      "displayName": "策略效果"
+    },
+    "type": "String"
+  }
+}

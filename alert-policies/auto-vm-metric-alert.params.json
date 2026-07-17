@@ -1,0 +1,37 @@
+{
+  "actionGroupId": {
+    "metadata": {
+      "description": "用于接收 CPU 及内存告警的 Action Group 资源 ID。",
+      "displayName": "Action Group Resource ID"
+    },
+    "type": "String"
+  },
+  "cpuThreshold": {
+    "defaultValue": 80,
+    "metadata": {
+      "description": "CPU 平均使用率超过该百分比时触发告警。",
+      "displayName": "CPU 阈值"
+    },
+    "type": "Integer"
+  },
+  "memoryAvailablePercentThreshold": {
+    "defaultValue": 20,
+    "metadata": {
+      "description": "可用内存百分比平均值低于该值时触发告警（如 20 表示可用低于 20%，约等于使用率高于 80%）。",
+      "displayName": "可用内存百分比阈值"
+    },
+    "type": "Integer"
+  },
+  "effect": {
+    "allowedValues": [
+      "DeployIfNotExists",
+      "Disabled"
+    ],
+    "defaultValue": "DeployIfNotExists",
+    "metadata": {
+      "description": "启用自动部署或禁用策略。",
+      "displayName": "策略效果"
+    },
+    "type": "String"
+  }
+}

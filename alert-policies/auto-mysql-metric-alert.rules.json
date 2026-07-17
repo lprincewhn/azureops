@@ -1,0 +1,177 @@
+{
+  "if": {
+    "equals": "Microsoft.DBforMySQL/flexibleServers",
+    "field": "type"
+  },
+  "then": {
+    "details": {
+      "deployment": {
+        "properties": {
+          "mode": "incremental",
+          "parameters": {
+            "actionGroupId": {
+              "value": "[parameters('actionGroupId')]"
+            },
+            "cpuThreshold": {
+              "value": "[parameters('cpuThreshold')]"
+            },
+            "memoryThreshold": {
+              "value": "[parameters('memoryThreshold')]"
+            },
+            "storageThreshold": {
+              "value": "[parameters('storageThreshold')]"
+            },
+            "serverId": {
+              "value": "[field('id')]"
+            },
+            "serverName": {
+              "value": "[field('name')]"
+            }
+          },
+          "template": {
+            "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+            "contentVersion": "1.0.0.0",
+            "parameters": {
+              "actionGroupId": {
+                "type": "string"
+              },
+              "cpuThreshold": {
+                "type": "int"
+              },
+              "memoryThreshold": {
+                "type": "int"
+              },
+              "storageThreshold": {
+                "type": "int"
+              },
+              "serverId": {
+                "type": "string"
+              },
+              "serverName": {
+                "type": "string"
+              }
+            },
+            "resources": [
+              {
+                "apiVersion": "2018-03-01",
+                "location": "global",
+                "name": "[concat('mysql-cpu-', resourceGroup().name, '-', parameters('serverName'))]",
+                "properties": {
+                  "actions": [
+                    {
+                      "actionGroupId": "[parameters('actionGroupId')]"
+                    }
+                  ],
+                  "autoMitigate": true,
+                  "criteria": {
+                    "allOf": [
+                      {
+                        "criterionType": "StaticThresholdCriterion",
+                        "metricName": "cpu_percent",
+                        "metricNamespace": "Microsoft.DBforMySQL/flexibleServers",
+                        "name": "HighCPU",
+                        "operator": "GreaterThan",
+                        "threshold": "[parameters('cpuThreshold')]",
+                        "timeAggregation": "Average"
+                      }
+                    ],
+                    "odata.type": "Microsoft.Azure.Monitor.SingleResourceMultipleMetricCriteria"
+                  },
+                  "description": "MySQL 服务器 CPU 使用率超过阈值",
+                  "enabled": true,
+                  "evaluationFrequency": "PT5M",
+                  "scopes": [
+                    "[parameters('serverId')]"
+                  ],
+                  "severity": 2,
+                  "windowSize": "PT5M"
+                },
+                "type": "Microsoft.Insights/metricAlerts"
+              },
+              {
+                "apiVersion": "2018-03-01",
+                "location": "global",
+                "name": "[concat('mysql-mem-', resourceGroup().name, '-', parameters('serverName'))]",
+                "properties": {
+                  "actions": [
+                    {
+                      "actionGroupId": "[parameters('actionGroupId')]"
+                    }
+                  ],
+                  "autoMitigate": true,
+                  "criteria": {
+                    "allOf": [
+                      {
+                        "criterionType": "StaticThresholdCriterion",
+                        "metricName": "memory_percent",
+                        "metricNamespace": "Microsoft.DBforMySQL/flexibleServers",
+                        "name": "HighMemory",
+                        "operator": "GreaterThan",
+                        "threshold": "[parameters('memoryThreshold')]",
+                        "timeAggregation": "Average"
+                      }
+                    ],
+                    "odata.type": "Microsoft.Azure.Monitor.SingleResourceMultipleMetricCriteria"
+                  },
+                  "description": "MySQL 服务器内存使用率超过阈值",
+                  "enabled": true,
+                  "evaluationFrequency": "PT5M",
+                  "scopes": [
+                    "[parameters('serverId')]"
+                  ],
+                  "severity": 2,
+                  "windowSize": "PT5M"
+                },
+                "type": "Microsoft.Insights/metricAlerts"
+              },
+              {
+                "apiVersion": "2018-03-01",
+                "location": "global",
+                "name": "[concat('mysql-storage-', resourceGroup().name, '-', parameters('serverName'))]",
+                "properties": {
+                  "actions": [
+                    {
+                      "actionGroupId": "[parameters('actionGroupId')]"
+                    }
+                  ],
+                  "autoMitigate": true,
+                  "criteria": {
+                    "allOf": [
+                      {
+                        "criterionType": "StaticThresholdCriterion",
+                        "metricName": "storage_percent",
+                        "metricNamespace": "Microsoft.DBforMySQL/flexibleServers",
+                        "name": "HighStorage",
+                        "operator": "GreaterThan",
+                        "threshold": "[parameters('storageThreshold')]",
+                        "timeAggregation": "Average"
+                      }
+                    ],
+                    "odata.type": "Microsoft.Azure.Monitor.SingleResourceMultipleMetricCriteria"
+                  },
+                  "description": "MySQL 服务器存储使用率超过阈值",
+                  "enabled": true,
+                  "evaluationFrequency": "PT5M",
+                  "scopes": [
+                    "[parameters('serverId')]"
+                  ],
+                  "severity": 2,
+                  "windowSize": "PT5M"
+                },
+                "type": "Microsoft.Insights/metricAlerts"
+              }
+            ]
+          }
+        }
+      },
+      "deploymentScope": "resourceGroup",
+      "existenceScope": "subscription",
+      "name": "[concat('mysql-cpu-', resourceGroup().name, '-', field('name'))]",
+      "roleDefinitionIds": [
+        "/providers/Microsoft.Authorization/roleDefinitions/749f88d5-cbae-40b8-bcfc-e573ddc772fa"
+      ],
+      "type": "Microsoft.Insights/metricAlerts"
+    },
+    "effect": "[parameters('effect')]"
+  }
+}

@@ -1,0 +1,135 @@
+{
+  "if": {
+    "equals": "Microsoft.Compute/virtualMachines",
+    "field": "type"
+  },
+  "then": {
+    "details": {
+      "deployment": {
+        "properties": {
+          "mode": "incremental",
+          "parameters": {
+            "actionGroupId": {
+              "value": "[parameters('actionGroupId')]"
+            },
+            "cpuThreshold": {
+              "value": "[parameters('cpuThreshold')]"
+            },
+            "memoryAvailablePercentThreshold": {
+              "value": "[parameters('memoryAvailablePercentThreshold')]"
+            },
+            "vmId": {
+              "value": "[field('id')]"
+            },
+            "vmName": {
+              "value": "[field('name')]"
+            }
+          },
+          "template": {
+            "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+            "contentVersion": "1.0.0.0",
+            "parameters": {
+              "actionGroupId": {
+                "type": "string"
+              },
+              "cpuThreshold": {
+                "type": "int"
+              },
+              "memoryAvailablePercentThreshold": {
+                "type": "int"
+              },
+              "vmId": {
+                "type": "string"
+              },
+              "vmName": {
+                "type": "string"
+              }
+            },
+            "resources": [
+              {
+                "apiVersion": "2018-03-01",
+                "location": "global",
+                "name": "[concat('vm-cpu-', resourceGroup().name, '-', parameters('vmName'))]",
+                "properties": {
+                  "actions": [
+                    {
+                      "actionGroupId": "[parameters('actionGroupId')]"
+                    }
+                  ],
+                  "autoMitigate": true,
+                  "criteria": {
+                    "allOf": [
+                      {
+                        "criterionType": "StaticThresholdCriterion",
+                        "metricName": "Percentage CPU",
+                        "metricNamespace": "Microsoft.Compute/virtualMachines",
+                        "name": "High CPU",
+                        "operator": "GreaterThan",
+                        "threshold": "[parameters('cpuThreshold')]",
+                        "timeAggregation": "Average"
+                      }
+                    ],
+                    "odata.type": "Microsoft.Azure.Monitor.SingleResourceMultipleMetricCriteria"
+                  },
+                  "description": "虚拟机 CPU 平均使用率超过阈值",
+                  "enabled": true,
+                  "evaluationFrequency": "PT5M",
+                  "scopes": [
+                    "[parameters('vmId')]"
+                  ],
+                  "severity": 2,
+                  "windowSize": "PT5M"
+                },
+                "type": "Microsoft.Insights/metricAlerts"
+              },
+              {
+                "apiVersion": "2018-03-01",
+                "location": "global",
+                "name": "[concat('vm-mem-', resourceGroup().name, '-', parameters('vmName'))]",
+                "properties": {
+                  "actions": [
+                    {
+                      "actionGroupId": "[parameters('actionGroupId')]"
+                    }
+                  ],
+                  "autoMitigate": true,
+                  "criteria": {
+                    "allOf": [
+                      {
+                        "criterionType": "StaticThresholdCriterion",
+                        "metricName": "Available Memory Percentage",
+                        "metricNamespace": "Microsoft.Compute/virtualMachines",
+                        "name": "LowAvailableMemory",
+                        "operator": "LessThan",
+                        "threshold": "[parameters('memoryAvailablePercentThreshold')]",
+                        "timeAggregation": "Average"
+                      }
+                    ],
+                    "odata.type": "Microsoft.Azure.Monitor.SingleResourceMultipleMetricCriteria"
+                  },
+                  "description": "虚拟机可用内存百分比平均值低于阈值",
+                  "enabled": true,
+                  "evaluationFrequency": "PT5M",
+                  "scopes": [
+                    "[parameters('vmId')]"
+                  ],
+                  "severity": 2,
+                  "windowSize": "PT5M"
+                },
+                "type": "Microsoft.Insights/metricAlerts"
+              }
+            ]
+          }
+        }
+      },
+      "deploymentScope": "resourceGroup",
+      "existenceScope": "subscription",
+      "name": "[concat('vm-cpu-', resourceGroup().name, '-', field('name'))]",
+      "roleDefinitionIds": [
+        "/providers/Microsoft.Authorization/roleDefinitions/749f88d5-cbae-40b8-bcfc-e573ddc772fa"
+      ],
+      "type": "Microsoft.Insights/metricAlerts"
+    },
+    "effect": "[parameters('effect')]"
+  }
+}

@@ -1,0 +1,177 @@
+{
+  "if": {
+    "equals": "Microsoft.Cache/redisEnterprise",
+    "field": "type"
+  },
+  "then": {
+    "details": {
+      "deployment": {
+        "properties": {
+          "mode": "incremental",
+          "parameters": {
+            "actionGroupId": {
+              "value": "[parameters('actionGroupId')]"
+            },
+            "cpuThreshold": {
+              "value": "[parameters('cpuThreshold')]"
+            },
+            "memoryThreshold": {
+              "value": "[parameters('memoryThreshold')]"
+            },
+            "serverLoadThreshold": {
+              "value": "[parameters('serverLoadThreshold')]"
+            },
+            "redisId": {
+              "value": "[field('id')]"
+            },
+            "redisName": {
+              "value": "[field('name')]"
+            }
+          },
+          "template": {
+            "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+            "contentVersion": "1.0.0.0",
+            "parameters": {
+              "actionGroupId": {
+                "type": "string"
+              },
+              "cpuThreshold": {
+                "type": "int"
+              },
+              "memoryThreshold": {
+                "type": "int"
+              },
+              "serverLoadThreshold": {
+                "type": "int"
+              },
+              "redisId": {
+                "type": "string"
+              },
+              "redisName": {
+                "type": "string"
+              }
+            },
+            "resources": [
+              {
+                "apiVersion": "2018-03-01",
+                "location": "global",
+                "name": "[concat('redis-cpu-', resourceGroup().name, '-', parameters('redisName'))]",
+                "properties": {
+                  "actions": [
+                    {
+                      "actionGroupId": "[parameters('actionGroupId')]"
+                    }
+                  ],
+                  "autoMitigate": true,
+                  "criteria": {
+                    "allOf": [
+                      {
+                        "criterionType": "StaticThresholdCriterion",
+                        "metricName": "percentProcessorTime",
+                        "metricNamespace": "Microsoft.Cache/redisEnterprise",
+                        "name": "HighCPU",
+                        "operator": "GreaterThan",
+                        "threshold": "[parameters('cpuThreshold')]",
+                        "timeAggregation": "Average"
+                      }
+                    ],
+                    "odata.type": "Microsoft.Azure.Monitor.SingleResourceMultipleMetricCriteria"
+                  },
+                  "description": "Redis 服务器 CPU 使用率超过阈值",
+                  "enabled": true,
+                  "evaluationFrequency": "PT5M",
+                  "scopes": [
+                    "[parameters('redisId')]"
+                  ],
+                  "severity": 2,
+                  "windowSize": "PT5M"
+                },
+                "type": "Microsoft.Insights/metricAlerts"
+              },
+              {
+                "apiVersion": "2018-03-01",
+                "location": "global",
+                "name": "[concat('redis-mem-', resourceGroup().name, '-', parameters('redisName'))]",
+                "properties": {
+                  "actions": [
+                    {
+                      "actionGroupId": "[parameters('actionGroupId')]"
+                    }
+                  ],
+                  "autoMitigate": true,
+                  "criteria": {
+                    "allOf": [
+                      {
+                        "criterionType": "StaticThresholdCriterion",
+                        "metricName": "usedmemorypercentage",
+                        "metricNamespace": "Microsoft.Cache/redisEnterprise",
+                        "name": "HighMemory",
+                        "operator": "GreaterThan",
+                        "threshold": "[parameters('memoryThreshold')]",
+                        "timeAggregation": "Average"
+                      }
+                    ],
+                    "odata.type": "Microsoft.Azure.Monitor.SingleResourceMultipleMetricCriteria"
+                  },
+                  "description": "Redis 服务器内存使用率超过阈值",
+                  "enabled": true,
+                  "evaluationFrequency": "PT5M",
+                  "scopes": [
+                    "[parameters('redisId')]"
+                  ],
+                  "severity": 2,
+                  "windowSize": "PT5M"
+                },
+                "type": "Microsoft.Insights/metricAlerts"
+              },
+              {
+                "apiVersion": "2018-03-01",
+                "location": "global",
+                "name": "[concat('redis-load-', resourceGroup().name, '-', parameters('redisName'))]",
+                "properties": {
+                  "actions": [
+                    {
+                      "actionGroupId": "[parameters('actionGroupId')]"
+                    }
+                  ],
+                  "autoMitigate": true,
+                  "criteria": {
+                    "allOf": [
+                      {
+                        "criterionType": "StaticThresholdCriterion",
+                        "metricName": "serverLoad",
+                        "metricNamespace": "Microsoft.Cache/redisEnterprise",
+                        "name": "HighServerLoad",
+                        "operator": "GreaterThan",
+                        "threshold": "[parameters('serverLoadThreshold')]",
+                        "timeAggregation": "Average"
+                      }
+                    ],
+                    "odata.type": "Microsoft.Azure.Monitor.SingleResourceMultipleMetricCriteria"
+                  },
+                  "description": "Redis 服务器负载超过阈值",
+                  "enabled": true,
+                  "evaluationFrequency": "PT5M",
+                  "scopes": [
+                    "[parameters('redisId')]"
+                  ],
+                  "severity": 2,
+                  "windowSize": "PT5M"
+                },
+                "type": "Microsoft.Insights/metricAlerts"
+              }
+            ]
+          }
+        }
+      },
+      "deploymentScope": "resourceGroup",
+      "existenceScope": "subscription",
+      "name": "[concat('redis-cpu-', resourceGroup().name, '-', field('name'))]",
+      "roleDefinitionIds": [
+        "/providers/Microsoft.Authorization/roleDefinitions/749f88d5-cbae-40b8-bcfc-e573ddc772fa"
+      ],
+      "type": "Microsoft.Insights/metricAlerts"
+    },
+    "effect": "[parameters('effect')]"
+  }
+}
