@@ -66,11 +66,13 @@ az policy definition create \
 
 DINE 策略需要托管标识来部署告警资源，因此必须指定 `--mi-system-assigned` 与 `--location`。
 
+> **注意**：定义位于管理组时，`--policy` 必须使用**完整的定义资源 ID**（`$MG_SCOPE/providers/Microsoft.Authorization/policyDefinitions/<name>`）。若只传短名，CLI 会默认在当前订阅查找定义而报错。
+
 ```bash
 az policy assignment create \
   --name "auto-vm-metric-alert" \
   --display-name "自动为虚拟机创建指标告警" \
-  --policy "auto-vm-metric-alert" \
+  --policy "$MG_SCOPE/providers/Microsoft.Authorization/policyDefinitions/auto-vm-metric-alert" \
   --scope "$MG_SCOPE" \
   --mi-system-assigned \
   --location "$ASSIGNMENT_LOCATION" \
@@ -172,7 +174,7 @@ az policy definition create \
 az policy assignment create \
   --name "auto-mysql-metric-alert" \
   --display-name "自动为 MySQL 弹性服务器创建指标告警" \
-  --policy "auto-mysql-metric-alert" \
+  --policy "$MG_SCOPE/providers/Microsoft.Authorization/policyDefinitions/auto-mysql-metric-alert" \
   --scope "$MG_SCOPE" \
   --mi-system-assigned --location "$ASSIGNMENT_LOCATION" \
   --params "{\"actionGroupId\": {\"value\": \"$ACTION_GROUP_ID\"}}"
@@ -197,7 +199,7 @@ az policy definition create \
 az policy assignment create \
   --name "auto-redis-metric-alert" \
   --display-name "自动为 Azure Managed Redis 创建指标告警" \
-  --policy "auto-redis-metric-alert" \
+  --policy "$MG_SCOPE/providers/Microsoft.Authorization/policyDefinitions/auto-redis-metric-alert" \
   --scope "$MG_SCOPE" \
   --mi-system-assigned --location "$ASSIGNMENT_LOCATION" \
   --params "{\"actionGroupId\": {\"value\": \"$ACTION_GROUP_ID\"}}"
