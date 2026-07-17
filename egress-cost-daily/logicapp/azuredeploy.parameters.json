@@ -1,0 +1,11 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "logicAppName": { "value": "egress-cost-logic" },
+    "meterCategory": { "value": "Bandwidth" },
+    "emailSender": { "value": "DoNotReply@<你的发件域>.azurecomm.net" },
+    "emailRecipients": { "value": "you@example.com" },
+    "scheduleHour": { "value": 2 }
+  }
+}
