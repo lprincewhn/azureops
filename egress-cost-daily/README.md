@@ -37,6 +37,7 @@ egress-cost-daily/
 |---|---|---|
 | 运行时 | Python | 低代码工作流(无代码) |
 | 发邮件 | ACS SDK | ACS Email 连接器(`acsemail`,密钥) |
+| 邮件正文 | 真实金额 + 分项明细表 | 真实金额 + 分项明细表 + 环比差异(较前一天百分比) |
 | 是否需要 ACS | 是 | 是(复用同一个 ACS) |
 | 发件人 | `DoNotReply@…azurecomm.net` | `DoNotReply@…azurecomm.net` |
 | 鉴权 | 托管标识查成本 | 托管标识查成本 + ACS 连接串(密钥) |
