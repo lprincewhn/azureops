@@ -91,6 +91,17 @@ ACS_CONN=$(az communication list-key -g $RG --name $ACS_NAME \
   --query primaryConnectionString -o tsv)
 ```
 
+> **发件域与收件人从哪来？**
+> - **发件人 `$EMAIL_SENDER`**：由步骤 1b 查询托管发件域 `properties.fromSenderDomain` 自动拼成
+>   `DoNotReply@<发件域>.azurecomm.net`，无需手填。若已部署过 ACS，可单独查回：
+>   ```bash
+>   az resource show -g $RG --name "$EMAIL_SVC/AzureManagedDomain" \
+>     --resource-type Microsoft.Communication/emailServices/domains \
+>     --api-version 2023-04-01 --query properties.fromSenderDomain -o tsv
+>   ```
+> - **收件人 `$RECIPIENTS`**：在第 0 节按需修改成真实邮箱。
+>   **方案 A（Function）多个用逗号 `,`；方案 B（Logic App）多个用分号 `;`**。
+
 ---
 
 # 方案 A：Azure Functions（Python）+ ACS

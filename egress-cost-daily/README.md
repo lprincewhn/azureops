@@ -46,6 +46,27 @@ egress-cost-daily/
 
 ### Logic App 部署
 
+**部署前：填写 `logicapp/azuredeploy.parameters.json`**（`emailSender` 与 `emailRecipients` 默认是占位符）：
+
+```bash
+# 1) 获取 ACS 托管发件域，拼出发件地址
+SENDER_DOMAIN=$(az resource show \
+  -g <rg> --name "<emailService名>/AzureManagedDomain" \
+  --resource-type Microsoft.Communication/emailServices/domains \
+  --api-version 2023-04-01 --query properties.fromSenderDomain -o tsv)
+echo "发件人: DoNotReply@${SENDER_DOMAIN}"
+
+# 2) 把上面的发件地址填入 emailSender，把真实收件人填入 emailRecipients
+#    （Logic App 收件人多个用分号 ; 分隔）
+```
+
+`logicapp/azuredeploy.parameters.json` 示例：
+```jsonc
+"emailSender":     { "value": "DoNotReply@<你的发件域>.azurecomm.net" },  // ← 用上面 SENDER_DOMAIN
+"emailRecipients": { "value": "you@example.com;teammate@example.com" }    // ← 真实收件人，分号分隔
+```
+
+**部署：**
 ```bash
 CS=$(az communication list-key --name <acs名> -g <rg> --query primaryConnectionString -o tsv)
 az deployment group create -g <rg> \
