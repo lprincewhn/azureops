@@ -53,27 +53,22 @@ az resource create \
   --location global \
   --properties "{\"dataLocation\":\"$DATA_LOCATION\"}"
 
-# 1b. Azure 托管发件域
-az resource create \
-  -g $RG --name "$EMAIL_SVC/AzureManagedDomain" \
-  --resource-type Microsoft.Communication/emailServices/domains \
-  --api-version 2023-04-01 \
-  --location global \
-  --properties '{"domainManagement":"AzureManaged","userEngagementTracking":"Disabled"}'
+# 1b. Azure 托管发件域（用 ACS 专用命令；az resource create 对该子资源类型解析会报错）
+az communication email domain create \
+  -g $RG --email-service-name $EMAIL_SVC \
+  --name AzureManagedDomain --location global \
+  --domain-management AzureManaged --user-engmnt-tracking Disabled
 
 # 取回发件域，拼出发件地址
-SENDER_DOMAIN=$(az resource show \
-  -g $RG --name "$EMAIL_SVC/AzureManagedDomain" \
-  --resource-type Microsoft.Communication/emailServices/domains \
-  --api-version 2023-04-01 \
-  --query properties.fromSenderDomain -o tsv)
+SENDER_DOMAIN=$(az communication email domain show \
+  -g $RG --email-service-name $EMAIL_SVC --name AzureManagedDomain \
+  --query fromSenderDomain -o tsv)
 EMAIL_SENDER="DoNotReply@${SENDER_DOMAIN}"
 echo "发件人: $EMAIL_SENDER"
 
-DOMAIN_ID=$(az resource show \
-  -g $RG --name "$EMAIL_SVC/AzureManagedDomain" \
-  --resource-type Microsoft.Communication/emailServices/domains \
-  --api-version 2023-04-01 --query id -o tsv)
+DOMAIN_ID=$(az communication email domain show \
+  -g $RG --email-service-name $EMAIL_SVC --name AzureManagedDomain \
+  --query id -o tsv)
 
 # 1c. Communication Service，并关联发件域
 az communication create \
@@ -92,12 +87,12 @@ ACS_CONN=$(az communication list-key -g $RG --name $ACS_NAME \
 ```
 
 > **发件域与收件人从哪来？**
-> - **发件人 `$EMAIL_SENDER`**：由步骤 1b 查询托管发件域 `properties.fromSenderDomain` 自动拼成
+> - **发件人 `$EMAIL_SENDER`**：由步骤 1b 查询托管发件域 `fromSenderDomain` 自动拼成
 >   `DoNotReply@<发件域>.azurecomm.net`，无需手填。若已部署过 ACS，可单独查回：
 >   ```bash
->   az resource show -g $RG --name "$EMAIL_SVC/AzureManagedDomain" \
->     --resource-type Microsoft.Communication/emailServices/domains \
->     --api-version 2023-04-01 --query properties.fromSenderDomain -o tsv
+>   az communication email domain show -g $RG \
+>     --email-service-name $EMAIL_SVC --name AzureManagedDomain \
+>     --query fromSenderDomain -o tsv
 >   ```
 > - **收件人 `$RECIPIENTS`**：在第 0 节按需修改成真实邮箱。
 >   **方案 A（Function）多个用逗号 `,`；方案 B（Logic App）多个用分号 `;`**。
@@ -110,13 +105,24 @@ ACS_CONN=$(az communication list-key -g $RG --name $ACS_NAME \
 
 ```bash
 FUNC_APP=func-egresscost-$RANDOM        # 全局唯一
-STORAGE=stegresscost$RANDOM             # 3-24 位小写字母数字，全局唯一
 AI_NAME=${FUNC_APP}-ai
 
-# 存储账户（Functions 宿主必需：代码包/Timer 锁/运行时协调，不存业务数据）
+# 宿主存储（Functions 必需：代码包/Timer 锁/运行时协调，不存业务数据）
+# 若订阅策略强制 allowSharedKeyAccess=false / publicNetworkAccess=Disabled，
+# 新建存储无法作为宿主存储；请改用一个「允许共享密钥+公网」的已有存储账户。
+#
+# 方式①：新建存储（订阅无上述策略时）
+STORAGE=stegresscost$RANDOM             # 3-24 位小写字母数字，全局唯一
 az storage account create \
   -g $RG -n $STORAGE -l $LOCATION \
   --sku Standard_LRS --kind StorageV2 --min-tls-version TLS1_2
+# 校验策略是否放行密钥：应为 true / Enabled，否则改用方式②
+az storage account show -g $RG -n $STORAGE \
+  --query "{sharedKey:allowSharedKeyAccess,pub:publicNetworkAccess}" -o json
+STORAGE_ARG=$STORAGE
+
+# 方式②：复用已有的允许密钥+公网的存储（跨资源组时必须用完整资源 ID）
+# STORAGE_ARG=$(az storage account show -n <已有存储名> -g <所在RG> --query id -o tsv)
 
 # Application Insights
 az monitor app-insights component create \
@@ -127,7 +133,7 @@ AI_CONN=$(az monitor app-insights component show \
 # Function App（Linux 消费计划 + Python 3.11 + 系统托管标识）
 az functionapp create \
   -g $RG -n $FUNC_APP \
-  --storage-account $STORAGE \
+  --storage-account "$STORAGE_ARG" \
   --consumption-plan-location $LOCATION \
   --runtime python --runtime-version 3.11 \
   --functions-version 4 \
@@ -136,9 +142,9 @@ az functionapp create \
   --assign-identity '[system]'
 ```
 
-> ⚠️ **存储账户策略注意**：若订阅有策略强制 `allowSharedKeyAccess=false` 或 `publicNetworkAccess=Disabled`，
-> 新建存储账户无法作为 Functions 宿主存储。此时改用一个**允许共享密钥+公网**的已有存储账户，
-> 用其连接串覆盖 `AzureWebJobsStorage`（见下）。
+> ⚠️ **存储账户策略注意**：很多订阅有策略强制新建存储 `allowSharedKeyAccess=false` + `publicNetworkAccess=Disabled`，
+> 此时新存储无法作为 Functions 宿主存储（部署报 `KeyBasedAuthenticationNotPermitted`）。
+> 请用方式②复用一个允许密钥+公网的已有存储账户，**跨资源组时 `--storage-account` 必须传完整资源 ID**。
 
 ## A2. 配置应用设置
 
@@ -176,6 +182,8 @@ az role assignment create \
 ## A4. 发布函数代码（远程构建装依赖）
 
 ```bash
+# 需先安装 Azure Functions Core Tools v4（若未安装）：
+#   npm install -g azure-functions-core-tools@4 --unsafe-perm true
 cd /home/azureuser/copilot/egress-cost-daily
 func azure functionapp publish $FUNC_APP --build remote
 ```
@@ -311,16 +319,15 @@ JSON
 
 ## B3. 创建 Logic App 工作流（az cli）
 
+`az logic workflow create` 的 `--definition` 需要**完整的工作流属性对象**（即包含 `definition`
+与 `parameters` 两个键，正是 B2 生成的 `workflow-def.json`），并用 `--mi-system-assigned true`
+一并开启系统托管标识（该命令没有独立的 `--parameters` 参数）：
+
 ```bash
 az logic workflow create \
   -g $RG --name $LOGIC_APP --location $LOCATION \
-  --definition "$(python3 -c "import json;print(json.dumps(json.load(open('/tmp/workflow-def.json'))['definition']))")" \
-  --parameters "$(python3 -c "import json;print(json.dumps(json.load(open('/tmp/workflow-def.json'))['parameters']))")"
-
-# 开启系统托管标识（查成本用）
-az resource update -g $RG --name $LOGIC_APP \
-  --resource-type Microsoft.Logic/workflows --api-version 2019-05-01 \
-  --set identity.type=SystemAssigned
+  --mi-system-assigned true \
+  --definition @/tmp/workflow-def.json
 ```
 
 ## B4. 授予托管标识查成本的角色
