@@ -1,0 +1,3 @@
+*.csv
+ri-reallocated*/
+__pycache__/
