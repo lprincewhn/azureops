@@ -21,6 +21,7 @@ import argparse
 import csv
 import glob
 import json
+import re
 from collections import defaultdict
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -149,25 +150,50 @@ def vm_model(row: dict[str, str]) -> str:
     return str(additional_info(row).get("ServiceType") or row.get("meterName") or "")
 
 
-def instance_flexibility_group(row: dict[str, str]) -> str:
-    """获取 RI 实例大小灵活性分组，如 'DSv3 Series'；无则返回空串。"""
-    return str(additional_info(row).get("InstanceFlexibilityGroup") or "").strip()
+def ri_normalization_ratio(row: dict[str, str]) -> Decimal | None:
+    """获取 additionalInfo.RINormalizationRatio；缺失或非法时返回 None。
 
-
-def instance_flexibility_ratio(row: dict[str, str]) -> Decimal | None:
-    """获取 RI 实例大小灵活性归一化比率；缺失或非法时返回 None。"""
-    raw = str(additional_info(row).get("InstanceFlexibilityRatio") or "").strip()
-    if not raw:
+    这是 Azure 账单中真实存在的实例大小灵活性字段：当 RI 以大小灵活性方式
+    应用到某个机型时，该比率表示 RI 在该机型上的归一化占用系数。
+    """
+    raw = additional_info(row).get("RINormalizationRatio")
+    if raw is None or str(raw).strip() == "":
         return None
     try:
-        return Decimal(raw)
+        return Decimal(str(raw))
     except InvalidOperation:
         return None
 
 
+# 从机型名派生实例大小灵活性组：family + 附加特性 + 版本（去掉 vCPU 核数与受限核数）。
+# 例：Standard_D2s_v5 / Standard_D4s_v5 / Standard_D8-2s_v5 → 组 "Ds_v5"；
+#     Standard_E8s_v5 → "Es_v5"；Standard_D2_v5 → "D_v5"（非高级存储，另一组）。
+# 说明：这是基于命名规则的启发式分组，覆盖 D/E/F 等主流系列的常见场景，
+# 并非 Azure 官方灵活性比率表的逐条复刻；边缘系列如有出入可按官方表扩展。
+_SIZE_PATTERN = re.compile(r"^([A-Za-z]+)(\d+)(?:-\d+)?([A-Za-z]*)(_.*)?$")
+
+
+def flexibility_group(model: str) -> str:
+    """根据机型名派生实例大小灵活性组标识；无法解析时返回原始机型名。"""
+    name = model.strip()
+    if name.startswith("Standard_"):
+        name = name[len("Standard_") :]
+    match = _SIZE_PATTERN.match(name)
+    if not match:
+        return model.strip()
+    family, _cores, features, version = match.groups()
+    return f"{family}{features}{version or ''}"
+
+
 def is_size_flexible(row: dict[str, str]) -> bool:
-    """判断明细对应的 RI 是否以实例大小灵活性方式应用（存在灵活性分组）。"""
-    return bool(instance_flexibility_group(row))
+    """启发式判断该明细是否体现了实例大小灵活性（应用到非基准规格）。
+
+    依据真实字段 RINormalizationRatio：比率存在且不等于 1 时，说明该 RI 被
+    归一化到了与基准不同的规格。注意：比率为 1 也可能是基准规格本身，
+    因此该判断仅为按行提示，权威的 On/Off 需 Reservation API（账单不含）。
+    """
+    ratio = ri_normalization_ratio(row)
+    return ratio is not None and ratio != Decimal("1")
 
 
 def vm_region(row: dict[str, str]) -> str:
@@ -184,12 +210,14 @@ def allocation_key(row: dict[str, str], match_mode: str = "model") -> tuple[str,
     """返回 RI 收益匹配使用的键。
 
     - model：按精确机型和区域匹配（默认，兼容历史行为）。
-    - flex-group：优先按 RI 实例大小灵活性分组和区域匹配，使同一 RI 覆盖的
-      不同机型能落入同一收益池；缺少灵活性分组时回退到机型匹配。
+    - flex-group：按机型派生的实例大小灵活性组和区域匹配，使同一 RI 覆盖的
+      同系列不同规格（如 D2s_v5 与 D4s_v5）落入同一收益池，避免"RI 单规格、
+      目标项目另一规格"时分摊失败。无法解析机型时回退到精确机型。
     """
     region = vm_region(row)
     if match_mode == "flex-group":
-        group = instance_flexibility_group(row)
+        model = vm_model(row)
+        group = flexibility_group(model)
         if group:
             return f"flexgroup:{group}", region
     return vm_model(row), region
@@ -228,6 +256,7 @@ def main() -> None:
         Decimal
     )
     ri_amount_by_key: defaultdict[tuple[str, str], Decimal] = defaultdict(Decimal)
+    ri_service_types: defaultdict[str, set[str]] = defaultdict(set)
 
     for input_path in input_paths:
         source_files.append(str(input_path))
@@ -254,6 +283,9 @@ def main() -> None:
 
                 if is_ri_usage(row, reservation_ids):
                     ri_usage_rows += 1
+                    ri_service_types[row.get("reservationId", "").strip()].add(
+                        vm_model(row)
+                    )
                     if is_size_flexible(row):
                         ri_size_flexible_rows += 1
                     if not has_target_tag(row, target_tag):
@@ -410,11 +442,15 @@ def main() -> None:
         "riUsageRows": ri_usage_rows,
         "riReallocatedRows": ri_reallocated_rows,
         "riSizeFlexibleRows": ri_size_flexible_rows,
+        "riServiceTypes": {
+            reservation_id: sorted(models)
+            for reservation_id, models in sorted(ri_service_types.items())
+        },
         "riUsageAmount": str(ri_amount),
         "targetNonRiVmAmount": str(target_non_ri_total),
         "riAllocationKeys": [
             {
-                "vmModel": key[0],
+                "matchKey": key[0],
                 "region": key[1],
                 "riAmount": str(ri_amount_by_key[key]),
                 "targetNonRiVmAmount": str(target_non_ri_total_by_key.get(key, Decimal("0"))),

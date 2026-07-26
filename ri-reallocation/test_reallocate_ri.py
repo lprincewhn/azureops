@@ -43,55 +43,61 @@ class ReallocationFilterTests(unittest.TestCase):
             ("Standard_D8s_v5", "AP Southeast"),
         )
 
-    def test_size_flexibility_helpers_read_additional_info(self):
-        row = {
-            "additionalInfo": (
-                '{"ServiceType":"Standard_D2s_v3",'
-                '"InstanceFlexibilityGroup":"DSv3 Series",'
-                '"InstanceFlexibilityRatio":"1"}'
-            )
-        }
-        self.assertTrue(MODULE.is_size_flexible(row))
-        self.assertEqual(MODULE.instance_flexibility_group(row), "DSv3 Series")
-        self.assertEqual(MODULE.instance_flexibility_ratio(row), MODULE.Decimal("1"))
+    def test_ri_normalization_ratio_reads_real_field(self):
+        row = {"additionalInfo": '{"ServiceType":"Standard_D2s_v5","RINormalizationRatio":1.0}'}
+        self.assertEqual(MODULE.ri_normalization_ratio(row), MODULE.Decimal("1.0"))
 
-    def test_size_flexibility_helpers_default_when_absent(self):
-        row = {"additionalInfo": '{"ServiceType":"Standard_D2s_v3"}'}
-        self.assertFalse(MODULE.is_size_flexible(row))
-        self.assertEqual(MODULE.instance_flexibility_group(row), "")
-        self.assertIsNone(MODULE.instance_flexibility_ratio(row))
+    def test_ri_normalization_ratio_missing_returns_none(self):
+        self.assertIsNone(MODULE.ri_normalization_ratio({"additionalInfo": "{}"}))
+        self.assertIsNone(MODULE.ri_normalization_ratio({}))
 
-    def test_flex_group_match_mode_groups_different_models(self):
+    def test_is_size_flexible_uses_normalization_ratio(self):
+        base = {"additionalInfo": '{"RINormalizationRatio":1.0}'}
+        flexed = {"additionalInfo": '{"RINormalizationRatio":2.0}'}
+        missing = {"additionalInfo": "{}"}
+        self.assertFalse(MODULE.is_size_flexible(base))
+        self.assertTrue(MODULE.is_size_flexible(flexed))
+        self.assertFalse(MODULE.is_size_flexible(missing))
+
+    def test_flexibility_group_derivation(self):
+        self.assertEqual(MODULE.flexibility_group("Standard_D2s_v5"), "Ds_v5")
+        self.assertEqual(MODULE.flexibility_group("Standard_D4s_v5"), "Ds_v5")
+        self.assertEqual(MODULE.flexibility_group("Standard_D8-2s_v5"), "Ds_v5")
+        self.assertEqual(MODULE.flexibility_group("Standard_E8s_v5"), "Es_v5")
+        self.assertEqual(MODULE.flexibility_group("Standard_D2_v5"), "D_v5")
+        self.assertEqual(MODULE.flexibility_group("Standard_D2ads_v5"), "Dads_v5")
+
+    def test_flex_group_match_mode_groups_different_sizes(self):
         d2 = {
-            "meterRegion": "AP Southeast",
-            "additionalInfo": (
-                '{"ServiceType":"Standard_D2s_v3","InstanceFlexibilityGroup":"DSv3 Series"}'
-            ),
+            "meterRegion": "US West 3",
+            "additionalInfo": '{"ServiceType":"Standard_D2s_v5"}',
         }
         d4 = {
-            "meterRegion": "AP Southeast",
-            "additionalInfo": (
-                '{"ServiceType":"Standard_D4s_v3","InstanceFlexibilityGroup":"DSv3 Series"}'
-            ),
+            "meterRegion": "US West 3",
+            "additionalInfo": '{"ServiceType":"Standard_D4s_v5"}',
         }
-        # model 模式下不同机型分到不同池
+        # model 模式下不同规格分到不同池
         self.assertNotEqual(
             MODULE.allocation_key(d2, "model"), MODULE.allocation_key(d4, "model")
         )
-        # flex-group 模式下同一灵活性分组落入同一池
+        # flex-group 模式下同系列不同规格落入同一池
         self.assertEqual(
             MODULE.allocation_key(d2, "flex-group"),
             MODULE.allocation_key(d4, "flex-group"),
         )
 
-    def test_flex_group_match_mode_falls_back_to_model(self):
-        row = {
+    def test_flex_group_separates_different_series(self):
+        d2 = {
             "meterRegion": "US West 3",
             "additionalInfo": '{"ServiceType":"Standard_D2s_v5"}',
         }
-        self.assertEqual(
-            MODULE.allocation_key(row, "flex-group"),
-            ("Standard_D2s_v5", "US West 3"),
+        e2 = {
+            "meterRegion": "US West 3",
+            "additionalInfo": '{"ServiceType":"Standard_E2s_v5"}',
+        }
+        self.assertNotEqual(
+            MODULE.allocation_key(d2, "flex-group"),
+            MODULE.allocation_key(e2, "flex-group"),
         )
 
     def test_allocation_key_does_not_match_different_region_or_model(self):

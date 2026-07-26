@@ -42,15 +42,22 @@ costInBillingCurrency
 区域 = meterRegion（缺失时依次使用 resourceLocation、location）
 ```
 
-默认按精确机型匹配（`--match-mode model`）。当同一个 RI 因**实例大小灵活性（Instance Size Flexibility）**同时覆盖同一系列的不同机型时，RI 使用记录的机型可能与目标项目实际使用的机型不同，导致精确匹配失败。此时可使用 `--match-mode flex-group`，改为按**灵活性分组**匹配：
+默认按精确机型匹配（`--match-mode model`）。当某个 RI 开启了**实例大小灵活性（Instance Size Flexibility）**、可覆盖同一系列的不同规格时，RI 使用记录的机型可能与目标项目实际使用的机型不同（例如 RI 记录为 `Standard_D2s_v5`，而目标项目只跑 `Standard_D4s_v5`），此时 `model` 模式会因找不到同规格目标明细而**报错分摊不出去**。使用 `--match-mode flex-group` 可改为按**灵活性组**匹配：
 
 ```text
-分组 = additionalInfo.InstanceFlexibilityGroup（如 "DSv3 Series"）
+组 = 从 additionalInfo.ServiceType 派生的灵活性组（family + 附加特性 + 版本，去掉核数）
+     例：Standard_D2s_v5 / Standard_D4s_v5 / Standard_D8-2s_v5 → "Ds_v5"
+         Standard_E8s_v5 → "Es_v5"；Standard_D2_v5 → "D_v5"
 区域 = meterRegion（缺失时依次使用 resourceLocation、location）
-# 该行没有灵活性分组时，自动回退到机型匹配
+# 机型无法解析时，自动回退到精确机型匹配
 ```
 
-> 说明：`additionalInfo.InstanceFlexibilityGroup`（分组）和 `InstanceFlexibilityRatio`（归一化比率）用于判断某条明细是否以大小灵活性方式应用了 RI。汇总报告 `ri-summary.json` 会输出 `matchMode` 与 `riSizeFlexibleRows`（存在灵活性分组的 RI 使用记录数）。比率仅作辅助判断，**不参与费用比例分摊计算**——分摊按各明细的实际费用（已反映机型大小差异）等比进行，若再乘以比率会重复计入。
+> **关于账单字段（重要更正）**：Azure 账单 `additionalInfo` 中真实存在的灵活性字段是 **`RINormalizationRatio`**（实例大小灵活性归一化比率），**不存在** `InstanceFlexibilityGroup` / `InstanceFlexibilityRatio`。因此本工具的灵活性组是**按机型命名规则派生的启发式分组**（覆盖 D/E/F 等主流系列的常见场景），并非 Azure 官方比率表的逐条复刻；边缘系列如有出入可按官方表扩展。
+>
+> **归一化比率不参与费用分摊**：分摊按各明细的**实际费用**（已反映机型大小差异）等比进行，若再乘以 `RINormalizationRatio` 会重复计入。该比率仅用于按行提示（`is_size_flexible`：比率存在且 ≠ 1 表示应用到了非基准规格）。
+>
+> **flex-group 需人工确认**：能否跨规格分摊取决于该 RI 的 flexibility 是否为 **On**，而权威的 On/Off 只在 Reservation API（账单不含，且通常需要 Reservation/Billing 读权限）。因此 `flex-group` 为**显式 opt-in**，请在确认该 RI 已开启大小灵活性后使用。汇总 `ri-summary.json` 会输出 `matchMode`、`riSizeFlexibleRows`（`RINormalizationRatio ≠ 1` 的记录数）以及 `riServiceTypes`（每个 RI 实际覆盖的机型集合）供判断。
+
 
 ## 3. 分摊逻辑
 
