@@ -52,12 +52,6 @@ costInBillingCurrency
 # 机型无法解析时，自动回退到精确机型匹配
 ```
 
-> **关于账单字段（重要更正）**：Azure 账单 `additionalInfo` 中真实存在的灵活性字段是 **`RINormalizationRatio`**（实例大小灵活性归一化比率），**不存在** `InstanceFlexibilityGroup` / `InstanceFlexibilityRatio`。因此本工具的灵活性组是**按机型命名规则派生的启发式分组**（覆盖 D/E/F 等主流系列的常见场景），并非 Azure 官方比率表的逐条复刻；边缘系列如有出入可按官方表扩展。
->
-> **归一化比率不参与费用分摊**：分摊按各明细的**实际费用**（已反映机型大小差异）等比进行，若再乘以 `RINormalizationRatio` 会重复计入。该比率仅用于按行提示（`is_size_flexible`：比率存在且 ≠ 1 表示应用到了非基准规格）。
->
-> **flex-group 需人工确认**：能否跨规格分摊取决于该 RI 的 flexibility 是否为 **On**，而权威的 On/Off 只在 Reservation API（账单不含，且通常需要 Reservation/Billing 读权限）。因此 `flex-group` 为**显式 opt-in**，请在确认该 RI 已开启大小灵活性后使用。汇总 `ri-summary.json` 会输出 `matchMode`、`riSizeFlexibleRows`（`RINormalizationRatio ≠ 1` 的记录数）以及 `riServiceTypes`（每个 RI 实际覆盖的机型集合）供判断。
-
 
 ## 3. 分摊逻辑
 
@@ -94,16 +88,16 @@ meterCategory = Virtual Machines
 且不是实际 RI 使用记录
 ```
 
-RI 金额按相同机型、相同区域的目标项目明细原始虚拟机费用比例分摊，不同机型或区域的虚拟机不会承接该 RI 收益。
+RI 金额按相同机型(或灵活性组)、相同区域的目标项目明细原始虚拟机费用比例分摊，不同机型或区域的虚拟机不会承接该 RI 收益。
 
 设：
 
 ```text
-RI总金额 = 同一机型和区域下所有不匹配目标标签的指定 RI 使用记录金额合计
+RI总金额 = 同一机型(或灵活性组)和区域下所有不匹配目标标签的指定 RI 使用记录金额合计
 目标项目非RI虚拟机费用总额 = 同一机型和区域下所有目标项目明细的原始费用合计
 ```
 
-每一条 `fota` 明细的分摊金额为：
+每一条明细的分摊金额为：
 
 ```text
 该行分摊金额
@@ -175,6 +169,7 @@ python3 reallocate_vm_ri.py \
   part_1_0001.csv \
   --reservation-id 8345b648-839b-4fdc-acbc-a776bdfe00d5 \
   --target-tag projname=fota \
+  --match-mode flex-group \
   --output-dir ri-reallocated
 ```
 
@@ -185,6 +180,7 @@ python3 reallocate_vm_ri.py \
   "part_*_0001.csv" \
   --reservation-id 8345b648-839b-4fdc-acbc-a776bdfe00d5 \
   --target-tag projname=fota \
+  --match-mode flex-group \
   --output-dir ri-reallocated
 ```
 
@@ -197,6 +193,7 @@ python3 reallocate_vm_ri.py \
   --reservation-id ri-id-1 \
   --reservation-id ri-id-2 \
   --target-tag projname=fota \
+  --match-mode flex-group \
   --output-dir ri-reallocated
 ```
 
@@ -314,60 +311,3 @@ ri-reallocated/
 ```
 
 其中 `changed-vm-cost-comparison.csv` 仅包含发生费用变化的虚拟机，并包含 `region`、`vmModel`、处理前费用、处理后费用和 `feeChangeInBillingCurrency`。
-
-## 10. 本次分摊执行日志
-
-分摊命令：
-
-```bash
-python3 reallocate_vm_ri.py \
-  part_0_0001.csv part_1_0001.csv \
-  --reservation-id 8345b648-839b-4fdc-acbc-a776bdfe00d5 \
-  --target-tag projname=fota \
-  --output-dir ri-reallocated
-```
-
-执行结果：
-
-```text
-RI 使用记录：24 条
-RI 使用金额：12.776931506849312
-目标项目非 RI 虚拟机费用：510.8680547140
-输出目录：ri-reallocated
-汇总文件：ri-reallocated/ri-summary.json
-```
-
-## 11. 机型与区域匹配规则变更
-
-分摊算法已更新为按 `additionalInfo.ServiceType` 和区域进行匹配。当前账单中指定 RI 的匹配键为：
-
-```text
-机型：Standard_D2s_v5
-区域：US West 3
-RI 金额：12.776931506849312
-```
-
-当前 `fota` 非 RI 虚拟机的可用匹配明细位于 `AP Southeast`，没有 `Standard_D2s_v5 + US West 3` 的目标明细。因此再次执行上述示例命令时，脚本会显式报错并停止，不会生成跨区域分摊结果。
-
-## 12. observe-platform 分摊执行记录
-
-将接收项目改为 `observe-platform` 后，命令如下：
-
-```bash
-python3 reallocate_vm_ri.py \
-  part_0_0001.csv part_1_0001.csv \
-  --reservation-id 8345b648-839b-4fdc-acbc-a776bdfe00d5 \
-  --target-tag projname=observe-platform \
-  --output-dir ri-reallocated-observe-platform
-```
-
-执行及对账结果：
-
-```text
-RI 使用记录：24 条
-RI 使用金额：12.623371726465751
-目标项目非 RI 虚拟机费用：586.3782283132
-虚拟机资源数：317
-费用发生变化的虚拟机数：4
-变化合计：0E-23
-```
