@@ -167,7 +167,7 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # 先将明细加载到内存，第二遍处理时可以按 fota 的总费用计算比例。
+    # 先将明细加载到内存，第二遍处理时可以按目标项目的总费用计算比例。
     rows: list[dict[str, str]] = []
     fieldnames: list[str] | None = None
     source_files: list[str] = []
@@ -236,8 +236,8 @@ def main() -> None:
                 "匹配的非 RI 虚拟机明细。"
             )
 
-    # 非 fota 的 RI 使用记录加回自身 RI 金额，体现未人为分配前的原始资源成本。
-    # fota 的非 RI VM 明细按原始费用比例扣减，承接 RI 优惠收益。
+    # 非目标项目的 RI 使用记录加回自身 RI 金额，体现未人为分配前的原始资源成本。
+    # 目标项目的非 RI VM 明细按原始费用比例扣减，承接 RI 优惠收益。
     allocation_by_index: dict[int, Decimal] = {}
     for index, row in enumerate(rows):
         if row.get("meterCategory") == "Virtual Machines" and is_ri_usage(
@@ -293,7 +293,7 @@ def main() -> None:
                     if adjustment > 0:
                         row["allocationType"] = "RI_USAGE_COST_REASSIGNED"
                         row["allocationTarget"] = target_project
-                    # 负数表示把 RI 优惠收益分配给 fota 项目。
+                    # 负数表示把 RI 优惠收益分配给目标项目。
                     elif adjustment < 0:
                         row["allocationType"] = "RI_BENEFIT_ASSIGNED"
                         row["allocationTarget"] = target_project
