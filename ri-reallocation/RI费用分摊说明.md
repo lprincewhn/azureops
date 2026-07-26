@@ -144,12 +144,12 @@ riAllocationAmount = 负数
 
 | 字段 | 说明 |
 |---|---|
-| `allocatedCostInBillingCurrency` | 分摊后的计算金额 |
+| `allocated<金额字段>` | 分摊后的计算金额；列名随 `--amount-field` 变化，默认 `allocatedCostInBillingCurrency`，使用 `--amount-field costInUsd` 时为 `allocatedCostInUsd` |
 | `riAllocationAmount` | 本行 RI 分摊调整金额，正数为加回，负数为扣减 |
 | `allocationType` | 分摊类型 |
 | `allocationTarget` | 分摊目标项目，即目标标签的值 |
 
-原始 `costInBillingCurrency` 不修改，便于对账。
+分摊后金额列的货币与 `--amount-field` 一致；汇总 `ri-summary.json` 的 `allocatedCostField` 字段记录了本次使用的列名。原始金额字段不修改，便于对账。
 
 ## 5. 脚本文件
 

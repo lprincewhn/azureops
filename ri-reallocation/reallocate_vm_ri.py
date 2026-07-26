@@ -196,6 +196,15 @@ def is_size_flexible(row: dict[str, str]) -> bool:
     return ratio is not None and ratio != Decimal("1")
 
 
+def allocated_field_name(amount_field: str) -> str:
+    """根据金额字段派生分摊后金额的输出列名。
+
+    使输出列货币与 --amount-field 一致，避免用非账单货币时列名产生误导。
+    默认 costInBillingCurrency 仍产出 allocatedCostInBillingCurrency（向后兼容）。
+    """
+    return "allocated" + amount_field[:1].upper() + amount_field[1:]
+
+
 def vm_region(row: dict[str, str]) -> str:
     """获取 Azure VM 区域。"""
     return (
@@ -339,12 +348,13 @@ def main() -> None:
             )
 
     output_paths: list[str] = []
+    allocated_field = allocated_field_name(args.amount_field)
     if not args.summary_only:
         if fieldnames is None:
             raise ValueError("没有读取到 CSV 表头")
         fieldnames = [
             *fieldnames,
-            "allocatedCostInBillingCurrency",
+            allocated_field,
             "riAllocationAmount",
             "allocationType",
             "allocationTarget",
@@ -365,7 +375,7 @@ def main() -> None:
                     row.pop("_source_file", None)
                     original = decimal_from_row(row, args.amount_field)
                     adjustment = allocation_by_index.get(index, Decimal("0"))
-                    row["allocatedCostInBillingCurrency"] = str(
+                    row[allocated_field] = str(
                         original + adjustment
                     )
                     row["riAllocationAmount"] = str(adjustment)
@@ -429,6 +439,7 @@ def main() -> None:
         "targetTag": {"key": target_tag[0], "value": target_tag[1]},
         "reservationIds": sorted(reservation_ids),
         "amountField": args.amount_field,
+        "allocatedCostField": allocated_field,
         "matchMode": args.match_mode,
         "costScope": "meterCategory == Virtual Machines",
         "riSelection": {

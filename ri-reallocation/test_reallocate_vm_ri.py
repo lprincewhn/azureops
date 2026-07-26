@@ -112,5 +112,19 @@ class ReallocationFilterTests(unittest.TestCase):
         self.assertNotEqual(MODULE.allocation_key(source), MODULE.allocation_key(target))
 
 
+    def test_allocated_field_name_follows_amount_field(self):
+        self.assertEqual(
+            MODULE.allocated_field_name("costInBillingCurrency"),
+            "allocatedCostInBillingCurrency",
+        )
+        self.assertEqual(
+            MODULE.allocated_field_name("costInUsd"), "allocatedCostInUsd"
+        )
+        self.assertEqual(
+            MODULE.allocated_field_name("costInPricingCurrency"),
+            "allocatedCostInPricingCurrency",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
