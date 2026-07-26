@@ -42,6 +42,16 @@ costInBillingCurrency
 区域 = meterRegion（缺失时依次使用 resourceLocation、location）
 ```
 
+默认按精确机型匹配（`--match-mode model`）。当同一个 RI 因**实例大小灵活性（Instance Size Flexibility）**同时覆盖同一系列的不同机型时，RI 使用记录的机型可能与目标项目实际使用的机型不同，导致精确匹配失败。此时可使用 `--match-mode flex-group`，改为按**灵活性分组**匹配：
+
+```text
+分组 = additionalInfo.InstanceFlexibilityGroup（如 "DSv3 Series"）
+区域 = meterRegion（缺失时依次使用 resourceLocation、location）
+# 该行没有灵活性分组时，自动回退到机型匹配
+```
+
+> 说明：`additionalInfo.InstanceFlexibilityGroup`（分组）和 `InstanceFlexibilityRatio`（归一化比率）用于判断某条明细是否以大小灵活性方式应用了 RI。汇总报告 `ri-summary.json` 会输出 `matchMode` 与 `riSizeFlexibleRows`（存在灵活性分组的 RI 使用记录数）。比率仅作辅助判断，**不参与费用比例分摊计算**——分摊按各明细的实际费用（已反映机型大小差异）等比进行，若再乘以比率会重复计入。
+
 ## 3. 分摊逻辑
 
 ### 3.1 RI 使用记录

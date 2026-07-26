@@ -56,6 +56,15 @@ def parse_args() -> argparse.Namespace:
         help="RI 分摊金额字段，默认：costInBillingCurrency",
     )
     parser.add_argument(
+        "--match-mode",
+        default="model",
+        choices=("model", "flex-group"),
+        help=(
+            "RI 收益匹配模式：model 按精确机型和区域匹配（默认）；"
+            "flex-group 按 RI 实例大小灵活性分组和区域匹配，缺分组时回退到机型"
+        ),
+    )
+    parser.add_argument(
         "--summary-only",
         action="store_true",
         help="只生成汇总文件，不生成明细副本",
@@ -126,13 +135,39 @@ def has_target_tag(row: dict[str, str], target_tag: tuple[str, str]) -> bool:
     return str(parse_tags(row.get("tags", "")).get(key) or "") == expected_value
 
 
+def additional_info(row: dict[str, str]) -> dict[str, Any]:
+    """解析账单的 additionalInfo JSON 字段；无效时返回空字典。"""
+    try:
+        info = json.loads(row.get("additionalInfo") or "{}")
+    except json.JSONDecodeError:
+        return {}
+    return info if isinstance(info, dict) else {}
+
+
 def vm_model(row: dict[str, str]) -> str:
     """获取 Azure VM 机型，优先使用 additionalInfo.ServiceType。"""
+    return str(additional_info(row).get("ServiceType") or row.get("meterName") or "")
+
+
+def instance_flexibility_group(row: dict[str, str]) -> str:
+    """获取 RI 实例大小灵活性分组，如 'DSv3 Series'；无则返回空串。"""
+    return str(additional_info(row).get("InstanceFlexibilityGroup") or "").strip()
+
+
+def instance_flexibility_ratio(row: dict[str, str]) -> Decimal | None:
+    """获取 RI 实例大小灵活性归一化比率；缺失或非法时返回 None。"""
+    raw = str(additional_info(row).get("InstanceFlexibilityRatio") or "").strip()
+    if not raw:
+        return None
     try:
-        additional_info = json.loads(row.get("additionalInfo") or "{}")
-    except json.JSONDecodeError:
-        additional_info = {}
-    return str(additional_info.get("ServiceType") or row.get("meterName") or "")
+        return Decimal(raw)
+    except InvalidOperation:
+        return None
+
+
+def is_size_flexible(row: dict[str, str]) -> bool:
+    """判断明细对应的 RI 是否以实例大小灵活性方式应用（存在灵活性分组）。"""
+    return bool(instance_flexibility_group(row))
 
 
 def vm_region(row: dict[str, str]) -> str:
@@ -145,9 +180,19 @@ def vm_region(row: dict[str, str]) -> str:
     )
 
 
-def allocation_key(row: dict[str, str]) -> tuple[str, str]:
-    """返回 RI 收益匹配使用的机型和区域键。"""
-    return vm_model(row), vm_region(row)
+def allocation_key(row: dict[str, str], match_mode: str = "model") -> tuple[str, str]:
+    """返回 RI 收益匹配使用的键。
+
+    - model：按精确机型和区域匹配（默认，兼容历史行为）。
+    - flex-group：优先按 RI 实例大小灵活性分组和区域匹配，使同一 RI 覆盖的
+      不同机型能落入同一收益池；缺少灵活性分组时回退到机型匹配。
+    """
+    region = vm_region(row)
+    if match_mode == "flex-group":
+        group = instance_flexibility_group(row)
+        if group:
+            return f"flexgroup:{group}", region
+    return vm_model(row), region
 
 
 def project_of(row: dict[str, str]) -> str:
@@ -174,6 +219,7 @@ def main() -> None:
     total_rows = 0
     ri_usage_rows = 0
     ri_reallocated_rows = 0
+    ri_size_flexible_rows = 0
     ri_amount = Decimal("0")
     project_before: defaultdict[str, Decimal] = defaultdict(Decimal)
     project_ri: defaultdict[str, Decimal] = defaultdict(Decimal)
@@ -208,13 +254,15 @@ def main() -> None:
 
                 if is_ri_usage(row, reservation_ids):
                     ri_usage_rows += 1
+                    if is_size_flexible(row):
+                        ri_size_flexible_rows += 1
                     if not has_target_tag(row, target_tag):
                         ri_reallocated_rows += 1
                         ri_amount += amount
-                        ri_amount_by_key[allocation_key(row)] += amount
+                        ri_amount_by_key[allocation_key(row, args.match_mode)] += amount
                         project_ri[project] += amount
                 elif has_target_tag(row, target_tag):
-                    key = allocation_key(row)
+                    key = allocation_key(row, args.match_mode)
                     target_non_ri_indexes[key].append(len(rows) - 1)
                     target_non_ri_total_by_key[key] += amount
 
@@ -349,6 +397,7 @@ def main() -> None:
         "targetTag": {"key": target_tag[0], "value": target_tag[1]},
         "reservationIds": sorted(reservation_ids),
         "amountField": args.amount_field,
+        "matchMode": args.match_mode,
         "costScope": "meterCategory == Virtual Machines",
         "riSelection": {
             "pricingModel": "Reservation",
@@ -360,6 +409,7 @@ def main() -> None:
         "totalRows": total_rows,
         "riUsageRows": ri_usage_rows,
         "riReallocatedRows": ri_reallocated_rows,
+        "riSizeFlexibleRows": ri_size_flexible_rows,
         "riUsageAmount": str(ri_amount),
         "targetNonRiVmAmount": str(target_non_ri_total),
         "riAllocationKeys": [
