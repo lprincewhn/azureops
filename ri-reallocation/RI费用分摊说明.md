@@ -55,6 +55,40 @@ costInBillingCurrency
 
 ## 3. 分摊逻辑
 
+### 3.0 处理流程概览
+
+下图为每条账单明细的判定与分摊流程（GitHub 可直接渲染 Mermaid）：
+
+```mermaid
+flowchart TD
+    A[读取账单明细行] --> B{meterCategory<br/>== Virtual Machines?}
+    B -- 否 --> Z[不处理<br/>原样保留]
+    B -- 是 --> C{是指定 RI 使用记录?<br/>pricingModel=Reservation<br/>chargeType=Usage<br/>reservationId 命中}
+
+    C -- 是 --> D{带目标标签?}
+    D -- 是 --> Z2[不处理<br/>RI 收益已在目标项目内]
+    D -- 否 --> E[加回 RI 使用金额<br/>allocationType=RI_USAGE_COST_REASSIGNED<br/>riAllocationAmount 为正<br/>计入 匹配键 的 RI 收益池]
+
+    C -- 否 --> F{带目标标签?}
+    F -- 否 --> Z3[不处理<br/>非目标项目普通费用]
+    F -- 是 --> G[归入目标项目池<br/>按 匹配键 累计原始费用]
+
+    E --> H[[按匹配键汇总:<br/>RI 收益池 & 目标项目费用池]]
+    G --> H
+    H --> I{每个匹配键校验<br/>目标池 ≥ RI池 且 ≠ 0?}
+    I -- 否 --> X[报错并停止<br/>该机型/组+区域分摊不出去]
+    I -- 是 --> J[目标明细按原始费用比例扣减 RI 收益<br/>allocationType=RI_BENEFIT_ASSIGNED<br/>riAllocationAmount 为负]
+    J --> K[输出分摊后明细 + 项目汇总 + summary]
+
+    subgraph K1[匹配键]
+      direction LR
+      M1["model 模式: 机型 + 区域"]
+      M2["flex-group 模式: 灵活性组 + 区域"]
+    end
+```
+
+> 匹配键由 `--match-mode` 决定：`model` 用 `(机型, 区域)`，`flex-group` 用 `(灵活性组, 区域)`。RI 收益只在**同一匹配键**内的目标项目明细间按原始费用比例分摊。
+
 ### 3.1 RI 使用记录
 
 对于不匹配目标标签的 RI 使用记录，将该行的 RI 使用金额加回资源成本：
