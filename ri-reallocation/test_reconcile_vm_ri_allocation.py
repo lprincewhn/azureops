@@ -7,8 +7,8 @@ import unittest
 from pathlib import Path
 
 
-MODULE_PATH = Path(__file__).with_name("reconcile_ri_allocation.py")
-SPEC = importlib.util.spec_from_file_location("reconcile_ri_allocation", MODULE_PATH)
+MODULE_PATH = Path(__file__).with_name("reconcile_vm_ri_allocation.py")
+SPEC = importlib.util.spec_from_file_location("reconcile_vm_ri_allocation", MODULE_PATH)
 MODULE = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
 sys.modules[SPEC.name] = MODULE

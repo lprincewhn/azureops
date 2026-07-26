@@ -160,7 +160,7 @@ riAllocationAmount = 负数
 ## 5. 脚本文件
 
 ```text
-reallocate_ri.py
+reallocate_vm_ri.py
 ```
 
 脚本默认不会修改源文件。
@@ -170,7 +170,7 @@ reallocate_ri.py
 在包含源 CSV 的目录执行：
 
 ```bash
-python3 reallocate_ri.py \
+python3 reallocate_vm_ri.py \
   part_0_0001.csv \
   part_1_0001.csv \
   --reservation-id 8345b648-839b-4fdc-acbc-a776bdfe00d5 \
@@ -181,7 +181,7 @@ python3 reallocate_ri.py \
 也可以使用 glob：
 
 ```bash
-python3 reallocate_ri.py \
+python3 reallocate_vm_ri.py \
   "part_*_0001.csv" \
   --reservation-id 8345b648-839b-4fdc-acbc-a776bdfe00d5 \
   --target-tag projname=fota \
@@ -191,7 +191,7 @@ python3 reallocate_ri.py \
 指定多个 RI：
 
 ```bash
-python3 reallocate_ri.py \
+python3 reallocate_vm_ri.py \
   part_0_0001.csv \
   part_1_0001.csv \
   --reservation-id ri-id-1 \
@@ -203,7 +203,7 @@ python3 reallocate_ri.py \
 使用其他标签作为接收项目条件：
 
 ```bash
-python3 reallocate_ri.py \
+python3 reallocate_vm_ri.py \
   part_0_0001.csv \
   part_1_0001.csv \
   --reservation-id 8345b648-839b-4fdc-acbc-a776bdfe00d5 \
@@ -214,7 +214,7 @@ python3 reallocate_ri.py \
 指定其他金额字段：
 
 ```bash
-python3 reallocate_ri.py \
+python3 reallocate_vm_ri.py \
   part_0_0001.csv \
   part_1_0001.csv \
   --reservation-id 8345b648-839b-4fdc-acbc-a776bdfe00d5 \
@@ -226,7 +226,7 @@ python3 reallocate_ri.py \
 只生成汇总、不生成明细副本：
 
 ```bash
-python3 reallocate_ri.py \
+python3 reallocate_vm_ri.py \
   part_0_0001.csv \
   part_1_0001.csv \
   --reservation-id 8345b648-839b-4fdc-acbc-a776bdfe00d5 \
@@ -284,12 +284,12 @@ ri-reallocated/
 
 ## 9. 对账脚本
 
-`reconcile_ri_allocation.py` 用于比较原始账单和分摊后账单，按 `ResourceId` 汇总每台虚拟机的处理前费用、处理后费用和变化金额，并补充区域与机型。
+`reconcile_vm_ri_allocation.py` 用于比较原始账单和分摊后账单，按 `ResourceId` 汇总每台虚拟机的处理前费用、处理后费用和变化金额，并补充区域与机型。
 
 执行命令：
 
 ```bash
-python3 reconcile_ri_allocation.py \
+python3 reconcile_vm_ri_allocation.py \
   "part_*_0001.csv" \
   --after-dir ri-reallocated \
   --output-dir ri-reallocated
@@ -320,7 +320,7 @@ ri-reallocated/
 分摊命令：
 
 ```bash
-python3 reallocate_ri.py \
+python3 reallocate_vm_ri.py \
   part_0_0001.csv part_1_0001.csv \
   --reservation-id 8345b648-839b-4fdc-acbc-a776bdfe00d5 \
   --target-tag projname=fota \
@@ -354,7 +354,7 @@ RI 金额：12.776931506849312
 将接收项目改为 `observe-platform` 后，命令如下：
 
 ```bash
-python3 reallocate_ri.py \
+python3 reallocate_vm_ri.py \
   part_0_0001.csv part_1_0001.csv \
   --reservation-id 8345b648-839b-4fdc-acbc-a776bdfe00d5 \
   --target-tag projname=observe-platform \

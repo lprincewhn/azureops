@@ -3,8 +3,8 @@ import unittest
 from pathlib import Path
 
 
-MODULE_PATH = Path(__file__).with_name("reallocate_ri.py")
-SPEC = importlib.util.spec_from_file_location("reallocate_ri", MODULE_PATH)
+MODULE_PATH = Path(__file__).with_name("reallocate_vm_ri.py")
+SPEC = importlib.util.spec_from_file_location("reallocate_vm_ri", MODULE_PATH)
 MODULE = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
 SPEC.loader.exec_module(MODULE)
