@@ -35,7 +35,11 @@ RI 金额默认使用：
 costInBillingCurrency
 ```
 
-可通过重复指定 `--reservation-id` 同时选择多个 RI；必须通过 `--target-tag key=value` 指定优惠收益接收项目，例如 `--target-tag projname=fota`。RI 收益只会分配给与 RI 使用记录同时匹配以下字段的目标项目明细：
+可通过重复指定 `--reservation-id` 同时选择多个 RI；必须通过 `--target-tag key=value` 指定优惠收益接收项目，例如 `--target-tag projname=fota`。此时所有 RI 共用同一个分摊目标。
+
+若需要**为不同 RI 指定不同的分摊目标**（一个 RI 只能有一个目标，不同 RI 可以有不同目标），改用 `--mapping-file` 从外部文件读取 `reservationId → 分摊目标标签` 的映射，详见 [6.1 映射文件模式](#61-映射文件模式多目标)。
+
+RI 收益只会分配给与 RI 使用记录同时匹配以下字段的目标项目明细：
 
 ```text
 机型 = additionalInfo.ServiceType
@@ -87,7 +91,7 @@ flowchart TD
     end
 ```
 
-> 匹配键由 `--match-mode` 决定：`model` 用 `(机型, 区域)`，`flex-group` 用 `(灵活性组, 区域)`。RI 收益只在**同一匹配键**内的目标项目明细间按原始费用比例分摊。
+> 匹配键由 `--match-mode` 决定：`model` 用 `(机型, 区域)`，`flex-group` 用 `(灵活性组, 区域)`。使用 `--mapping-file` 指定多目标时，收益池进一步按**分摊目标**隔离，即实际隔离维度为 `(分摊目标, 匹配键)`；RI 收益只在**同一目标、同一匹配键**内的目标项目明细间按原始费用比例分摊。
 
 ### 3.1 RI 使用记录
 
@@ -266,6 +270,60 @@ python3 reallocate_vm_ri.py \
   --output-dir ri-reallocation-summary
 ```
 
+### 6.1 映射文件模式（多目标）
+
+当不同 RI 需要分摊给不同项目时，使用 `--mapping-file` 从外部文件读取
+`reservationId → 分摊目标标签` 的映射。约束：**一个 RI 只能有一个分摊目标，
+不同 RI 可以有不同目标**（映射文件中同一 reservationId 出现多个不同目标会报错）。
+
+`--mapping-file` 与 `--reservation-id` / `--target-tag` 互斥，提供映射文件后
+后两者不再需要。
+
+支持 JSON 和 CSV 两种格式（按扩展名判断，`.csv` 走 CSV，其余按 JSON）：
+
+**JSON 对象形式**（最简洁，键为 reservationId，值为 `key=value`）：
+
+```json
+{
+  "8345b648-839b-4fdc-acbc-a776bdfe00d5": "projname=fota",
+  "1f2e3d4c-5b6a-7890-abcd-ef1234567890": "projname=beta"
+}
+```
+
+**JSON 结构化形式**（`targetTag` 支持 `key=value` 字符串或 `{"key":..,"value":..}` 对象）：
+
+```json
+{
+  "mappings": [
+    {"reservationId": "8345b648-839b-4fdc-acbc-a776bdfe00d5", "targetTag": "projname=fota"},
+    {"reservationId": "1f2e3d4c-5b6a-7890-abcd-ef1234567890", "targetTag": {"key": "app", "value": "nacos"}}
+  ]
+}
+```
+
+**CSV 形式**（需包含 `reservationId` 和 `targetTag` 两列）：
+
+```csv
+reservationId,targetTag
+8345b648-839b-4fdc-acbc-a776bdfe00d5,projname=fota
+1f2e3d4c-5b6a-7890-abcd-ef1234567890,projname=beta
+```
+
+执行：
+
+```bash
+python3 reallocate_vm_ri.py \
+  "part_*_0001.csv" \
+  --mapping-file ri-target-mapping.json \
+  --match-mode flex-group \
+  --output-dir ri-reallocated
+```
+
+**收益隔离**：每个 RI 的优惠收益只会分摊给它自己映射的目标项目，且仍受
+「相同机型（或灵活性组）+ 相同区域」匹配键约束。不同目标之间互不串收益——
+即使两个目标恰好使用同机型同区域，RI-A 的收益也不会流向 RI-B 的目标。校验
+（目标非 RI 费用 ≥ 待分摊 RI 金额、且不为 0）按 `(分摊目标, 匹配键)` 逐一进行。
+
 ## 7. 输出文件
 
 执行完成后，输出目录包含：
@@ -296,14 +354,14 @@ ri-reallocated/
 
 包含：
 
-- 输入文件
-- 输出文件
-- RI 记录数量
-- RI 分摊记录数量
-- RI 金额
-- 目标项目非 RI 虚拟机费用
-- 源文件是否被修改
-- 标签和资源 ID 是否被修改
+- 输入文件、输出文件
+- `mappings`：本次使用的 `reservationId → 分摊目标标签` 映射
+- `targets`：全部分摊目标（`key=value` 列表）
+- RI 记录数量、RI 分摊记录数量
+- RI 金额、目标项目非 RI 虚拟机费用
+- `assignedByTarget`：每个分摊目标承接的 RI 收益总额
+- `riAllocationKeys`：每个 `(分摊目标, 匹配键)` 的 RI 金额与目标费用
+- 源文件是否被修改、标签和资源 ID 是否被修改
 
 ## 8. 注意事项
 
