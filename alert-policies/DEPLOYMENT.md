@@ -130,12 +130,13 @@ az policy state trigger-scan --subscription "<sub-under-mg>"
 
 ### 步骤 5：创建修复任务（为存量资源补齐告警）
 
-管理组范围的修复任务需使用完整的 assignment 资源 ID：
+分配位于管理组时，修复任务**必须用 `-m "$MG"` 指定管理组范围**；否则 CLI 会默认在当前订阅范围创建修复任务，引用不到管理组级的分配。加上 `-m` 后，`--policy-assignment` 可直接用分配名：
 
 ```bash
 az policy remediation create \
   --name "remediate-vm-metric-alert-$(date +%Y%m%d%H%M%S)" \
-  --policy-assignment "$MG_SCOPE/providers/Microsoft.Authorization/policyAssignments/auto-vm-metric-alert" \
+  --management-group "$MG" \
+  --policy-assignment "auto-vm-metric-alert" \
   --resource-discovery-mode ExistingNonCompliant
 ```
 
@@ -144,9 +145,10 @@ az policy remediation create \
 ### 步骤 6：验证
 
 ```bash
-# 查看修复任务状态
+# 查看修复任务状态（管理组范围需带 -m "$MG"）
 az policy remediation show \
   --name "<remediation-name>" \
+  --management-group "$MG" \
   --query "{state:provisioningState, total:deploymentStatus.totalDeployments, success:deploymentStatus.successfulDeployments, failed:deploymentStatus.failedDeployments}" -o json
 
 # 在具体订阅中查看已部署的告警规则
