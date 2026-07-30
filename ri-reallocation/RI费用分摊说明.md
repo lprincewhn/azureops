@@ -324,6 +324,59 @@ python3 reallocate_vm_ri.py \
 即使两个目标恰好使用同机型同区域，RI-A 的收益也不会流向 RI-B 的目标。校验
 （目标非 RI 费用 ≥ 待分摊 RI 金额、且不为 0）按 `(分摊目标, 匹配键)` 逐一进行。
 
+### 6.2 预留定义模式（一个 RI 按 binding 分摊到多个项目）
+
+当**一个 RI 需要同时分摊给多个项目**时，使用 `--reservations-file` 从预留
+定义文件（`reservations.json`）读取分摊比例。与 6.1 的区别：6.1 是「一个 RI
+一个目标」，本模式是「一个 RI 按 `bindings` 的 `boundQuantity` 权重拆分到多个
+`projectCode`」。
+
+`--reservations-file` 与 `--mapping-file` / `--reservation-id` / `--target-tag`
+互斥。
+
+**文件结构**（数组，或 `{"reservations": [...]}`，或单个对象）：
+
+```json
+[
+  {
+    "externalReservationId": ".../reservationOrders/<order>/reservations/8345b648-839b-4fdc-acbc-a776bdfe00d5",
+    "bindings": [
+      {"projectCode": "config-register-center", "boundQuantity": 2},
+      {"projectCode": "observe-platform", "boundQuantity": 1}
+    ]
+  }
+]
+```
+
+字段说明：
+
+- **reservationId**：优先取 `reservationId` 字段；缺失时从 `externalReservationId`
+  的 `/reservations/` 之后一段提取。需与账单 `reservationId` 列一致。
+- **bindings[].projectCode**：目标项目，映射为目标标签 `projname=<projectCode>`
+  （标签键可用 `--project-tag-key` 修改，默认 `projname`）。
+- **bindings[].boundQuantity**：该项目的分摊权重。同一预留内相同 `projectCode`
+  的权重合并；权重 ≤ 0 的 binding 忽略；没有有效 binding 的预留跳过。
+
+**分摊规则**：某 RI 的全部使用金额（按匹配键分池）先加回各自的 RI 使用记录，
+再按 `boundQuantity / ΣboundQuantity` 的比例拆成子池，每个子池分摊给对应
+`projectCode` 目标项目内「相同机型（或灵活性组）+ 相同区域」的非 RI 虚拟机明细。
+与 6.1 不同，本模式对**全部** RI 使用记录加回并按权重再分摊（即使某条 RI 使用
+记录本就落在某个绑定项目内），从而严格按 binding 比例分配收益。金额守恒不变。
+
+执行：
+
+```bash
+python3 reallocate_vm_ri.py \
+  "part_*_0001.csv" \
+  --reservations-file reservations.json \
+  --amount-field costInUsd \
+  --output-dir ri-reallocated
+```
+
+> 若某 `projectCode` 在账单里没有对应 `projname` 的非 RI 虚拟机明细（机型/区域
+> 也需匹配），校验会报错——这通常意味着 binding 的 projectCode 与账单标签口径
+> 不一致，需先对齐命名或改用 `--project-tag-key`。
+
 ## 7. 输出文件
 
 执行完成后，输出目录包含：
@@ -355,7 +408,8 @@ ri-reallocated/
 包含：
 
 - 输入文件、输出文件
-- `mappings`：本次使用的 `reservationId → 分摊目标标签` 映射
+- `allocationMode`：分摊模式，`mapping`（单目标/映射文件/内联）或 `reservations`（按 binding 权重多目标）
+- `mappings`：每个 `reservationId` 的分摊目标列表，每个目标含 `key`/`value`/`weight`
 - `targets`：全部分摊目标（`key=value` 列表）
 - RI 记录数量、RI 分摊记录数量
 - RI 金额、目标项目非 RI 虚拟机费用

@@ -1,3 +1,4 @@
 *.csv
 ri-reallocated*/
 __pycache__/
+reservations.json

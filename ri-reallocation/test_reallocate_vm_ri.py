@@ -403,5 +403,292 @@ class MultiTargetReallocationTests(unittest.TestCase):
         self.assertEqual(result_rows[0]["allocationType"], "")
 
 
+class ReservationsFileTests(unittest.TestCase):
+    def _write(self, data):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = Path(tmp.name) / "reservations.json"
+        path.write_text(json.dumps(data), encoding="utf-8")
+        return path
+
+    def test_reservation_id_extracted_from_external(self):
+        self.assertEqual(
+            MODULE._reservation_id_from_external(
+                "/providers/microsoft.capacity/reservationOrders/ord/reservations/rid-1"
+            ),
+            "rid-1",
+        )
+        self.assertEqual(MODULE._reservation_id_from_external("rid-2"), "rid-2")
+        self.assertEqual(MODULE._reservation_id_from_external(""), "")
+
+    def test_bindings_become_weighted_targets(self):
+        path = self._write(
+            [
+                {
+                    "externalReservationId": ".../reservations/ri-a",
+                    "bindings": [
+                        {"projectCode": "alpha", "boundQuantity": 2},
+                        {"projectCode": "beta", "boundQuantity": 1},
+                    ],
+                }
+            ]
+        )
+        result = MODULE.load_reservations_file(path)
+        self.assertEqual(
+            result["ri-a"],
+            [
+                (("projname", "alpha"), MODULE.Decimal("2")),
+                (("projname", "beta"), MODULE.Decimal("1")),
+            ],
+        )
+
+    def test_custom_project_tag_key(self):
+        path = self._write(
+            [{"reservationId": "ri-a", "bindings": [{"projectCode": "x", "boundQuantity": 1}]}]
+        )
+        result = MODULE.load_reservations_file(path, project_tag_key="costcenter")
+        self.assertEqual(result["ri-a"], [(("costcenter", "x"), MODULE.Decimal("1"))])
+
+    def test_same_project_code_weights_merged(self):
+        path = self._write(
+            [
+                {
+                    "reservationId": "ri-a",
+                    "bindings": [
+                        {"projectCode": "x", "boundQuantity": 2},
+                        {"projectCode": "x", "boundQuantity": 3},
+                    ],
+                }
+            ]
+        )
+        result = MODULE.load_reservations_file(path)
+        self.assertEqual(result["ri-a"], [(("projname", "x"), MODULE.Decimal("5"))])
+
+    def test_non_positive_quantity_ignored(self):
+        path = self._write(
+            [
+                {
+                    "reservationId": "ri-a",
+                    "bindings": [
+                        {"projectCode": "x", "boundQuantity": 1},
+                        {"projectCode": "y", "boundQuantity": 0},
+                    ],
+                }
+            ]
+        )
+        result = MODULE.load_reservations_file(path)
+        self.assertEqual(result["ri-a"], [(("projname", "x"), MODULE.Decimal("1"))])
+
+    def test_reservation_without_bindings_skipped(self):
+        path = self._write(
+            [
+                {"reservationId": "ri-empty", "bindings": []},
+                {"reservationId": "ri-a", "bindings": [{"projectCode": "x", "boundQuantity": 1}]},
+            ]
+        )
+        result = MODULE.load_reservations_file(path)
+        self.assertNotIn("ri-empty", result)
+        self.assertIn("ri-a", result)
+
+    def test_no_usable_definition_raises(self):
+        path = self._write([{"reservationId": "ri-a", "bindings": []}])
+        with self.assertRaises(ValueError):
+            MODULE.load_reservations_file(path)
+
+    def test_duplicate_reservation_id_raises(self):
+        path = self._write(
+            [
+                {"reservationId": "ri-a", "bindings": [{"projectCode": "x", "boundQuantity": 1}]},
+                {"reservationId": "ri-a", "bindings": [{"projectCode": "y", "boundQuantity": 1}]},
+            ]
+        )
+        with self.assertRaises(ValueError):
+            MODULE.load_reservations_file(path)
+
+    def test_external_reservation_id_takes_precedence(self):
+        # Real reservations.json has no top-level reservationId; the billing GUID
+        # lives in externalReservationId while `id` is an unrelated record UUID.
+        path = self._write(
+            [
+                {
+                    "id": "internal-record-uuid",
+                    "externalReservationId": ".../reservations/billing-rid",
+                    "bindings": [{"projectCode": "x", "boundQuantity": 1}],
+                }
+            ]
+        )
+        result = MODULE.load_reservations_file(path)
+        self.assertIn("billing-rid", result)
+        self.assertNotIn("internal-record-uuid", result)
+
+    def test_build_ri_targets_reservations_mutually_exclusive(self):
+        path = self._write(
+            [{"reservationId": "ri-a", "bindings": [{"projectCode": "x", "boundQuantity": 1}]}]
+        )
+        args = argparse.Namespace(
+            reservations_file=str(path),
+            project_tag_key="projname",
+            mapping_file="m.json",
+            reservation_id=None,
+            target_tag=None,
+        )
+        with self.assertRaises(ValueError):
+            MODULE.build_ri_targets(args)
+
+    def test_build_ri_targets_wraps_inline_single_target(self):
+        args = argparse.Namespace(
+            reservations_file=None,
+            project_tag_key="projname",
+            mapping_file=None,
+            reservation_id=["ri-a"],
+            target_tag="projname=fota",
+        )
+        targets, redistribute_all = MODULE.build_ri_targets(args)
+        self.assertFalse(redistribute_all)
+        self.assertEqual(targets, {"ri-a": [(("projname", "fota"), MODULE.Decimal("1"))]})
+
+
+class ReservationsReallocationTests(unittest.TestCase):
+    HEADERS = MultiTargetReallocationTests.HEADERS
+
+    def _row(self, **kw):
+        row = {h: "" for h in self.HEADERS}
+        row["meterCategory"] = "Virtual Machines"
+        row.update(kw)
+        return row
+
+    def _run(self, rows, reservations):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        src = root / "bill.csv"
+        with src.open("w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=self.HEADERS)
+            writer.writeheader()
+            writer.writerows(rows)
+        resv_path = root / "reservations.json"
+        resv_path.write_text(json.dumps(reservations), encoding="utf-8")
+        out_dir = root / "out"
+        argv = [
+            "prog",
+            str(src),
+            "--reservations-file",
+            str(resv_path),
+            "--output-dir",
+            str(out_dir),
+        ]
+        old_argv = sys.argv
+        sys.argv = argv
+        try:
+            MODULE.main()
+        finally:
+            sys.argv = old_argv
+        with (out_dir / "bill.csv").open(encoding="utf-8", newline="") as f:
+            result_rows = list(csv.DictReader(f))
+        summary = json.loads((out_dir / "ri-summary.json").read_text("utf-8"))
+        return result_rows, summary
+
+    def test_single_ri_split_to_two_projects_by_weight(self):
+        rows = [
+            # RI usage physically tagged to an unrelated project, cost 30
+            self._row(
+                ResourceId="/vm/ri-usage",
+                pricingModel="Reservation",
+                chargeType="Usage",
+                reservationId="ri-a",
+                meterRegion="US West 3",
+                additionalInfo='{"ServiceType":"Standard_D2s_v5"}',
+                tags='{"projname":"misc"}',
+                costInBillingCurrency="30",
+            ),
+            # alpha receiver (weight 2 -> gets 20)
+            self._row(
+                ResourceId="/vm/alpha-recv",
+                pricingModel="OnDemand",
+                chargeType="Usage",
+                reservationId="",
+                meterRegion="US West 3",
+                additionalInfo='{"ServiceType":"Standard_D2s_v5"}',
+                tags='{"projname":"alpha"}',
+                costInBillingCurrency="100",
+            ),
+            # beta receiver (weight 1 -> gets 10)
+            self._row(
+                ResourceId="/vm/beta-recv",
+                pricingModel="OnDemand",
+                chargeType="Usage",
+                reservationId="",
+                meterRegion="US West 3",
+                additionalInfo='{"ServiceType":"Standard_D2s_v5"}',
+                tags='{"projname":"beta"}',
+                costInBillingCurrency="100",
+            ),
+        ]
+        reservations = [
+            {
+                "externalReservationId": ".../reservations/ri-a",
+                "bindings": [
+                    {"projectCode": "alpha", "boundQuantity": 2},
+                    {"projectCode": "beta", "boundQuantity": 1},
+                ],
+            }
+        ]
+        result_rows, summary = self._run(rows, reservations)
+        by_id = {r["ResourceId"]: r for r in result_rows}
+        self.assertEqual(summary["allocationMode"], "reservations")
+        # RI usage fully added back +30
+        self.assertEqual(by_id["/vm/ri-usage"]["riAllocationAmount"], "30")
+        self.assertEqual(
+            by_id["/vm/ri-usage"]["allocationType"], "RI_USAGE_COST_REASSIGNED"
+        )
+        # weighted split: alpha -20 (2/3), beta -10 (1/3)
+        self.assertEqual(by_id["/vm/alpha-recv"]["riAllocationAmount"], "-20")
+        self.assertEqual(by_id["/vm/beta-recv"]["riAllocationAmount"], "-10")
+        self.assertEqual(
+            summary["assignedByTarget"], {"alpha": "20", "beta": "10"}
+        )
+        # conservation
+        total = sum(MODULE.Decimal(r["riAllocationAmount"]) for r in result_rows)
+        self.assertEqual(total, MODULE.Decimal("0"))
+
+    def test_ri_usage_in_bound_target_is_redistributed(self):
+        # Even RI usage physically sitting in a bound target is added back and
+        # redistributed by weight (full-redistribution mode).
+        rows = [
+            self._row(
+                ResourceId="/vm/ri-usage-in-alpha",
+                pricingModel="Reservation",
+                chargeType="Usage",
+                reservationId="ri-a",
+                meterRegion="US West 3",
+                additionalInfo='{"ServiceType":"Standard_D2s_v5"}',
+                tags='{"projname":"alpha"}',
+                costInBillingCurrency="12",
+            ),
+            self._row(
+                ResourceId="/vm/alpha-recv",
+                pricingModel="OnDemand",
+                chargeType="Usage",
+                reservationId="",
+                meterRegion="US West 3",
+                additionalInfo='{"ServiceType":"Standard_D2s_v5"}',
+                tags='{"projname":"alpha"}',
+                costInBillingCurrency="100",
+            ),
+        ]
+        reservations = [
+            {
+                "reservationId": "ri-a",
+                "bindings": [{"projectCode": "alpha", "boundQuantity": 1}],
+            }
+        ]
+        result_rows, summary = self._run(rows, reservations)
+        by_id = {r["ResourceId"]: r for r in result_rows}
+        self.assertEqual(by_id["/vm/ri-usage-in-alpha"]["riAllocationAmount"], "12")
+        self.assertEqual(by_id["/vm/alpha-recv"]["riAllocationAmount"], "-12")
+        total = sum(MODULE.Decimal(r["riAllocationAmount"]) for r in result_rows)
+        self.assertEqual(total, MODULE.Decimal("0"))
+
+
 if __name__ == "__main__":
     unittest.main()

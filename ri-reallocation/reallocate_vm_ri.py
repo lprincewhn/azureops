@@ -67,6 +67,23 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--reservations-file",
+        default=None,
+        help=(
+            "预留分摊定义文件（reservations.json）。按每个预留的 bindings 将 RI "
+            "优惠收益按 boundQuantity 比例分摊到多个项目（projectCode）；"
+            "与 --mapping-file/--reservation-id/--target-tag 互斥"
+        ),
+    )
+    parser.add_argument(
+        "--project-tag-key",
+        default="projname",
+        help=(
+            "reservations.json 模式下，把 binding 的 projectCode 映射为目标标签时"
+            "使用的标签键，默认 projname（即目标 projname=<projectCode>）"
+        ),
+    )
+    parser.add_argument(
         "--amount-field",
         default="costInBillingCurrency",
         choices=("costInBillingCurrency", "costInPricingCurrency", "costInUsd"),
@@ -252,6 +269,143 @@ def build_ri_target_map(args: argparse.Namespace) -> dict[str, tuple[str, str]]:
     return mapping
 
 
+# reservationId → 分摊目标列表，每个目标为 ((标签键, 标签值), 权重)。
+RiTargets = dict[str, list[tuple[tuple[str, str], Decimal]]]
+
+
+def _reservation_id_from_external(external: Any) -> str:
+    """从 externalReservationId 中提取账单里使用的 reservationId。
+
+    形如 ``/providers/microsoft.capacity/reservationOrders/<order>/reservations/<rid>``，
+    取 ``/reservations/`` 之后的一段；没有该分段时按原值返回。这是账单
+    ``reservationId`` 列使用的预留 GUID，权威来源；对象里的 ``id`` /
+    ``bindings[].reservationId`` 通常是内部记录 UUID，与账单无关。
+    """
+    text = str(external or "").strip()
+    if not text:
+        return ""
+    marker = "/reservations/"
+    if marker in text:
+        tail = text.rsplit(marker, 1)[1]
+        return tail.strip("/").split("/")[0].strip()
+    return text
+
+
+def load_reservations_file(path: Path, project_tag_key: str = "projname") -> RiTargets:
+    """读取 reservations.json，构建 reservationId → [(目标, 权重)] 映射。
+
+    每个预留按 ``bindings`` 拆分：``projectCode`` 作为目标标签值（键由
+    ``project_tag_key`` 指定，默认 projname），``boundQuantity`` 作为权重。
+    同一预留内相同 projectCode 的多个 binding 权重合并；权重非正的 binding 忽略；
+    没有有效 binding 的预留跳过。
+    """
+    if not path.is_file():
+        raise FileNotFoundError(f"找不到 reservations 文件：{path}")
+    data = json.loads(path.read_text(encoding="utf-8-sig"))
+    if isinstance(data, dict):
+        if isinstance(data.get("reservations"), list):
+            items = data["reservations"]
+        else:
+            items = [data]
+    elif isinstance(data, list):
+        items = data
+    else:
+        raise ValueError("reservations 文件 JSON 顶层必须是对象或数组")
+
+    key = (project_tag_key or "projname").strip() or "projname"
+    result: RiTargets = {}
+    for item in items:
+        if not isinstance(item, dict):
+            raise ValueError("reservation 条目必须是对象")
+        reservation_id = _reservation_id_from_external(
+            item.get("externalReservationId")
+        )
+        if not reservation_id:
+            reservation_id = str(item.get("reservationId") or "").strip()
+        if not reservation_id:
+            raise ValueError("reservation 条目缺少 reservationId/externalReservationId")
+
+        weights: dict[str, Decimal] = {}
+        for binding in item.get("bindings") or []:
+            if not isinstance(binding, dict):
+                continue
+            code = str(binding.get("projectCode") or "").strip()
+            if not code:
+                continue
+            try:
+                weight = Decimal(str(binding.get("boundQuantity", 0)))
+            except InvalidOperation:
+                weight = Decimal("0")
+            if weight <= 0:
+                continue
+            weights[code] = weights.get(code, Decimal("0")) + weight
+        if not weights:
+            # 没有有效 binding（未绑定项目）的预留无法分摊，跳过。
+            continue
+        if reservation_id in result:
+            raise ValueError(
+                f"reservations 文件存在重复 reservationId：{reservation_id!r}"
+            )
+        result[reservation_id] = [
+            ((key, code), weight) for code, weight in weights.items()
+        ]
+    if not result:
+        raise ValueError(
+            "reservations 文件没有可用的 RI 分摊定义（缺少有效 bindings）"
+        )
+    return result
+
+
+def build_ri_targets(args: argparse.Namespace) -> tuple[RiTargets, bool]:
+    """构建 reservationId → [(目标, 权重)] 映射，并返回是否使用全量按权重再分摊。
+
+    - --reservations-file：按 bindings 权重把一个 RI 分摊到多个项目，返回
+      ``redistribute_all=True``（无论 binding 数量，均对全部 RI 使用记录加回并按
+      权重再分摊）。
+    - --mapping-file / 内联 --reservation-id + --target-tag：单目标，权重恒为 1，
+      返回 ``redistribute_all=False``（沿用"已在目标则不搬动"的历史行为）。
+    """
+    if args.reservations_file:
+        if args.mapping_file or args.reservation_id or args.target_tag:
+            raise ValueError(
+                "--reservations-file 不能与 "
+                "--mapping-file/--reservation-id/--target-tag 同时使用"
+            )
+        targets = load_reservations_file(
+            Path(args.reservations_file), args.project_tag_key
+        )
+        return targets, True
+    single = build_ri_target_map(args)
+    return {rid: [(target, Decimal("1"))] for rid, target in single.items()}, False
+
+
+def _row_contributions(
+    amount: Decimal,
+    targets_list: list[tuple[tuple[str, str], Decimal]],
+    row: dict[str, str],
+    redistribute_all: bool,
+) -> tuple[Decimal | None, list[tuple[tuple[str, str], Decimal]], str]:
+    """计算单条 RI 使用记录的加回金额与各目标收益池贡献。
+
+    返回 ``(add_back, contributions, label)``：
+    - ``add_back`` 为 None 表示该行保持不变（单目标模式下已在目标项目内）；
+    - 否则 ``add_back`` 为加回到该行的金额，``contributions`` 为 [(目标, 贡献)]，
+      各贡献之和等于 ``add_back``；``label`` 为写入 allocationTarget 列的目标标识。
+    """
+    if not redistribute_all and len(targets_list) == 1:
+        target = targets_list[0][0]
+        if has_target_tag(row, target):
+            return None, [], ""
+        return amount, [(target, amount)], target[1]
+    total_weight = sum((weight for _target, weight in targets_list), Decimal("0"))
+    contributions = [
+        (target, amount * weight / total_weight)
+        for target, weight in targets_list
+    ]
+    label = "|".join(target[1] for target, _weight in targets_list)
+    return amount, contributions, label
+
+
 def decimal_from_row(row: dict[str, str], field: str) -> Decimal:
     """将指定金额字段转换为 Decimal，避免浮点数精度误差。"""
     raw = (row.get(field) or "").strip()
@@ -382,9 +536,11 @@ def project_of(row: dict[str, str]) -> str:
 def main() -> None:
     """读取账单、计算分摊并生成明细副本和汇总报告。"""
     args = parse_args()
-    ri_target = build_ri_target_map(args)
-    reservation_ids = set(ri_target)
-    targets = sorted(set(ri_target.values()))
+    ri_targets, redistribute_all = build_ri_targets(args)
+    reservation_ids = set(ri_targets)
+    targets = sorted(
+        {target for entries in ri_targets.values() for target, _weight in entries}
+    )
     input_paths = expand_inputs(args.inputs)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -434,17 +590,21 @@ def main() -> None:
 
                 if is_ri_usage(row, reservation_ids):
                     reservation_id = row.get("reservationId", "").strip()
-                    target = ri_target[reservation_id]
+                    targets_list = ri_targets[reservation_id]
                     ri_usage_rows += 1
                     ri_service_types[reservation_id].add(vm_model(row))
                     if is_size_flexible(row):
                         ri_size_flexible_rows += 1
-                    if not has_target_tag(row, target):
+                    add_back, contributions, _label = _row_contributions(
+                        amount, targets_list, row, redistribute_all
+                    )
+                    if add_back is not None:
                         ri_reallocated_rows += 1
-                        ri_amount += amount
-                        pool_key = (target, allocation_key(row, args.match_mode))
-                        ri_amount_by_key[pool_key] += amount
-                        project_ri[project] += amount
+                        ri_amount += add_back
+                        project_ri[project] += add_back
+                        alloc_key = allocation_key(row, args.match_mode)
+                        for target, contribution in contributions:
+                            ri_amount_by_key[(target, alloc_key)] += contribution
                 else:
                     matched = [t for t in targets if has_target_tag(row, t)]
                     if len(matched) > 1:
@@ -490,11 +650,14 @@ def main() -> None:
             row, reservation_ids
         ):
             reservation_id = row.get("reservationId", "").strip()
-            target = ri_target[reservation_id]
+            targets_list = ri_targets[reservation_id]
             amount = decimal_from_row(row, args.amount_field)
-            if not has_target_tag(row, target):
-                allocation_by_index[index] = amount
-                target_value_by_index[index] = target[1]
+            add_back, _contributions, label = _row_contributions(
+                amount, targets_list, row, redistribute_all
+            )
+            if add_back is not None:
+                allocation_by_index[index] = add_back
+                target_value_by_index[index] = label
 
     # 每条目标明细只承接相同分摊目标、相同机型和区域 RI 收益池中的金额。
     for pool_key, indexes in target_non_ri_indexes.items():
@@ -604,15 +767,16 @@ def main() -> None:
             )
 
     summary = {
+        "allocationMode": "reservations" if redistribute_all else "mapping",
         "mappings": [
             {
                 "reservationId": reservation_id,
-                "targetTag": {
-                    "key": ri_target[reservation_id][0],
-                    "value": ri_target[reservation_id][1],
-                },
+                "targets": [
+                    {"key": target[0], "value": target[1], "weight": str(weight)}
+                    for target, weight in ri_targets[reservation_id]
+                ],
             }
-            for reservation_id in sorted(ri_target)
+            for reservation_id in sorted(ri_targets)
         ],
         "targets": ["=".join(target) for target in targets],
         "reservationIds": sorted(reservation_ids),
