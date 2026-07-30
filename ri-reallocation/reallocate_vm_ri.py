@@ -8,10 +8,11 @@
 3. 原 RI 使用记录的 tags 和 ResourceId 保持不变。
 4. 原 RI 使用记录不是目标项目时：
      allocatedCostInBillingCurrency = costInBillingCurrency + RI 使用金额
-5. 目标项目中没有实际使用 RI 的 VM 记录按原费用比例扣减 RI 使用金额：
+5. 目标项目的 VM 记录按费用比例扣减 RI 使用金额（若某条 RI 使用记录自身命中
+   目标，则加回后以全价一并参与该目标分摊）：
      allocatedCostInBillingCurrency = costInBillingCurrency - 分摊金额
 
-这样 RI 使用记录的 allocatedCost 大于原始 cost，目标项目非 RI 记录的
+这样非目标的 RI 使用记录 allocatedCost 大于原始 cost，目标项目接收记录的
 allocatedCost 小于原始 cost，整体金额保持不变。
 """
 
@@ -429,6 +430,11 @@ def main() -> None:
     )
     ri_amount_by_key: defaultdict[pool_key_type, Decimal] = defaultdict(Decimal)
     ri_service_types: defaultdict[str, set[str]] = defaultdict(set)
+    # RI 使用记录加回后的信息：加回金额、目标标签、以及作为接收方时的全价基数。
+    ri_usage_indexes: set[int] = set()
+    ri_add_back_by_index: dict[int, Decimal] = {}
+    ri_label_by_index: dict[int, str] = {}
+    receiver_basis_by_index: dict[int, Decimal] = {}
 
     for input_path in input_paths:
         source_files.append(str(input_path))
@@ -460,15 +466,38 @@ def main() -> None:
                     ri_service_types[reservation_id].add(vm_model(row))
                     if is_size_flexible(row):
                         ri_size_flexible_rows += 1
-                    add_back, contributions, _label = _row_contributions(
+                    add_back, contributions, label = _row_contributions(
                         amount, targets_list, ri_denominators[reservation_id]
                     )
                     ri_reallocated_rows += 1
                     ri_amount += add_back
                     project_ri[project] += add_back
+                    row_index = len(rows) - 1
+                    ri_usage_indexes.add(row_index)
+                    ri_add_back_by_index[row_index] = add_back
+                    ri_label_by_index[row_index] = label
                     alloc_key = allocation_key(row, ri_modes[reservation_id])
                     for target, contribution in contributions:
                         ri_amount_by_key[(target, alloc_key)] += contribution
+                    # 加回后的 RI 使用记录以全价（原始金额 + 加回金额）参与其自身所属
+                    # 目标的收益分摊，避免该目标项目仅靠其它明细承接、拿到的收益少于
+                    # binding 权重应得份额。
+                    matched = [t for t in targets if has_target_tag(row, t)]
+                    if len(matched) > 1:
+                        labels = "、".join("=".join(t) for t in matched)
+                        raise ValueError(
+                            f"虚拟机明细同时匹配多个分摊目标（{labels}）；"
+                            "一条明细只能归属一个分摊目标。"
+                        )
+                    if matched:
+                        full_price = amount + add_back
+                        pool_key = (
+                            matched[0],
+                            allocation_key(row, target_modes[matched[0]]),
+                        )
+                        target_non_ri_indexes[pool_key].append(row_index)
+                        target_non_ri_total_by_key[pool_key] += full_price
+                        receiver_basis_by_index[row_index] = full_price
                 else:
                     matched = [t for t in targets if has_target_tag(row, t)]
                     if len(matched) > 1:
@@ -478,12 +507,14 @@ def main() -> None:
                             "一条明细只能归属一个分摊目标。"
                         )
                     if matched:
+                        row_index = len(rows) - 1
                         pool_key = (
                             matched[0],
                             allocation_key(row, target_modes[matched[0]]),
                         )
-                        target_non_ri_indexes[pool_key].append(len(rows) - 1)
+                        target_non_ri_indexes[pool_key].append(row_index)
                         target_non_ri_total_by_key[pool_key] += amount
+                        receiver_basis_by_index[row_index] = amount
 
     target_non_ri_total = sum(
         target_non_ri_total_by_key.values(), Decimal("0")
@@ -499,33 +530,25 @@ def main() -> None:
         if key_target_total == 0:
             raise ValueError(
                 f"找不到分摊目标 {target_label!r} 与 RI 机型和区域 {alloc_key!r} "
-                "匹配的非 RI 虚拟机明细。"
+                "匹配的虚拟机明细（含加回后的 RI 使用记录）。"
             )
         if key_target_total < key_ri_amount:
             raise ValueError(
                 f"分摊目标 {target_label!r} 的匹配机型和区域 {alloc_key!r} "
-                f"非 RI 虚拟机费用 {key_target_total} 小于待分摊 RI 金额 "
+                f"虚拟机全价费用 {key_target_total} 小于待分摊 RI 金额 "
                 f"{key_ri_amount}，无法按比例分摊后保持非负费用。"
             )
 
-    # 非目标项目的 RI 使用记录加回自身 RI 金额，体现未人为分配前的原始资源成本。
-    # 目标项目的非 RI VM 明细按原始费用比例扣减，承接 RI 优惠收益。
+    # RI 使用记录先加回自身 RI 金额（体现未人为分配前的原始资源成本）；若其标签命中
+    # 某个分摊目标，则加回后再以全价参与该目标收益分摊，净额为加回金额减去应摊份额。
     allocation_by_index: dict[int, Decimal] = {}
     target_value_by_index: dict[int, str] = {}
-    for index, row in enumerate(rows):
-        if row.get("meterCategory") == "Virtual Machines" and is_ri_usage(
-            row, reservation_ids
-        ):
-            reservation_id = row.get("reservationId", "").strip()
-            targets_list = ri_targets[reservation_id]
-            amount = decimal_from_row(row, args.amount_field)
-            add_back, _contributions, label = _row_contributions(
-                amount, targets_list, ri_denominators[reservation_id]
-            )
-            allocation_by_index[index] = add_back
-            target_value_by_index[index] = label
+    for index in ri_usage_indexes:
+        allocation_by_index[index] = ri_add_back_by_index[index]
+        target_value_by_index[index] = ri_label_by_index[index]
 
-    # 每条目标明细只承接相同分摊目标、相同机型和区域 RI 收益池中的金额。
+    # 每条目标明细只承接相同分摊目标、相同机型和区域 RI 收益池中的金额；加回后的
+    # RI 使用记录以全价基数参与，普通非 RI 明细以原始费用基数参与。
     for pool_key, indexes in target_non_ri_indexes.items():
         target, _alloc_key = pool_key
         key_ri_amount = ri_amount_by_key.get(pool_key, Decimal("0"))
@@ -534,11 +557,14 @@ def main() -> None:
             continue
         key_target_total = target_non_ri_total_by_key[pool_key]
         for index in indexes:
-            amount = decimal_from_row(rows[index], args.amount_field)
-            allocation_by_index[index] = -(
-                key_ri_amount * amount / key_target_total
+            basis = receiver_basis_by_index[index]
+            share = key_ri_amount * basis / key_target_total
+            allocation_by_index[index] = (
+                allocation_by_index.get(index, Decimal("0")) - share
             )
-            target_value_by_index[index] = target[1]
+            # RI 使用记录本身也是接收方时保留其加回目标标签，其余用池目标标签。
+            if index not in ri_usage_indexes:
+                target_value_by_index[index] = target[1]
 
     output_paths: list[str] = []
     allocated_field = allocated_field_name(args.amount_field)
@@ -572,13 +598,18 @@ def main() -> None:
                         original + adjustment
                     )
                     row["riAllocationAmount"] = str(adjustment)
-                    # 正数表示把 RI 使用金额加回实际使用 RI 的资源。
-                    if adjustment > 0:
+                    # RI 使用记录：其 RI 成本被重新分配（可能同时又接收了本项目应得
+                    # 收益），净额可正可负；统一标记为 RI_USAGE_COST_REASSIGNED。
+                    if index in ri_usage_indexes and adjustment != 0:
                         row["allocationType"] = "RI_USAGE_COST_REASSIGNED"
                         row["allocationTarget"] = target_value_by_index.get(index, "")
                     # 负数表示把 RI 优惠收益分配给目标项目。
                     elif adjustment < 0:
                         row["allocationType"] = "RI_BENEFIT_ASSIGNED"
+                        row["allocationTarget"] = target_value_by_index.get(index, "")
+                    # 兜底：非 RI 记录理论上不会出现正调整。
+                    elif adjustment > 0:
+                        row["allocationType"] = "RI_USAGE_COST_REASSIGNED"
                         row["allocationTarget"] = target_value_by_index.get(index, "")
                     else:
                         row["allocationType"] = ""

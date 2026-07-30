@@ -509,9 +509,10 @@ class ReservationsReallocationTests(unittest.TestCase):
         total = sum(MODULE.Decimal(r["riAllocationAmount"]) for r in result_rows)
         self.assertEqual(total, MODULE.Decimal("0"))
 
-    def test_ri_usage_in_bound_target_is_redistributed(self):
-        # Even RI usage physically sitting in a bound target is added back and
-        # redistributed by weight (full-redistribution mode).
+    def test_ri_usage_in_bound_target_also_receives_benefit(self):
+        # An RI usage record physically tagged with a bound target is added back
+        # to full price AND participates as a receiver of that target's benefit
+        # pool. Otherwise the target could receive less than its binding weight.
         rows = [
             self._row(
                 ResourceId="/vm/ri-usage-in-alpha",
@@ -542,10 +543,49 @@ class ReservationsReallocationTests(unittest.TestCase):
         ]
         result_rows, summary = self._run(rows, reservations)
         by_id = {r["ResourceId"]: r for r in result_rows}
-        self.assertEqual(by_id["/vm/ri-usage-in-alpha"]["riAllocationAmount"], "12")
-        self.assertEqual(by_id["/vm/alpha-recv"]["riAllocationAmount"], "-12")
+        # add_back=12, full price of RI row=24, receiver basis total=24+100=124.
+        # RI row share = 12*24/124, recv share = 12*100/124.
+        ri_amt = MODULE.Decimal(by_id["/vm/ri-usage-in-alpha"]["riAllocationAmount"])
+        recv_amt = MODULE.Decimal(by_id["/vm/alpha-recv"]["riAllocationAmount"])
+        self.assertEqual(ri_amt, MODULE.Decimal("12") - MODULE.Decimal("12") * 24 / 124)
+        self.assertEqual(recv_amt, -MODULE.Decimal("12") * 100 / 124)
+        # RI usage row keeps a positive net (its share of its own benefit).
+        self.assertGreater(ri_amt, MODULE.Decimal("0"))
+        # allocationType still classifies the RI record as a reassignment.
+        self.assertEqual(
+            by_id["/vm/ri-usage-in-alpha"]["allocationType"],
+            "RI_USAGE_COST_REASSIGNED",
+        )
         total = sum(MODULE.Decimal(r["riAllocationAmount"]) for r in result_rows)
         self.assertEqual(total, MODULE.Decimal("0"))
+
+    def test_ri_usage_can_be_sole_receiver_of_its_target(self):
+        # If the bound target has no other VM, the added-back RI usage record is
+        # itself the receiver, so allocation still succeeds (no error) and nets 0.
+        rows = [
+            self._row(
+                ResourceId="/vm/ri-usage-only",
+                pricingModel="Reservation",
+                chargeType="Usage",
+                reservationId="ri-a",
+                meterRegion="US West 3",
+                additionalInfo='{"ServiceType":"Standard_D2s_v5"}',
+                tags='{"projname":"alpha"}',
+                costInBillingCurrency="12",
+            ),
+        ]
+        reservations = [
+            {
+                "reservationId": "ri-a",
+                "bindings": [{"projectCode": "alpha", "boundQuantity": 1}],
+            }
+        ]
+        result_rows, _summary = self._run(rows, reservations)
+        by_id = {r["ResourceId"]: r for r in result_rows}
+        # add_back=12, full price=24, sole receiver basis=24 -> share=12.
+        # net = 12 - 12 = 0.
+        self.assertEqual(by_id["/vm/ri-usage-only"]["riAllocationAmount"], "0")
+
 
 
     def test_flexibility_on_enables_flex_group_matching(self):

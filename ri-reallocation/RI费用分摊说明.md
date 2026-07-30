@@ -69,13 +69,13 @@ flowchart TD
     B -- 否 --> Z[不处理<br/>原样保留]
     B -- 是 --> C{是指定 RI 使用记录?<br/>pricingModel=Reservation<br/>chargeType=Usage<br/>reservationId 命中}
 
-    C -- 是 --> E[按 boundTotal 分母拆分 RI 使用金额<br/>allocationType=RI_USAGE_COST_REASSIGNED<br/>riAllocationAmount 为正<br/>按 binding 权重计入各 目标+匹配键 的 RI 收益池<br/>未绑定份额保留在原记录]
+    C -- 是 --> E[按 boundTotal 分母拆分 RI 使用金额<br/>allocationType=RI_USAGE_COST_REASSIGNED<br/>按 binding 权重计入各 目标+匹配键 的 RI 收益池<br/>未绑定份额保留在原记录<br/>若自身命中目标则以全价加入该目标接收池]
 
     C -- 否 --> F{带目标标签?}
     F -- 否 --> Z3[不处理<br/>非目标项目普通费用]
     F -- 是 --> G[归入目标项目池<br/>按 目标+匹配键 累计原始费用]
 
-    E --> H[[按 目标+匹配键 汇总:<br/>RI 收益池 & 目标项目费用池]]
+    E --> H[[按 目标+匹配键 汇总:<br/>RI 收益池 & 目标项目费用池<br/>接收池含加回后的 RI 记录全价]]
     G --> H
     H --> I{每个 目标+匹配键 校验<br/>目标池 ≥ RI池 且 ≠ 0?}
     I -- 否 --> X[报错并停止<br/>该目标的机型/组+区域分摊不出去]
@@ -104,22 +104,24 @@ allocatedCostInBillingCurrency = costInBillingCurrency + 加回金额
 
 当 `boundTotal > ΣboundQuantity`（预留只部分绑定）时，未绑定份额 `(boundTotal − ΣboundQuantity) / boundTotal` 对应的收益**不再分摊出去，保留在原 RI 使用记录（即消费该 RI 的项目）上**。
 
+若某条 RI 使用记录自身标签命中某个分摊目标（即消费该 RI 的项目本身就是绑定目标之一），则加回后它以**全价**（`原始金额 + 加回金额`）参与该目标收益池的分摊，和目标项目的普通虚拟机明细一起按费用比例扣减。这样该项目才能按 binding 权重完整拿到应得收益，而不会因为「自己消费的 RI 记录被排除在接收方之外」而少分。此时该记录的 `riAllocationAmount = 加回金额 − 应摊份额`，净额可正可负，但仍统一标记为 `RI_USAGE_COST_REASSIGNED`。
+
 这些记录标记为：
 
 ```text
 allocationType = RI_USAGE_COST_REASSIGNED
 allocationTarget = 该预留全部分摊目标（多个时以 | 连接，如 alpha|beta）
-riAllocationAmount = 正数
+riAllocationAmount = 加回金额 −（作为接收方时的应摊份额）
 ```
 
 ### 3.2 目标项目明细
 
-目标范围为：
+接收 RI 收益的明细范围为：
 
 ```text
 meterCategory = Virtual Machines
 目标标签 key=value
-且不是实际 RI 使用记录
+（含加回后的 RI 使用记录：以全价参与自身所属目标的分摊）
 ```
 
 RI 收益按 `(分摊目标, 机型或灵活性组, 区域)` 分池，只在同一池内的目标项目明细间按原始虚拟机费用比例分摊，不同目标、机型或区域的虚拟机不会承接该池的 RI 收益。
@@ -129,7 +131,8 @@ RI 收益按 `(分摊目标, 机型或灵活性组, 区域)` 分池，只在同�
 ```text
 RI收益池金额 = 所有 RI 使用记录按 boundQuantity 权重分配到该目标、
               且匹配键（机型或灵活性组 + 区域）一致的贡献之和
-目标项目非RI虚拟机费用总额 = 该池内所有目标项目明细的原始费用合计
+目标项目费用总额 = 该池内所有接收明细的费用基数合计
+              （普通非 RI 明细取原始费用；加回后的 RI 使用记录取全价 = 原始金额 + 加回金额）
 ```
 
 每一条明细的分摊金额为：
@@ -137,8 +140,8 @@ RI收益池金额 = 所有 RI 使用记录按 boundQuantity 权重分配到该�
 ```text
 该行分摊金额
   = RI收益池金额
-  × 该行原始费用
-  ÷ 目标项目非RI虚拟机费用总额
+  × 该行费用基数
+  ÷ 目标项目费用总额
 ```
 
 分摊后的金额为：
@@ -231,11 +234,13 @@ reallocate_vm_ri.py
 
 **分摊规则**：某 RI 的使用金额（按匹配键分池）按 `boundQuantity / boundTotal` 的
 比例拆成子池，每个子池分摊给对应 `projectCode` 目标项目内「相同机型（或灵活性组）
-+ 相同区域」的非 RI 虚拟机明细，并把这些子池金额之和加回各自的 RI 使用记录。
++ 相同区域」的虚拟机明细，并把这些子池金额之和加回各自的 RI 使用记录。
 当 `boundTotal > ΣboundQuantity`（预留只部分绑定）时，未绑定份额
 `(boundTotal − ΣboundQuantity) / boundTotal` 对应的收益**不再分摊，保留在原 RI
-使用记录（消费该 RI 的项目）上**。本模式对**全部** RI 使用记录按 binding 比例
-再分摊（即使某条 RI 使用记录本就落在某个绑定项目内）。金额守恒不变。
+使用记录（消费该 RI 的项目）上**。若某条 RI 使用记录自身标签就是绑定目标之一，
+则加回后以**全价**（原始金额 + 加回金额）与该目标的普通虚拟机明细一起参与该目标
+收益分摊，确保该项目按 binding 权重完整拿到收益（否则可能少于权重应得份额）；
+其净额 `riAllocationAmount = 加回金额 − 应摊份额`，可正可负。金额守恒不变。
 
 在包含源 CSV 的目录执行：
 
@@ -286,9 +291,9 @@ python3 reallocate_vm_ri.py \
   --output-dir ri-reallocation-summary
 ```
 
-> 若某 `projectCode` 在账单里没有对应 `projname` 的非 RI 虚拟机明细（机型/区域
-> 也需匹配），校验会报错——这通常意味着 binding 的 projectCode 与账单标签口径
-> 不一致，需先对齐命名或改用 `--project-tag-key`。
+> 若某 `projectCode` 在账单里既没有对应 `projname` 的普通虚拟机明细、也没有该目标
+> 自身命中的 RI 使用记录（机型/区域也需匹配），校验会报错——这通常意味着 binding
+> 的 projectCode 与账单标签口径不一致，需先对齐命名或改用 `--project-tag-key`。
 
 ## 7. 输出文件
 
@@ -326,7 +331,7 @@ ri-reallocated/
 - `matchModeByReservation`：每个 `reservationId` 由 `flexibility` 推导出的匹配模式（`flex-group` / `model`）
 - `targets`：全部分摊目标（`key=value` 列表）
 - RI 记录数量、RI 分摊记录数量
-- RI 金额、目标项目非 RI 虚拟机费用
+- RI 金额、目标项目虚拟机费用（接收池，含加回后的 RI 记录全价）
 - `assignedByTarget`：每个分摊目标承接的 RI 收益总额
 - `riAllocationKeys`：每个 `(分摊目标, 匹配键)` 的 RI 金额与目标费用
 - 源文件是否被修改、标签和资源 ID 是否被修改
@@ -336,7 +341,7 @@ ri-reallocated/
 1. 源 CSV 不会被覆盖。
 2. 脚本不会修改 `tags` 和 `ResourceId`。
 3. 脚本不会把 `pricingModel=Reservation` 改成 `OnDemand`。
-4. 如果目标标签对应项目中没有匹配机型和区域的非 RI 虚拟机费用，或费用小于对应 RI 金额，脚本会报错并停止，避免跨规格、跨区域分摊或产生负费用。
+4. 如果目标标签对应项目中既没有匹配机型和区域的普通虚拟机费用、也没有该目标自身命中的 RI 使用记录，或接收池全价费用小于对应 RI 金额，脚本会报错并停止，避免跨规格、跨区域分摊或产生负费用。
 5. 输出文件中的 `allocatedCostInBillingCurrency` 是分摊分析金额，不是 Azure 原始账单字段。
 
 ## 9. 对账脚本
