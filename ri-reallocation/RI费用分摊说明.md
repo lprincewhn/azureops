@@ -2,7 +2,7 @@
 
 ## 1. 目的
 
-本方案用于生成一份新的 Azure 成本明细副本，将指定 `reservationId` 的 RI 使用金额重新分摊到指定标签对应的项目，同时保留源文件不变。
+本方案用于生成一份新的 Azure 成本明细副本，将预留（RI）使用金额按 `reservations.json` 中每个预留 `bindings` 的 `boundQuantity` 权重重新分摊到一个或多个项目，同时保留源文件不变。
 
 原始资源的以下字段保持不变：
 
@@ -69,18 +69,16 @@ flowchart TD
     B -- 否 --> Z[不处理<br/>原样保留]
     B -- 是 --> C{是指定 RI 使用记录?<br/>pricingModel=Reservation<br/>chargeType=Usage<br/>reservationId 命中}
 
-    C -- 是 --> D{带目标标签?}
-    D -- 是 --> Z2[不处理<br/>RI 收益已在目标项目内]
-    D -- 否 --> E[加回 RI 使用金额<br/>allocationType=RI_USAGE_COST_REASSIGNED<br/>riAllocationAmount 为正<br/>计入 匹配键 的 RI 收益池]
+    C -- 是 --> E[加回 RI 使用金额<br/>allocationType=RI_USAGE_COST_REASSIGNED<br/>riAllocationAmount 为正<br/>按 binding 权重拆分计入<br/>各 目标+匹配键 的 RI 收益池]
 
     C -- 否 --> F{带目标标签?}
     F -- 否 --> Z3[不处理<br/>非目标项目普通费用]
-    F -- 是 --> G[归入目标项目池<br/>按 匹配键 累计原始费用]
+    F -- 是 --> G[归入目标项目池<br/>按 目标+匹配键 累计原始费用]
 
-    E --> H[[按匹配键汇总:<br/>RI 收益池 & 目标项目费用池]]
+    E --> H[[按 目标+匹配键 汇总:<br/>RI 收益池 & 目标项目费用池]]
     G --> H
-    H --> I{每个匹配键校验<br/>目标池 ≥ RI池 且 ≠ 0?}
-    I -- 否 --> X[报错并停止<br/>该机型/组+区域分摊不出去]
+    H --> I{每个 目标+匹配键 校验<br/>目标池 ≥ RI池 且 ≠ 0?}
+    I -- 否 --> X[报错并停止<br/>该目标的机型/组+区域分摊不出去]
     I -- 是 --> J[目标明细按原始费用比例扣减 RI 收益<br/>allocationType=RI_BENEFIT_ASSIGNED<br/>riAllocationAmount 为负]
     J --> K[输出分摊后明细 + 项目汇总 + summary]
 
@@ -95,7 +93,7 @@ flowchart TD
 
 ### 3.1 RI 使用记录
 
-对每一条 RI 使用记录，将该行的 RI 使用金额加回资源成本（该金额随后按 binding 权重分摊到各目标项目）：
+对每一条 RI 使用记录（无论其自身标签），将该行的 RI 使用金额全额加回资源成本，该金额随后按该预留 `bindings` 的 `boundQuantity` 权重拆分到各目标项目：
 
 ```text
 allocatedCostInBillingCurrency
@@ -112,7 +110,7 @@ allocatedCostInBillingCurrency > costInBillingCurrency
 
 ```text
 allocationType = RI_USAGE_COST_REASSIGNED
-allocationTarget = 目标标签值
+allocationTarget = 该预留全部分摊目标（多个时以 | 连接，如 alpha|beta）
 riAllocationAmount = 正数
 ```
 
@@ -126,20 +124,21 @@ meterCategory = Virtual Machines
 且不是实际 RI 使用记录
 ```
 
-RI 金额按相同机型(或灵活性组)、相同区域的目标项目明细原始虚拟机费用比例分摊，不同机型或区域的虚拟机不会承接该 RI 收益。
+RI 收益按 `(分摊目标, 机型或灵活性组, 区域)` 分池，只在同一池内的目标项目明细间按原始虚拟机费用比例分摊，不同目标、机型或区域的虚拟机不会承接该池的 RI 收益。
 
-设：
+设某一 `(分摊目标, 匹配键)` 池：
 
 ```text
-RI总金额 = 同一机型(或灵活性组)和区域下所有不匹配目标标签的指定 RI 使用记录金额合计
-目标项目非RI虚拟机费用总额 = 同一机型和区域下所有目标项目明细的原始费用合计
+RI收益池金额 = 所有 RI 使用记录按 boundQuantity 权重分配到该目标、
+              且匹配键（机型或灵活性组 + 区域）一致的贡献之和
+目标项目非RI虚拟机费用总额 = 该池内所有目标项目明细的原始费用合计
 ```
 
 每一条明细的分摊金额为：
 
 ```text
 该行分摊金额
-  = RI总金额
+  = RI收益池金额
   × 该行原始费用
   ÷ 目标项目非RI虚拟机费用总额
 ```
@@ -170,8 +169,8 @@ riAllocationAmount = 负数
 分摊前后虚拟机费用总额保持不变：
 
 ```text
-非目标标签 RI 记录增加金额
-  = 相同机型和区域的目标项目明细扣减金额
+所有 RI 使用记录加回金额合计
+  = 所有目标项目明细扣减金额合计
 ```
 
 脚本使用 `Decimal` 计算，避免浮点数误差。
