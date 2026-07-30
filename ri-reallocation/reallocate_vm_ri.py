@@ -62,15 +62,6 @@ def parse_args() -> argparse.Namespace:
         help="RI 分摊金额字段，默认：costInBillingCurrency",
     )
     parser.add_argument(
-        "--match-mode",
-        default="model",
-        choices=("model", "flex-group"),
-        help=(
-            "RI 收益匹配模式：model 按精确机型和区域匹配（默认）；"
-            "flex-group 按 RI 实例大小灵活性分组和区域匹配，缺分组时回退到机型"
-        ),
-    )
-    parser.add_argument(
         "--summary-only",
         action="store_true",
         help="只生成汇总文件，不生成明细副本",
@@ -105,6 +96,17 @@ def parse_tags(raw: str) -> dict[str, Any]:
 
 # reservationId → 分摊目标列表，每个目标为 ((标签键, 标签值), 权重)。
 RiTargets = dict[str, list[tuple[tuple[str, str], Decimal]]]
+# reservationId → RI 收益匹配模式（"model" 或 "flex-group"）。
+RiModes = dict[str, str]
+
+
+def _match_mode_from_flexibility(flexibility: Any) -> str:
+    """根据预留的 flexibility 字段推导 RI 收益匹配模式。
+
+    实例大小灵活性开启（``on``）时按灵活性组匹配（``flex-group``），
+    否则按精确机型匹配（``model``）。
+    """
+    return "flex-group" if str(flexibility or "").strip().lower() == "on" else "model"
 
 
 def _reservation_id_from_external(external: Any) -> str:
@@ -125,13 +127,19 @@ def _reservation_id_from_external(external: Any) -> str:
     return text
 
 
-def load_reservations_file(path: Path, project_tag_key: str = "projname") -> RiTargets:
-    """读取 reservations.json，构建 reservationId → [(目标, 权重)] 映射。
+def load_reservations_file(
+    path: Path, project_tag_key: str = "projname"
+) -> tuple[RiTargets, RiModes]:
+    """读取 reservations.json，构建 reservationId → [(目标, 权重)] 映射及匹配模式。
 
     每个预留按 ``bindings`` 拆分：``projectCode`` 作为目标标签值（键由
     ``project_tag_key`` 指定，默认 projname），``boundQuantity`` 作为权重。
     同一预留内相同 projectCode 的多个 binding 权重合并；权重非正的 binding 忽略；
-    没有有效 binding 的预留跳过。
+    没有有效 binding 的预留跳过。RI 收益匹配模式由预留的 ``flexibility`` 字段
+    推导（``on`` → flex-group，否则 model），无需命令行指定。
+
+    返回 ``(ri_targets, ri_modes)``：``ri_targets`` 为 reservationId → [(目标, 权重)]，
+    ``ri_modes`` 为 reservationId → 匹配模式。
     """
     if not path.is_file():
         raise FileNotFoundError(f"找不到 reservations 文件：{path}")
@@ -148,6 +156,7 @@ def load_reservations_file(path: Path, project_tag_key: str = "projname") -> RiT
 
     key = (project_tag_key or "projname").strip() or "projname"
     result: RiTargets = {}
+    modes: RiModes = {}
     for item in items:
         if not isinstance(item, dict):
             raise ValueError("reservation 条目必须是对象")
@@ -183,18 +192,22 @@ def load_reservations_file(path: Path, project_tag_key: str = "projname") -> RiT
         result[reservation_id] = [
             ((key, code), weight) for code, weight in weights.items()
         ]
+        modes[reservation_id] = _match_mode_from_flexibility(
+            item.get("flexibility")
+        )
     if not result:
         raise ValueError(
             "reservations 文件没有可用的 RI 分摊定义（缺少有效 bindings）"
         )
-    return result
+    return result, modes
 
 
-def build_ri_targets(args: argparse.Namespace) -> RiTargets:
-    """构建 reservationId → [(目标, 权重)] 映射。
+def build_ri_targets(args: argparse.Namespace) -> tuple[RiTargets, RiModes]:
+    """构建 reservationId → [(目标, 权重)] 映射及匹配模式。
 
     读取 --reservations-file 指定的 reservations.json，按每个预留的 bindings
-    权重把一个 RI 分摊到多个项目（projectCode）。
+    权重把一个 RI 分摊到多个项目（projectCode），并按预留的 flexibility 字段
+    推导 RI 收益匹配模式。
     """
     return load_reservations_file(Path(args.reservations_file), args.project_tag_key)
 
@@ -349,11 +362,24 @@ def project_of(row: dict[str, str]) -> str:
 def main() -> None:
     """读取账单、计算分摊并生成明细副本和汇总报告。"""
     args = parse_args()
-    ri_targets = build_ri_targets(args)
+    ri_targets, ri_modes = build_ri_targets(args)
     reservation_ids = set(ri_targets)
     targets = sorted(
         {target for entries in ri_targets.values() for target, _weight in entries}
     )
+    # 每个分摊目标的匹配模式来自绑定它的预留的 flexibility。若同一目标被匹配模式
+    # 不同的预留同时绑定，收益池无法一致隔离，直接报错要求先统一口径。
+    target_modes: dict[tuple[str, str], str] = {}
+    for reservation_id, entries in ri_targets.items():
+        mode = ri_modes[reservation_id]
+        for target, _weight in entries:
+            existing = target_modes.get(target)
+            if existing is not None and existing != mode:
+                raise ValueError(
+                    f"分摊目标 {'='.join(target)!r} 被匹配模式不同的预留同时绑定"
+                    f"（{existing} 与 {mode}）；请统一相关预留的 flexibility。"
+                )
+            target_modes[target] = mode
     input_paths = expand_inputs(args.inputs)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -414,7 +440,7 @@ def main() -> None:
                     ri_reallocated_rows += 1
                     ri_amount += add_back
                     project_ri[project] += add_back
-                    alloc_key = allocation_key(row, args.match_mode)
+                    alloc_key = allocation_key(row, ri_modes[reservation_id])
                     for target, contribution in contributions:
                         ri_amount_by_key[(target, alloc_key)] += contribution
                 else:
@@ -426,7 +452,10 @@ def main() -> None:
                             "一条明细只能归属一个分摊目标。"
                         )
                     if matched:
-                        pool_key = (matched[0], allocation_key(row, args.match_mode))
+                        pool_key = (
+                            matched[0],
+                            allocation_key(row, target_modes[matched[0]]),
+                        )
                         target_non_ri_indexes[pool_key].append(len(rows) - 1)
                         target_non_ri_total_by_key[pool_key] += amount
 
@@ -582,6 +611,7 @@ def main() -> None:
         "mappings": [
             {
                 "reservationId": reservation_id,
+                "matchMode": ri_modes[reservation_id],
                 "targets": [
                     {"key": target[0], "value": target[1], "weight": str(weight)}
                     for target, weight in ri_targets[reservation_id]
@@ -593,7 +623,10 @@ def main() -> None:
         "reservationIds": sorted(reservation_ids),
         "amountField": args.amount_field,
         "allocatedCostField": allocated_field,
-        "matchMode": args.match_mode,
+        "matchModeByReservation": {
+            reservation_id: ri_modes[reservation_id]
+            for reservation_id in sorted(ri_modes)
+        },
         "costScope": "meterCategory == Virtual Machines",
         "riSelection": {
             "pricingModel": "Reservation",

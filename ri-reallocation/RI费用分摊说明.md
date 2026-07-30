@@ -44,7 +44,7 @@ RI 收益只会分配给与 RI 使用记录同时匹配以下字段的目标项�
 区域 = meterRegion（缺失时依次使用 resourceLocation、location）
 ```
 
-默认按精确机型匹配（`--match-mode model`）。当某个 RI 开启了**实例大小灵活性（Instance Size Flexibility）**、可覆盖同一系列的不同规格时，RI 使用记录的机型可能与目标项目实际使用的机型不同（例如 RI 记录为 `Standard_D2s_v5`，而目标项目只跑 `Standard_D4s_v5`），此时 `model` 模式会因找不到同规格目标明细而**报错分摊不出去**。使用 `--match-mode flex-group` 可改为按**灵活性组**匹配：
+匹配模式由 `reservations.json` 中每个预留的 `flexibility` 字段自动决定，无需命令行指定：`flexibility=on`（开启**实例大小灵活性 Instance Size Flexibility**）时按**灵活性组**匹配（`flex-group`），否则按**精确机型**匹配（`model`）。当某个 RI 开启了实例大小灵活性、可覆盖同一系列的不同规格时，RI 使用记录的机型可能与目标项目实际使用的机型不同（例如 RI 记录为 `Standard_D2s_v5`，而目标项目只跑 `Standard_D4s_v5`）；此时 `model` 会因找不到同规格目标明细而**报错分摊不出去**，而 `flex-group` 按灵活性组匹配即可正常分摊：
 
 ```text
 组 = 从 additionalInfo.ServiceType 派生的灵活性组（family + 附加特性 + 版本，去掉核数）
@@ -53,6 +53,8 @@ RI 收益只会分配给与 RI 使用记录同时匹配以下字段的目标项�
 区域 = meterRegion（缺失时依次使用 resourceLocation、location）
 # 机型无法解析时，自动回退到精确机型匹配
 ```
+
+> 匹配模式是**按预留（RI）粒度**的：不同预留可各自采用 `flex-group` 或 `model`。若同一 `projectCode` 被匹配模式不同的多个预留同时绑定，收益池无法一致隔离，脚本会报错，需先统一相关预留的 `flexibility`。
 
 
 ## 3. 分摊逻辑
@@ -89,7 +91,7 @@ flowchart TD
     end
 ```
 
-> 匹配键由 `--match-mode` 决定：`model` 用 `(机型, 区域)`，`flex-group` 用 `(灵活性组, 区域)`。收益池进一步按**分摊目标**隔离，即实际隔离维度为 `(分摊目标, 匹配键)`；RI 收益只在**同一目标、同一匹配键**内的目标项目明细间按原始费用比例分摊。
+> 匹配键由每个预留的 `flexibility` 决定：`model` 用 `(机型, 区域)`，`flex-group` 用 `(灵活性组, 区域)`。收益池进一步按**分摊目标**隔离，即实际隔离维度为 `(分摊目标, 匹配键)`；RI 收益只在**同一目标、同一匹配键**内的目标项目明细间按原始费用比例分摊。
 
 ### 3.1 RI 使用记录
 
@@ -206,6 +208,7 @@ reallocate_vm_ri.py
 [
   {
     "externalReservationId": ".../reservationOrders/<order>/reservations/8345b648-839b-4fdc-acbc-a776bdfe00d5",
+    "flexibility": "on",
     "bindings": [
       {"projectCode": "config-register-center", "boundQuantity": 2},
       {"projectCode": "observe-platform", "boundQuantity": 1}
@@ -218,6 +221,8 @@ reallocate_vm_ri.py
 
 - **reservationId**：优先从 `externalReservationId` 的 `/reservations/` 之后一段
   提取；缺失时回退到 `reservationId` 字段。需与账单 `reservationId` 列一致。
+- **flexibility**：实例大小灵活性开关。`on` → 按灵活性组匹配（`flex-group`），
+  否则按精确机型匹配（`model`）。匹配模式据此**自动推导，无需命令行参数**。
 - **bindings[].projectCode**：目标项目，映射为目标标签 `projname=<projectCode>`
   （标签键可用 `--project-tag-key` 修改，默认 `projname`）。
 - **bindings[].boundQuantity**：该项目的分摊权重。同一预留内相同 `projectCode`
@@ -236,7 +241,6 @@ python3 reallocate_vm_ri.py \
   part_0_0001.csv \
   part_1_0001.csv \
   --reservations-file reservations.json \
-  --match-mode flex-group \
   --output-dir ri-reallocated
 ```
 
@@ -246,7 +250,6 @@ python3 reallocate_vm_ri.py \
 python3 reallocate_vm_ri.py \
   "part_*_0001.csv" \
   --reservations-file reservations.json \
-  --match-mode flex-group \
   --output-dir ri-reallocated
 ```
 
@@ -316,7 +319,8 @@ ri-reallocated/
 
 - 输入文件、输出文件
 - `allocationMode`：分摊模式，固定为 `reservations`（按 binding 权重分摊到一个或多个项目）
-- `mappings`：每个 `reservationId` 的分摊目标列表，每个目标含 `key`/`value`/`weight`
+- `mappings`：每个 `reservationId` 的分摊目标列表（每个目标含 `key`/`value`/`weight`）及其 `matchMode`
+- `matchModeByReservation`：每个 `reservationId` 由 `flexibility` 推导出的匹配模式（`flex-group` / `model`）
 - `targets`：全部分摊目标（`key=value` 列表）
 - RI 记录数量、RI 分摊记录数量
 - RI 金额、目标项目非 RI 虚拟机费用

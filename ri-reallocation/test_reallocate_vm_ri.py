@@ -154,7 +154,7 @@ class ReservationsFileTests(unittest.TestCase):
                 }
             ]
         )
-        result = MODULE.load_reservations_file(path)
+        result, _modes = MODULE.load_reservations_file(path)
         self.assertEqual(
             result["ri-a"],
             [
@@ -167,7 +167,7 @@ class ReservationsFileTests(unittest.TestCase):
         path = self._write(
             [{"reservationId": "ri-a", "bindings": [{"projectCode": "x", "boundQuantity": 1}]}]
         )
-        result = MODULE.load_reservations_file(path, project_tag_key="costcenter")
+        result, _modes = MODULE.load_reservations_file(path, project_tag_key="costcenter")
         self.assertEqual(result["ri-a"], [(("costcenter", "x"), MODULE.Decimal("1"))])
 
     def test_same_project_code_weights_merged(self):
@@ -182,7 +182,7 @@ class ReservationsFileTests(unittest.TestCase):
                 }
             ]
         )
-        result = MODULE.load_reservations_file(path)
+        result, _modes = MODULE.load_reservations_file(path)
         self.assertEqual(result["ri-a"], [(("projname", "x"), MODULE.Decimal("5"))])
 
     def test_non_positive_quantity_ignored(self):
@@ -197,7 +197,7 @@ class ReservationsFileTests(unittest.TestCase):
                 }
             ]
         )
-        result = MODULE.load_reservations_file(path)
+        result, _modes = MODULE.load_reservations_file(path)
         self.assertEqual(result["ri-a"], [(("projname", "x"), MODULE.Decimal("1"))])
 
     def test_reservation_without_bindings_skipped(self):
@@ -207,7 +207,7 @@ class ReservationsFileTests(unittest.TestCase):
                 {"reservationId": "ri-a", "bindings": [{"projectCode": "x", "boundQuantity": 1}]},
             ]
         )
-        result = MODULE.load_reservations_file(path)
+        result, _modes = MODULE.load_reservations_file(path)
         self.assertNotIn("ri-empty", result)
         self.assertIn("ri-a", result)
 
@@ -238,7 +238,7 @@ class ReservationsFileTests(unittest.TestCase):
                 }
             ]
         )
-        result = MODULE.load_reservations_file(path)
+        result, _modes = MODULE.load_reservations_file(path)
         self.assertIn("billing-rid", result)
         self.assertNotIn("internal-record-uuid", result)
 
@@ -250,8 +250,34 @@ class ReservationsFileTests(unittest.TestCase):
             reservations_file=str(path),
             project_tag_key="projname",
         )
-        targets = MODULE.build_ri_targets(args)
+        targets, _modes = MODULE.build_ri_targets(args)
         self.assertEqual(targets, {"ri-a": [(("projname", "x"), MODULE.Decimal("1"))]})
+
+    def test_match_mode_from_flexibility(self):
+        self.assertEqual(MODULE._match_mode_from_flexibility("on"), "flex-group")
+        self.assertEqual(MODULE._match_mode_from_flexibility("On"), "flex-group")
+        self.assertEqual(MODULE._match_mode_from_flexibility("off"), "model")
+        self.assertEqual(MODULE._match_mode_from_flexibility(""), "model")
+        self.assertEqual(MODULE._match_mode_from_flexibility(None), "model")
+
+    def test_flexibility_field_derives_match_mode(self):
+        path = self._write(
+            [
+                {
+                    "reservationId": "ri-flex",
+                    "flexibility": "on",
+                    "bindings": [{"projectCode": "x", "boundQuantity": 1}],
+                },
+                {
+                    "reservationId": "ri-fixed",
+                    "flexibility": "off",
+                    "bindings": [{"projectCode": "y", "boundQuantity": 1}],
+                },
+            ]
+        )
+        _result, modes = MODULE.load_reservations_file(path)
+        self.assertEqual(modes["ri-flex"], "flex-group")
+        self.assertEqual(modes["ri-fixed"], "model")
 
 
 class ReservationsReallocationTests(unittest.TestCase):
@@ -405,6 +431,83 @@ class ReservationsReallocationTests(unittest.TestCase):
         self.assertEqual(by_id["/vm/alpha-recv"]["riAllocationAmount"], "-12")
         total = sum(MODULE.Decimal(r["riAllocationAmount"]) for r in result_rows)
         self.assertEqual(total, MODULE.Decimal("0"))
+
+
+    def test_flexibility_on_enables_flex_group_matching(self):
+        # RI usage is D2s_v5 but the receiver only runs D4s_v5. With
+        # flexibility=on the reservation matches by flex-group, so the benefit
+        # still flows; without it, model matching would fail to find a receiver.
+        rows = [
+            self._row(
+                ResourceId="/vm/ri-usage",
+                pricingModel="Reservation",
+                chargeType="Usage",
+                reservationId="ri-a",
+                meterRegion="US West 3",
+                additionalInfo='{"ServiceType":"Standard_D2s_v5"}',
+                tags='{"projname":"misc"}',
+                costInBillingCurrency="10",
+            ),
+            self._row(
+                ResourceId="/vm/alpha-recv",
+                pricingModel="OnDemand",
+                chargeType="Usage",
+                reservationId="",
+                meterRegion="US West 3",
+                additionalInfo='{"ServiceType":"Standard_D4s_v5"}',
+                tags='{"projname":"alpha"}',
+                costInBillingCurrency="100",
+            ),
+        ]
+        reservations = [
+            {
+                "externalReservationId": ".../reservations/ri-a",
+                "flexibility": "on",
+                "bindings": [{"projectCode": "alpha", "boundQuantity": 1}],
+            }
+        ]
+        result_rows, summary = self._run(rows, reservations)
+        by_id = {r["ResourceId"]: r for r in result_rows}
+        self.assertEqual(summary["matchModeByReservation"], {"ri-a": "flex-group"})
+        self.assertEqual(by_id["/vm/ri-usage"]["riAllocationAmount"], "10")
+        self.assertEqual(by_id["/vm/alpha-recv"]["riAllocationAmount"], "-10")
+        total = sum(MODULE.Decimal(r["riAllocationAmount"]) for r in result_rows)
+        self.assertEqual(total, MODULE.Decimal("0"))
+
+    def test_flexibility_off_requires_exact_model(self):
+        # Same layout but flexibility off -> model matching -> no D2s_v5 receiver
+        # in target alpha -> validation error.
+        rows = [
+            self._row(
+                ResourceId="/vm/ri-usage",
+                pricingModel="Reservation",
+                chargeType="Usage",
+                reservationId="ri-a",
+                meterRegion="US West 3",
+                additionalInfo='{"ServiceType":"Standard_D2s_v5"}',
+                tags='{"projname":"misc"}',
+                costInBillingCurrency="10",
+            ),
+            self._row(
+                ResourceId="/vm/alpha-recv",
+                pricingModel="OnDemand",
+                chargeType="Usage",
+                reservationId="",
+                meterRegion="US West 3",
+                additionalInfo='{"ServiceType":"Standard_D4s_v5"}',
+                tags='{"projname":"alpha"}',
+                costInBillingCurrency="100",
+            ),
+        ]
+        reservations = [
+            {
+                "externalReservationId": ".../reservations/ri-a",
+                "flexibility": "off",
+                "bindings": [{"projectCode": "alpha", "boundQuantity": 1}],
+            }
+        ]
+        with self.assertRaises(ValueError):
+            self._run(rows, reservations)
 
 
 if __name__ == "__main__":
