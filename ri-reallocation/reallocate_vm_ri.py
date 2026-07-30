@@ -20,7 +20,6 @@ from __future__ import annotations
 import argparse
 import csv
 import glob
-import io
 import json
 import re
 from collections import defaultdict
@@ -41,46 +40,19 @@ def parse_args() -> argparse.Namespace:
         help="输出目录，默认：ri-reallocated",
     )
     parser.add_argument(
-        "--reservation-id",
-        action="append",
-        default=None,
-        help=(
-            "要重新分摊优惠收益的 reservationId，可重复指定；"
-            "不使用 --mapping-file 时必填，所有 RI 共用 --target-tag 目标"
-        ),
-    )
-    parser.add_argument(
-        "--target-tag",
-        default=None,
-        help=(
-            "接收优惠收益的标签，格式为 key=value，例如 projname=fota；"
-            "不使用 --mapping-file 时必填"
-        ),
-    )
-    parser.add_argument(
-        "--mapping-file",
-        default=None,
-        help=(
-            "RI→分摊目标映射文件（JSON 或 CSV）。提供后不再使用 "
-            "--reservation-id/--target-tag，可为不同 RI 指定不同目标；"
-            "一个 RI 只能有一个目标，不同 RI 可以有不同目标"
-        ),
-    )
-    parser.add_argument(
         "--reservations-file",
-        default=None,
+        required=True,
         help=(
             "预留分摊定义文件（reservations.json）。按每个预留的 bindings 将 RI "
-            "优惠收益按 boundQuantity 比例分摊到多个项目（projectCode）；"
-            "与 --mapping-file/--reservation-id/--target-tag 互斥"
+            "优惠收益按 boundQuantity 比例分摊到多个项目（projectCode）"
         ),
     )
     parser.add_argument(
         "--project-tag-key",
         default="projname",
         help=(
-            "reservations.json 模式下，把 binding 的 projectCode 映射为目标标签时"
-            "使用的标签键，默认 projname（即目标 projname=<projectCode>）"
+            "把 binding 的 projectCode 映射为目标标签时使用的标签键，"
+            "默认 projname（即目标 projname=<projectCode>）"
         ),
     )
     parser.add_argument(
@@ -129,144 +101,6 @@ def parse_tags(raw: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError("tags 字段不是 JSON 对象")
     return value
-
-
-def parse_target_tag(raw: str) -> tuple[str, str]:
-    """解析接收优惠收益的标签条件。"""
-    key, separator, value = raw.partition("=")
-    key = key.strip()
-    value = value.strip()
-    if not separator or not key or not value:
-        raise ValueError(
-            f"目标标签格式无效：{raw!r}，应为 key=value，例如 projname=fota"
-        )
-    return key, value
-
-
-def _target_from_value(raw: Any) -> tuple[str, str]:
-    """将映射文件中的单个目标标签值解析为 (key, value)。
-
-    支持两种写法：字符串 "key=value"，或对象 {"key": ..., "value": ...}。
-    """
-    if isinstance(raw, dict):
-        key = str(raw.get("key") or "").strip()
-        value = str(raw.get("value") or "").strip()
-        if not key or not value:
-            raise ValueError(
-                f"目标标签对象无效：{raw!r}，需要非空的 key 和 value"
-            )
-        return key, value
-    return parse_target_tag(str(raw))
-
-
-def _build_mapping(pairs: list[tuple[Any, Any]]) -> dict[str, tuple[str, str]]:
-    """从 (reservationId, targetTag) 列表构建映射，强制一个 RI 只有一个目标。"""
-    mapping: dict[str, tuple[str, str]] = {}
-    for reservation_raw, target_raw in pairs:
-        reservation_id = str(reservation_raw or "").strip()
-        if not reservation_id:
-            raise ValueError("映射文件包含空的 reservationId")
-        target = _target_from_value(target_raw)
-        existing = mapping.get(reservation_id)
-        if existing is not None and existing != target:
-            raise ValueError(
-                f"reservationId {reservation_id!r} 映射到多个不同的分摊目标；"
-                "一个 RI 只能有一个分摊目标"
-            )
-        mapping[reservation_id] = target
-    if not mapping:
-        raise ValueError("映射文件没有有效的 RI 映射")
-    return mapping
-
-
-def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    """json object_pairs_hook：任一 JSON 对象出现重复键时报错。
-
-    用于捕获映射文件对象形式里同一 reservationId 出现多次（JSON 默认会静默保留
-    最后一个），从而落实"一个 RI 只能有一个分摊目标"。
-    """
-    result: dict[str, Any] = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError(f"映射文件存在重复键：{key!r}")
-        result[key] = value
-    return result
-
-
-def _load_mapping_json(text: str) -> dict[str, tuple[str, str]]:
-    """解析 JSON 映射文件。
-
-    支持三种结构：
-    - 对象：{"<ri-id>": "key=value", ...}
-    - 带 mappings 的对象：{"mappings": [{"reservationId": ..., "targetTag": ...}]}
-    - 数组：[{"reservationId": ..., "targetTag": ...}]
-    """
-    data = json.loads(text, object_pairs_hook=_reject_duplicate_keys)
-    pairs: list[tuple[Any, Any]] = []
-    if isinstance(data, dict):
-        if isinstance(data.get("mappings"), list):
-            items = data["mappings"]
-        else:
-            return _build_mapping(list(data.items()))
-    elif isinstance(data, list):
-        items = data
-    else:
-        raise ValueError("映射文件 JSON 顶层必须是对象或数组")
-    for item in items:
-        if not isinstance(item, dict):
-            raise ValueError("映射条目必须是包含 reservationId/targetTag 的对象")
-        pairs.append((item.get("reservationId"), item.get("targetTag")))
-    return _build_mapping(pairs)
-
-
-def _load_mapping_csv(text: str) -> dict[str, tuple[str, str]]:
-    """解析 CSV 映射文件，需包含 reservationId 和 targetTag 两列。"""
-    reader = csv.DictReader(io.StringIO(text))
-    fields = reader.fieldnames or []
-    if "reservationId" not in fields or "targetTag" not in fields:
-        raise ValueError("CSV 映射文件需要 reservationId 和 targetTag 两列")
-    pairs = [(row.get("reservationId"), row.get("targetTag")) for row in reader]
-    return _build_mapping(pairs)
-
-
-def load_mapping_file(path: Path) -> dict[str, tuple[str, str]]:
-    """读取外部映射文件，返回 reservationId → (key, value) 映射。
-
-    根据扩展名选择解析器：.csv 用 CSV，其余按 JSON 解析。
-    """
-    if not path.is_file():
-        raise FileNotFoundError(f"找不到映射文件：{path}")
-    text = path.read_text(encoding="utf-8-sig")
-    if path.suffix.lower() == ".csv":
-        return _load_mapping_csv(text)
-    return _load_mapping_json(text)
-
-
-def build_ri_target_map(args: argparse.Namespace) -> dict[str, tuple[str, str]]:
-    """根据命令行参数构建 reservationId → 分摊目标标签的映射。
-
-    优先使用 --mapping-file（可为不同 RI 指定不同目标）；否则回退到
-    --reservation-id + --target-tag 的单目标模式（所有 RI 共用一个目标）。
-    """
-    if args.mapping_file:
-        if args.reservation_id or args.target_tag:
-            raise ValueError(
-                "--mapping-file 不能与 --reservation-id/--target-tag 同时使用"
-            )
-        return load_mapping_file(Path(args.mapping_file))
-    if not args.reservation_id or not args.target_tag:
-        raise ValueError(
-            "必须提供 --mapping-file，或同时提供 --reservation-id 和 --target-tag"
-        )
-    target = parse_target_tag(args.target_tag)
-    mapping: dict[str, tuple[str, str]] = {}
-    for reservation_id in args.reservation_id:
-        reservation_id = reservation_id.strip()
-        if reservation_id:
-            mapping[reservation_id] = target
-    if not mapping:
-        raise ValueError("--reservation-id 至少需要一个非空值")
-    return mapping
 
 
 # reservationId → 分摊目标列表，每个目标为 ((标签键, 标签值), 权重)。
@@ -356,47 +190,26 @@ def load_reservations_file(path: Path, project_tag_key: str = "projname") -> RiT
     return result
 
 
-def build_ri_targets(args: argparse.Namespace) -> tuple[RiTargets, bool]:
-    """构建 reservationId → [(目标, 权重)] 映射，并返回是否使用全量按权重再分摊。
+def build_ri_targets(args: argparse.Namespace) -> RiTargets:
+    """构建 reservationId → [(目标, 权重)] 映射。
 
-    - --reservations-file：按 bindings 权重把一个 RI 分摊到多个项目，返回
-      ``redistribute_all=True``（无论 binding 数量，均对全部 RI 使用记录加回并按
-      权重再分摊）。
-    - --mapping-file / 内联 --reservation-id + --target-tag：单目标，权重恒为 1，
-      返回 ``redistribute_all=False``（沿用"已在目标则不搬动"的历史行为）。
+    读取 --reservations-file 指定的 reservations.json，按每个预留的 bindings
+    权重把一个 RI 分摊到多个项目（projectCode）。
     """
-    if args.reservations_file:
-        if args.mapping_file or args.reservation_id or args.target_tag:
-            raise ValueError(
-                "--reservations-file 不能与 "
-                "--mapping-file/--reservation-id/--target-tag 同时使用"
-            )
-        targets = load_reservations_file(
-            Path(args.reservations_file), args.project_tag_key
-        )
-        return targets, True
-    single = build_ri_target_map(args)
-    return {rid: [(target, Decimal("1"))] for rid, target in single.items()}, False
+    return load_reservations_file(Path(args.reservations_file), args.project_tag_key)
 
 
 def _row_contributions(
     amount: Decimal,
     targets_list: list[tuple[tuple[str, str], Decimal]],
     row: dict[str, str],
-    redistribute_all: bool,
-) -> tuple[Decimal | None, list[tuple[tuple[str, str], Decimal]], str]:
+) -> tuple[Decimal, list[tuple[tuple[str, str], Decimal]], str]:
     """计算单条 RI 使用记录的加回金额与各目标收益池贡献。
 
-    返回 ``(add_back, contributions, label)``：
-    - ``add_back`` 为 None 表示该行保持不变（单目标模式下已在目标项目内）；
-    - 否则 ``add_back`` 为加回到该行的金额，``contributions`` 为 [(目标, 贡献)]，
-      各贡献之和等于 ``add_back``；``label`` 为写入 allocationTarget 列的目标标识。
+    返回 ``(add_back, contributions, label)``：``add_back`` 为加回到该行的金额，
+    ``contributions`` 为 [(目标, 贡献)]，各贡献之和等于 ``add_back``（按 bindings
+    权重拆分）；``label`` 为写入 allocationTarget 列的目标标识。
     """
-    if not redistribute_all and len(targets_list) == 1:
-        target = targets_list[0][0]
-        if has_target_tag(row, target):
-            return None, [], ""
-        return amount, [(target, amount)], target[1]
     total_weight = sum((weight for _target, weight in targets_list), Decimal("0"))
     contributions = [
         (target, amount * weight / total_weight)
@@ -536,7 +349,7 @@ def project_of(row: dict[str, str]) -> str:
 def main() -> None:
     """读取账单、计算分摊并生成明细副本和汇总报告。"""
     args = parse_args()
-    ri_targets, redistribute_all = build_ri_targets(args)
+    ri_targets = build_ri_targets(args)
     reservation_ids = set(ri_targets)
     targets = sorted(
         {target for entries in ri_targets.values() for target, _weight in entries}
@@ -596,15 +409,14 @@ def main() -> None:
                     if is_size_flexible(row):
                         ri_size_flexible_rows += 1
                     add_back, contributions, _label = _row_contributions(
-                        amount, targets_list, row, redistribute_all
+                        amount, targets_list, row
                     )
-                    if add_back is not None:
-                        ri_reallocated_rows += 1
-                        ri_amount += add_back
-                        project_ri[project] += add_back
-                        alloc_key = allocation_key(row, args.match_mode)
-                        for target, contribution in contributions:
-                            ri_amount_by_key[(target, alloc_key)] += contribution
+                    ri_reallocated_rows += 1
+                    ri_amount += add_back
+                    project_ri[project] += add_back
+                    alloc_key = allocation_key(row, args.match_mode)
+                    for target, contribution in contributions:
+                        ri_amount_by_key[(target, alloc_key)] += contribution
                 else:
                     matched = [t for t in targets if has_target_tag(row, t)]
                     if len(matched) > 1:
@@ -653,11 +465,10 @@ def main() -> None:
             targets_list = ri_targets[reservation_id]
             amount = decimal_from_row(row, args.amount_field)
             add_back, _contributions, label = _row_contributions(
-                amount, targets_list, row, redistribute_all
+                amount, targets_list, row
             )
-            if add_back is not None:
-                allocation_by_index[index] = add_back
-                target_value_by_index[index] = label
+            allocation_by_index[index] = add_back
+            target_value_by_index[index] = label
 
     # 每条目标明细只承接相同分摊目标、相同机型和区域 RI 收益池中的金额。
     for pool_key, indexes in target_non_ri_indexes.items():
@@ -767,7 +578,7 @@ def main() -> None:
             )
 
     summary = {
-        "allocationMode": "reservations" if redistribute_all else "mapping",
+        "allocationMode": "reservations",
         "mappings": [
             {
                 "reservationId": reservation_id,
