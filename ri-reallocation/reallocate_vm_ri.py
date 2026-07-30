@@ -98,6 +98,9 @@ def parse_tags(raw: str) -> dict[str, Any]:
 RiTargets = dict[str, list[tuple[tuple[str, str], Decimal]]]
 # reservationId → RI 收益匹配模式（"model" 或 "flex-group"）。
 RiModes = dict[str, str]
+# reservationId → 权重分母（boundTotal）。绑定项目按 boundQuantity/boundTotal 分摊，
+# 剩余 (boundTotal - Σ boundQuantity)/boundTotal 的收益留在原 RI 使用项目（其他项目）。
+RiDenominators = dict[str, Decimal]
 
 
 def _match_mode_from_flexibility(flexibility: Any) -> str:
@@ -129,8 +132,8 @@ def _reservation_id_from_external(external: Any) -> str:
 
 def load_reservations_file(
     path: Path, project_tag_key: str = "projname"
-) -> tuple[RiTargets, RiModes]:
-    """读取 reservations.json，构建 reservationId → [(目标, 权重)] 映射及匹配模式。
+) -> tuple[RiTargets, RiModes, RiDenominators]:
+    """读取 reservations.json，构建 reservationId → [(目标, 权重)] 映射、匹配模式及权重分母。
 
     每个预留按 ``bindings`` 拆分：``projectCode`` 作为目标标签值（键由
     ``project_tag_key`` 指定，默认 projname），``boundQuantity`` 作为权重。
@@ -138,8 +141,12 @@ def load_reservations_file(
     没有有效 binding 的预留跳过。RI 收益匹配模式由预留的 ``flexibility`` 字段
     推导（``on`` → flex-group，否则 model），无需命令行指定。
 
-    返回 ``(ri_targets, ri_modes)``：``ri_targets`` 为 reservationId → [(目标, 权重)]，
-    ``ri_modes`` 为 reservationId → 匹配模式。
+    权重分母取 ``boundTotal``：绑定项目各按 ``boundQuantity / boundTotal`` 分摊，
+    剩余的 ``(boundTotal - Σ boundQuantity) / boundTotal`` 那部分收益不再搬走，
+    留在实际使用该 RI 的原项目（其他项目）。当 ``boundTotal`` 缺失、非正或小于
+    Σ boundQuantity 时，回退为 Σ boundQuantity（即无剩余、全额分摊到绑定项目）。
+
+    返回 ``(ri_targets, ri_modes, ri_denominators)``。
     """
     if not path.is_file():
         raise FileNotFoundError(f"找不到 reservations 文件：{path}")
@@ -157,6 +164,7 @@ def load_reservations_file(
     key = (project_tag_key or "projname").strip() or "projname"
     result: RiTargets = {}
     modes: RiModes = {}
+    denominators: RiDenominators = {}
     for item in items:
         if not isinstance(item, dict):
             raise ValueError("reservation 条目必须是对象")
@@ -195,19 +203,30 @@ def load_reservations_file(
         modes[reservation_id] = _match_mode_from_flexibility(
             item.get("flexibility")
         )
+        bound_sum = sum(weights.values(), Decimal("0"))
+        try:
+            bound_total = Decimal(str(item.get("boundTotal")))
+        except (InvalidOperation, TypeError):
+            bound_total = None
+        # boundTotal 缺失/非正/小于已绑定权重之和时，回退为全额分摊（无其他项目剩余）。
+        if bound_total is None or bound_total < bound_sum:
+            bound_total = bound_sum
+        denominators[reservation_id] = bound_total
     if not result:
         raise ValueError(
             "reservations 文件没有可用的 RI 分摊定义（缺少有效 bindings）"
         )
-    return result, modes
+    return result, modes, denominators
 
 
-def build_ri_targets(args: argparse.Namespace) -> tuple[RiTargets, RiModes]:
-    """构建 reservationId → [(目标, 权重)] 映射及匹配模式。
+def build_ri_targets(
+    args: argparse.Namespace,
+) -> tuple[RiTargets, RiModes, RiDenominators]:
+    """构建 reservationId → [(目标, 权重)] 映射、匹配模式及权重分母。
 
     读取 --reservations-file 指定的 reservations.json，按每个预留的 bindings
     权重把一个 RI 分摊到多个项目（projectCode），并按预留的 flexibility 字段
-    推导 RI 收益匹配模式。
+    推导 RI 收益匹配模式；权重分母取 boundTotal（详见 load_reservations_file）。
     """
     return load_reservations_file(Path(args.reservations_file), args.project_tag_key)
 
@@ -215,21 +234,28 @@ def build_ri_targets(args: argparse.Namespace) -> tuple[RiTargets, RiModes]:
 def _row_contributions(
     amount: Decimal,
     targets_list: list[tuple[tuple[str, str], Decimal]],
-    row: dict[str, str],
+    denominator: Decimal,
 ) -> tuple[Decimal, list[tuple[tuple[str, str], Decimal]], str]:
     """计算单条 RI 使用记录的加回金额与各目标收益池贡献。
 
-    返回 ``(add_back, contributions, label)``：``add_back`` 为加回到该行的金额，
-    ``contributions`` 为 [(目标, 贡献)]，各贡献之和等于 ``add_back``（按 bindings
-    权重拆分）；``label`` 为写入 allocationTarget 列的目标标识。
+    ``denominator`` 为权重分母（boundTotal）。绑定项目各分得
+    ``amount × boundQuantity / boundTotal``；加回金额 ``add_back`` 为各目标贡献之和，
+    即 ``amount × Σ boundQuantity / boundTotal``。剩余部分不加回，留在原 RI 使用项目
+    （其他项目）。``denominator`` 非正时按 Σ 权重全额分摊。
+
+    返回 ``(add_back, contributions, label)``：``contributions`` 为 [(目标, 贡献)]，
+    各贡献之和等于 ``add_back``；``label`` 为写入 allocationTarget 列的目标标识。
     """
     total_weight = sum((weight for _target, weight in targets_list), Decimal("0"))
+    if denominator is None or denominator <= 0:
+        denominator = total_weight
     contributions = [
-        (target, amount * weight / total_weight)
+        (target, amount * weight / denominator)
         for target, weight in targets_list
     ]
+    add_back = sum((c for _target, c in contributions), Decimal("0"))
     label = "|".join(target[1] for target, _weight in targets_list)
-    return amount, contributions, label
+    return add_back, contributions, label
 
 
 def decimal_from_row(row: dict[str, str], field: str) -> Decimal:
@@ -362,7 +388,7 @@ def project_of(row: dict[str, str]) -> str:
 def main() -> None:
     """读取账单、计算分摊并生成明细副本和汇总报告。"""
     args = parse_args()
-    ri_targets, ri_modes = build_ri_targets(args)
+    ri_targets, ri_modes, ri_denominators = build_ri_targets(args)
     reservation_ids = set(ri_targets)
     targets = sorted(
         {target for entries in ri_targets.values() for target, _weight in entries}
@@ -435,7 +461,7 @@ def main() -> None:
                     if is_size_flexible(row):
                         ri_size_flexible_rows += 1
                     add_back, contributions, _label = _row_contributions(
-                        amount, targets_list, row
+                        amount, targets_list, ri_denominators[reservation_id]
                     )
                     ri_reallocated_rows += 1
                     ri_amount += add_back
@@ -494,7 +520,7 @@ def main() -> None:
             targets_list = ri_targets[reservation_id]
             amount = decimal_from_row(row, args.amount_field)
             add_back, _contributions, label = _row_contributions(
-                amount, targets_list, row
+                amount, targets_list, ri_denominators[reservation_id]
             )
             allocation_by_index[index] = add_back
             target_value_by_index[index] = label
@@ -612,6 +638,13 @@ def main() -> None:
             {
                 "reservationId": reservation_id,
                 "matchMode": ri_modes[reservation_id],
+                "boundTotal": str(ri_denominators[reservation_id]),
+                "boundWeightSum": str(
+                    sum(
+                        (weight for _target, weight in ri_targets[reservation_id]),
+                        Decimal("0"),
+                    )
+                ),
                 "targets": [
                     {"key": target[0], "value": target[1], "weight": str(weight)}
                     for target, weight in ri_targets[reservation_id]

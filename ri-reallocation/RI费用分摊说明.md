@@ -69,7 +69,7 @@ flowchart TD
     B -- 否 --> Z[不处理<br/>原样保留]
     B -- 是 --> C{是指定 RI 使用记录?<br/>pricingModel=Reservation<br/>chargeType=Usage<br/>reservationId 命中}
 
-    C -- 是 --> E[加回 RI 使用金额<br/>allocationType=RI_USAGE_COST_REASSIGNED<br/>riAllocationAmount 为正<br/>按 binding 权重拆分计入<br/>各 目标+匹配键 的 RI 收益池]
+    C -- 是 --> E[按 boundTotal 分母拆分 RI 使用金额<br/>allocationType=RI_USAGE_COST_REASSIGNED<br/>riAllocationAmount 为正<br/>按 binding 权重计入各 目标+匹配键 的 RI 收益池<br/>未绑定份额保留在原记录]
 
     C -- 否 --> F{带目标标签?}
     F -- 否 --> Z3[不处理<br/>非目标项目普通费用]
@@ -93,18 +93,16 @@ flowchart TD
 
 ### 3.1 RI 使用记录
 
-对每一条 RI 使用记录（无论其自身标签），将该行的 RI 使用金额全额加回资源成本，该金额随后按该预留 `bindings` 的 `boundQuantity` 权重拆分到各目标项目：
+对每一条 RI 使用记录（无论其自身标签），按该预留的 `bindings` 权重把该行的 RI 使用金额拆分到各目标项目。拆分的分母为该预留的 `boundTotal`（预留总份数），每个项目获得 `boundQuantity / boundTotal` 的比例；若 `boundTotal` 缺失或不大于权重合计，则回退到以 `ΣboundQuantity` 为分母（等价于全额分摊）。
+
+加回原 RI 使用记录的金额为所有目标项目分得金额之和：
 
 ```text
-allocatedCostInBillingCurrency
-  = costInBillingCurrency + RI使用金额
+加回金额 = RI使用金额 × ΣboundQuantity / boundTotal
+allocatedCostInBillingCurrency = costInBillingCurrency + 加回金额
 ```
 
-因此：
-
-```text
-allocatedCostInBillingCurrency > costInBillingCurrency
-```
+当 `boundTotal > ΣboundQuantity`（预留只部分绑定）时，未绑定份额 `(boundTotal − ΣboundQuantity) / boundTotal` 对应的收益**不再分摊出去，保留在原 RI 使用记录（即消费该 RI 的项目）上**。
 
 这些记录标记为：
 
@@ -208,6 +206,7 @@ reallocate_vm_ri.py
   {
     "externalReservationId": ".../reservationOrders/<order>/reservations/8345b648-839b-4fdc-acbc-a776bdfe00d5",
     "flexibility": "on",
+    "boundTotal": 3,
     "bindings": [
       {"projectCode": "config-register-center", "boundQuantity": 2},
       {"projectCode": "observe-platform", "boundQuantity": 1}
@@ -222,16 +221,21 @@ reallocate_vm_ri.py
   提取；缺失时回退到 `reservationId` 字段。需与账单 `reservationId` 列一致。
 - **flexibility**：实例大小灵活性开关。`on` → 按灵活性组匹配（`flex-group`），
   否则按精确机型匹配（`model`）。匹配模式据此**自动推导，无需命令行参数**。
+- **boundTotal**：预留总份数，作为权重分摊的**分母**。每个项目分得
+  `boundQuantity / boundTotal`。缺失、非正或小于 `ΣboundQuantity` 时，回退到以
+  `ΣboundQuantity` 为分母（等价于全额分摊）。
 - **bindings[].projectCode**：目标项目，映射为目标标签 `projname=<projectCode>`
   （标签键可用 `--project-tag-key` 修改，默认 `projname`）。
-- **bindings[].boundQuantity**：该项目的分摊权重。同一预留内相同 `projectCode`
-  的权重合并；权重 ≤ 0 的 binding 忽略；没有有效 binding 的预留跳过。
+- **bindings[].boundQuantity**：该项目的分摊权重（分子）。同一预留内相同
+  `projectCode` 的权重合并；权重 ≤ 0 的 binding 忽略；没有有效 binding 的预留跳过。
 
-**分摊规则**：某 RI 的全部使用金额（按匹配键分池）先加回各自的 RI 使用记录，
-再按 `boundQuantity / ΣboundQuantity` 的比例拆成子池，每个子池分摊给对应
-`projectCode` 目标项目内「相同机型（或灵活性组）+ 相同区域」的非 RI 虚拟机明细。
-本模式对**全部** RI 使用记录加回并按权重再分摊（即使某条 RI 使用记录本就落在
-某个绑定项目内），从而严格按 binding 比例分配收益。金额守恒不变。
+**分摊规则**：某 RI 的使用金额（按匹配键分池）按 `boundQuantity / boundTotal` 的
+比例拆成子池，每个子池分摊给对应 `projectCode` 目标项目内「相同机型（或灵活性组）
++ 相同区域」的非 RI 虚拟机明细，并把这些子池金额之和加回各自的 RI 使用记录。
+当 `boundTotal > ΣboundQuantity`（预留只部分绑定）时，未绑定份额
+`(boundTotal − ΣboundQuantity) / boundTotal` 对应的收益**不再分摊，保留在原 RI
+使用记录（消费该 RI 的项目）上**。本模式对**全部** RI 使用记录按 binding 比例
+再分摊（即使某条 RI 使用记录本就落在某个绑定项目内）。金额守恒不变。
 
 在包含源 CSV 的目录执行：
 

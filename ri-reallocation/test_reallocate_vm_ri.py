@@ -154,7 +154,7 @@ class ReservationsFileTests(unittest.TestCase):
                 }
             ]
         )
-        result, _modes = MODULE.load_reservations_file(path)
+        result, _modes, _dens = MODULE.load_reservations_file(path)
         self.assertEqual(
             result["ri-a"],
             [
@@ -167,7 +167,7 @@ class ReservationsFileTests(unittest.TestCase):
         path = self._write(
             [{"reservationId": "ri-a", "bindings": [{"projectCode": "x", "boundQuantity": 1}]}]
         )
-        result, _modes = MODULE.load_reservations_file(path, project_tag_key="costcenter")
+        result, _modes, _dens = MODULE.load_reservations_file(path, project_tag_key="costcenter")
         self.assertEqual(result["ri-a"], [(("costcenter", "x"), MODULE.Decimal("1"))])
 
     def test_same_project_code_weights_merged(self):
@@ -182,7 +182,7 @@ class ReservationsFileTests(unittest.TestCase):
                 }
             ]
         )
-        result, _modes = MODULE.load_reservations_file(path)
+        result, _modes, _dens = MODULE.load_reservations_file(path)
         self.assertEqual(result["ri-a"], [(("projname", "x"), MODULE.Decimal("5"))])
 
     def test_non_positive_quantity_ignored(self):
@@ -197,7 +197,7 @@ class ReservationsFileTests(unittest.TestCase):
                 }
             ]
         )
-        result, _modes = MODULE.load_reservations_file(path)
+        result, _modes, _dens = MODULE.load_reservations_file(path)
         self.assertEqual(result["ri-a"], [(("projname", "x"), MODULE.Decimal("1"))])
 
     def test_reservation_without_bindings_skipped(self):
@@ -207,7 +207,7 @@ class ReservationsFileTests(unittest.TestCase):
                 {"reservationId": "ri-a", "bindings": [{"projectCode": "x", "boundQuantity": 1}]},
             ]
         )
-        result, _modes = MODULE.load_reservations_file(path)
+        result, _modes, _dens = MODULE.load_reservations_file(path)
         self.assertNotIn("ri-empty", result)
         self.assertIn("ri-a", result)
 
@@ -238,7 +238,7 @@ class ReservationsFileTests(unittest.TestCase):
                 }
             ]
         )
-        result, _modes = MODULE.load_reservations_file(path)
+        result, _modes, _dens = MODULE.load_reservations_file(path)
         self.assertIn("billing-rid", result)
         self.assertNotIn("internal-record-uuid", result)
 
@@ -250,8 +250,69 @@ class ReservationsFileTests(unittest.TestCase):
             reservations_file=str(path),
             project_tag_key="projname",
         )
-        targets, _modes = MODULE.build_ri_targets(args)
+        targets, _modes, _dens = MODULE.build_ri_targets(args)
         self.assertEqual(targets, {"ri-a": [(("projname", "x"), MODULE.Decimal("1"))]})
+
+    def test_bound_total_used_as_denominator(self):
+        path = self._write(
+            [
+                {
+                    "reservationId": "ri-a",
+                    "boundTotal": 4,
+                    "bindings": [
+                        {"projectCode": "x", "boundQuantity": 2},
+                        {"projectCode": "y", "boundQuantity": 1},
+                    ],
+                }
+            ]
+        )
+        _result, _modes, dens = MODULE.load_reservations_file(path)
+        self.assertEqual(dens["ri-a"], MODULE.Decimal("4"))
+
+    def test_bound_total_missing_falls_back_to_weight_sum(self):
+        path = self._write(
+            [
+                {
+                    "reservationId": "ri-a",
+                    "bindings": [
+                        {"projectCode": "x", "boundQuantity": 2},
+                        {"projectCode": "y", "boundQuantity": 1},
+                    ],
+                }
+            ]
+        )
+        _result, _modes, dens = MODULE.load_reservations_file(path)
+        self.assertEqual(dens["ri-a"], MODULE.Decimal("3"))
+
+    def test_bound_total_below_weight_sum_falls_back(self):
+        path = self._write(
+            [
+                {
+                    "reservationId": "ri-a",
+                    "boundTotal": 1,
+                    "bindings": [
+                        {"projectCode": "x", "boundQuantity": 2},
+                        {"projectCode": "y", "boundQuantity": 1},
+                    ],
+                }
+            ]
+        )
+        _result, _modes, dens = MODULE.load_reservations_file(path)
+        self.assertEqual(dens["ri-a"], MODULE.Decimal("3"))
+
+    def test_row_contributions_partial_when_bound_total_larger(self):
+        targets_list = [
+            (("projname", "x"), MODULE.Decimal("2")),
+            (("projname", "y"), MODULE.Decimal("1")),
+        ]
+        add_back, contributions, _label = MODULE._row_contributions(
+            MODULE.Decimal("40"), targets_list, MODULE.Decimal("4")
+        )
+        amounts = {t[1]: amt for t, amt in contributions}
+        self.assertEqual(amounts["x"], MODULE.Decimal("20"))
+        self.assertEqual(amounts["y"], MODULE.Decimal("10"))
+        # 未绑定部分（40*1/4=10）保留在原 RI 明细上，不再分摊。
+        self.assertEqual(add_back, MODULE.Decimal("30"))
 
     def test_match_mode_from_flexibility(self):
         self.assertEqual(MODULE._match_mode_from_flexibility("on"), "flex-group")
@@ -275,7 +336,7 @@ class ReservationsFileTests(unittest.TestCase):
                 },
             ]
         )
-        _result, modes = MODULE.load_reservations_file(path)
+        _result, modes, _dens = MODULE.load_reservations_file(path)
         self.assertEqual(modes["ri-flex"], "flex-group")
         self.assertEqual(modes["ri-fixed"], "model")
 
@@ -391,6 +452,60 @@ class ReservationsReallocationTests(unittest.TestCase):
             summary["assignedByTarget"], {"alpha": "20", "beta": "10"}
         )
         # conservation
+        total = sum(MODULE.Decimal(r["riAllocationAmount"]) for r in result_rows)
+        self.assertEqual(total, MODULE.Decimal("0"))
+
+    def test_bound_total_leaves_unbound_remainder_on_ri_row(self):
+        # boundTotal=4 但绑定权重合计=3，未绑定部分 (1/4) 保留在原 RI 明细上。
+        rows = [
+            self._row(
+                ResourceId="/vm/ri-usage",
+                pricingModel="Reservation",
+                chargeType="Usage",
+                reservationId="ri-a",
+                meterRegion="US West 3",
+                additionalInfo='{"ServiceType":"Standard_D2s_v5"}',
+                tags='{"projname":"misc"}',
+                costInBillingCurrency="40",
+            ),
+            self._row(
+                ResourceId="/vm/alpha-recv",
+                pricingModel="OnDemand",
+                chargeType="Usage",
+                reservationId="",
+                meterRegion="US West 3",
+                additionalInfo='{"ServiceType":"Standard_D2s_v5"}',
+                tags='{"projname":"alpha"}',
+                costInBillingCurrency="100",
+            ),
+            self._row(
+                ResourceId="/vm/beta-recv",
+                pricingModel="OnDemand",
+                chargeType="Usage",
+                reservationId="",
+                meterRegion="US West 3",
+                additionalInfo='{"ServiceType":"Standard_D2s_v5"}',
+                tags='{"projname":"beta"}',
+                costInBillingCurrency="100",
+            ),
+        ]
+        reservations = [
+            {
+                "externalReservationId": ".../reservations/ri-a",
+                "boundTotal": 4,
+                "bindings": [
+                    {"projectCode": "alpha", "boundQuantity": 2},
+                    {"projectCode": "beta", "boundQuantity": 1},
+                ],
+            }
+        ]
+        result_rows, summary = self._run(rows, reservations)
+        by_id = {r["ResourceId"]: r for r in result_rows}
+        # 40*2/4=20 给 alpha，40*1/4=10 给 beta，仅加回 30；剩余 10 留在原明细。
+        self.assertEqual(by_id["/vm/ri-usage"]["riAllocationAmount"], "30")
+        self.assertEqual(by_id["/vm/alpha-recv"]["riAllocationAmount"], "-20")
+        self.assertEqual(by_id["/vm/beta-recv"]["riAllocationAmount"], "-10")
+        self.assertEqual(summary["assignedByTarget"], {"alpha": "20", "beta": "10"})
         total = sum(MODULE.Decimal(r["riAllocationAmount"]) for r in result_rows)
         self.assertEqual(total, MODULE.Decimal("0"))
 
