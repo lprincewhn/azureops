@@ -420,6 +420,7 @@ def main() -> None:
     ri_reallocated_rows = 0
     ri_size_flexible_rows = 0
     ri_amount = Decimal("0")
+    ri_raw_total = Decimal("0")
     project_before: defaultdict[str, Decimal] = defaultdict(Decimal)
     project_ri: defaultdict[str, Decimal] = defaultdict(Decimal)
     # 收益池和目标费用池按 (分摊目标, 匹配键) 隔离，确保每个 RI 的收益只流向自己的目标。
@@ -471,6 +472,7 @@ def main() -> None:
                     )
                     ri_reallocated_rows += 1
                     ri_amount += add_back
+                    ri_raw_total += amount
                     project_ri[project] += add_back
                     row_index = len(rows) - 1
                     ri_usage_indexes.add(row_index)
@@ -707,8 +709,9 @@ def main() -> None:
             reservation_id: sorted(models)
             for reservation_id, models in sorted(ri_service_types.items())
         },
-        "riUsageAmount": str(ri_amount),
-        "targetNonRiVmAmount": str(target_non_ri_total),
+        "riAllocatableAmount": str(ri_amount),
+        "riRawTotalAmount": str(ri_raw_total),
+        "targetVmReceiverAmount": str(target_non_ri_total),
         "assignedByTarget": {
             target_value: str(amount)
             for target_value, amount in sorted(assigned_by_target.items())
@@ -719,7 +722,7 @@ def main() -> None:
                 "matchKey": alloc_key[0],
                 "region": alloc_key[1],
                 "riAmount": str(ri_amount_by_key[(target, alloc_key)]),
-                "targetNonRiVmAmount": str(
+                "targetVmReceiverAmount": str(
                     target_non_ri_total_by_key.get((target, alloc_key), Decimal("0"))
                 ),
             }
@@ -738,8 +741,9 @@ def main() -> None:
 
     print(f"分摊目标数：{len(targets)}")
     print(f"RI 使用记录：{ri_usage_rows} 条")
-    print(f"RI 使用金额：{ri_amount}")
-    print(f"目标项目非 RI 虚拟机费用：{target_non_ri_total}")
+    print(f"RI 原始费用合计：{ri_raw_total}")
+    print(f"待分摊 RI 金额：{ri_amount}")
+    print(f"目标项目虚拟机接收费用：{target_non_ri_total}")
     print(f"输出目录：{output_dir}")
     print(f"汇总文件：{summary_path}")
 

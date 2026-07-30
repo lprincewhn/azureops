@@ -506,6 +506,9 @@ class ReservationsReallocationTests(unittest.TestCase):
         self.assertEqual(by_id["/vm/alpha-recv"]["riAllocationAmount"], "-20")
         self.assertEqual(by_id["/vm/beta-recv"]["riAllocationAmount"], "-10")
         self.assertEqual(summary["assignedByTarget"], {"alpha": "20", "beta": "10"})
+        # 原始费用合计=40，待分摊=40*3/4=30，未绑定 1/4 不计入待分摊金额。
+        self.assertEqual(summary["riRawTotalAmount"], "40")
+        self.assertEqual(summary["riAllocatableAmount"], "30")
         total = sum(MODULE.Decimal(r["riAllocationAmount"]) for r in result_rows)
         self.assertEqual(total, MODULE.Decimal("0"))
 

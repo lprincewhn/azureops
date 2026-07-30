@@ -331,9 +331,11 @@ ri-reallocated/
 - `matchModeByReservation`：每个 `reservationId` 由 `flexibility` 推导出的匹配模式（`flex-group` / `model`）
 - `targets`：全部分摊目标（`key=value` 列表）
 - RI 记录数量、RI 分摊记录数量
-- RI 金额、目标项目虚拟机费用（接收池，含加回后的 RI 记录全价）
+- `riRawTotalAmount`：RI 使用记录原始费用合计（对账用，未乘权重）
+- `riAllocatableAmount`：待分摊 RI 金额（= Σ 加回金额 = 原始费用 × ΣboundQuantity/boundTotal；部分绑定时小于原始费用合计）
+- `targetVmReceiverAmount`：目标项目虚拟机接收费用（接收池，含加回后的 RI 记录全价）
 - `assignedByTarget`：每个分摊目标承接的 RI 收益总额
-- `riAllocationKeys`：每个 `(分摊目标, 匹配键)` 的 RI 金额与目标费用
+- `riAllocationKeys`：每个 `(分摊目标, 匹配键)` 的 `riAmount` 与 `targetVmReceiverAmount`
 - 源文件是否被修改、标签和资源 ID 是否被修改
 
 ## 8. 注意事项
