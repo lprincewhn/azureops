@@ -1,5 +1,11 @@
 # RI 费用重新分摊说明
 
+> **文档元数据**
+>
+> - 飞书文档（导出目标）：<https://my.feishu.cn/docx/EEQndRbM1occsPxh621c1miSn6b>
+> - 说明：本 Markdown 为权威源文件；后续如需同步/导出到飞书，请更新上述飞书文档。
+> - 最后导出到飞书：2026-08-01
+
 ## 1. 目的
 
 本方案用于生成一份新的 Azure 成本明细副本，将预留（RI）使用金额按 `reservations.json` 中每个预留 `bindings` 的 `boundQuantity` 权重重新分摊到一个或多个项目，同时保留源文件不变。
@@ -61,7 +67,71 @@ RI 收益只会分配给与 RI 使用记录同时匹配以下字段的目标项�
 
 ### 3.0 处理流程概览
 
-下图为每条账单明细的判定与分摊流程（GitHub 可直接渲染 Mermaid）：
+本节自上而下给出三张图（GitHub 可直接渲染 Mermaid）：先是工具整体执行流程，再是与对账脚本的协作关系，最后是单条明细的判定与分摊流程。
+
+#### 3.0.1 工具整体执行流程（`reallocate_vm_ri.py`）
+
+脚本对全部输入做**两遍扫描**：第一遍逐行累计各项目费用与各 `(分摊目标, 匹配键)` 收益池，第二遍才能按目标项目费用总额算比例并写出结果。
+
+```mermaid
+flowchart TD
+    START([开始]) --> ARGS[解析命令行参数<br/>inputs / --reservations-file<br/>--project-tag-key / --amount-field<br/>--summary-only]
+    ARGS --> LOAD[加载 reservations.json<br/>reservationId → 目标+权重<br/>flexibility → 匹配模式 model/flex-group<br/>boundTotal → 权重分母]
+    LOAD --> MODECHK{同一目标被<br/>不同匹配模式的<br/>预留绑定?}
+    MODECHK -- 是 --> ERR1[报错停止<br/>需先统一相关预留的 flexibility]
+    MODECHK -- 否 --> PASS1
+
+    subgraph PASS1[第一遍：逐行扫描累计]
+      direction TB
+      R1[读取一行账单明细] --> VM{meterCategory<br/>== Virtual Machines?}
+      VM -- 否 --> KEEP[原样保留 不处理]
+      VM -- 是 --> ACC[累计 project_before 项目原始费用]
+      ACC --> ISRI{是指定 RI 使用记录?}
+      ISRI -- 是 --> SPLIT[按 boundTotal 拆分 RI 金额<br/>按 binding 权重计入各目标收益池<br/>自身命中目标则以全价入接收池]
+      ISRI -- 否 --> HASTAG{带目标标签?}
+      HASTAG -- 是 --> RECV[按原始费用计入<br/>目标接收池 目标+匹配键]
+      HASTAG -- 否 --> NEXT1[下一行]
+      SPLIT --> NEXT1
+      RECV --> NEXT1
+      KEEP --> NEXT1
+    end
+
+    PASS1 --> VALID{逐 目标+匹配键 校验:<br/>接收池费用 ≥ 待分摊 RI 且 ≠ 0?}
+    VALID -- 否 --> ERR2[报错停止<br/>该机型/组+区域分摊不出去]
+    VALID -- 是 --> COMPUTE[计算每条明细调整额:<br/>RI 记录 = 加回金额 − 应摊份额<br/>接收明细 = 按费用比例扣减 RI 收益]
+    COMPUTE --> PASS2
+
+    subgraph PASS2[第二遍：写出结果]
+      direction TB
+      W1[逐输入文件写明细副本<br/>新增列 allocated* / riAllocationAmount<br/>allocationType / allocationTarget]
+    end
+
+    PASS2 --> AGG[生成 project-allocation.csv<br/>项目分摊前后费用对比]
+    AGG --> SUM[生成 ri-summary.json 汇总统计]
+    SUM --> PRINT[打印汇总到控制台] --> END([结束])
+    ERR1 --> END
+    ERR2 --> END
+```
+
+> `--summary-only` 时跳过第二遍的明细副本，仅生成 `project-allocation.csv` 与 `ri-summary.json`。
+
+#### 3.0.2 与对账脚本的协作关系
+
+`reconcile_vm_ri_allocation.py` 读取分摊前后两份账单，做虚拟机级别对账，校验金额守恒。
+
+```mermaid
+flowchart LR
+    SRC[(源账单 CSV<br/>part_*.csv)] --> REALLOC[reallocate_vm_ri.py<br/>RI 费用重分摊]
+    RES[(reservations.json<br/>预留绑定定义)] --> REALLOC
+    REALLOC --> OUT[(ri-reallocated/<br/>明细副本<br/>project-allocation.csv<br/>ri-summary.json)]
+    SRC --> RECON[reconcile_vm_ri_allocation.py<br/>分摊前后对账]
+    OUT --> RECON
+    RECON --> REPORT[(VM 级对账结果<br/>校验金额守恒)]
+```
+
+#### 3.0.3 单条明细判定与分摊流程
+
+下图为每条账单明细的判定与分摊流程，并**显式展开**一条 RI 使用记录按 `binding` 权重分摊到多个目标的分叉结构：
 
 ```mermaid
 flowchart TD
@@ -69,13 +139,30 @@ flowchart TD
     B -- 否 --> Z[不处理<br/>原样保留]
     B -- 是 --> C{是指定 RI 使用记录?<br/>pricingModel=Reservation<br/>chargeType=Usage<br/>reservationId 命中}
 
-    C -- 是 --> E[按 boundTotal 分母拆分 RI 使用金额<br/>allocationType=RI_USAGE_COST_REASSIGNED<br/>按 binding 权重计入各 目标+匹配键 的 RI 收益池<br/>未绑定份额保留在原记录<br/>若自身命中目标则以全价加入该目标接收池]
+    C -- 是 --> E[标记 allocationType=RI_USAGE_COST_REASSIGNED<br/>取该预留 bindings 列表与 boundTotal]
+    E --> SPLIT[[遍历该预留每个 binding 目标<br/>一条 RI → 多目标按权重拆分]]
+
+    subgraph FANOUT[多目标权重分摊：分母 boundTotal]
+      direction TB
+      SPLIT --> W1[目标1 分得<br/>= RI金额 × boundQuantity1 / boundTotal<br/>计入 目标1+匹配键 收益池]
+      SPLIT --> W2[目标2 分得<br/>= RI金额 × boundQuantity2 / boundTotal<br/>计入 目标2+匹配键 收益池]
+      SPLIT --> Wd[…… 其余绑定目标同理]
+      W1 --> REM
+      W2 --> REM
+      Wd --> REM[未绑定份额<br/>= RI金额 ×（boundTotal − ΣboundQuantity）/ boundTotal<br/>保留在原 RI 使用记录]
+    end
+
+    REM --> LBL[加回金额 = Σ各目标分得<br/>allocationTarget = 全部目标以竖线连接<br/>如 alpha&#124;beta]
+    LBL --> SELF{自身标签<br/>命中某分摊目标?}
+    SELF -- 是 --> SELFP[以全价 原始+加回<br/>加入该目标接收池]
+    SELF -- 否 --> H
+    SELFP --> H
 
     C -- 否 --> F{带目标标签?}
     F -- 否 --> Z3[不处理<br/>非目标项目普通费用]
     F -- 是 --> G[归入目标项目池<br/>按 目标+匹配键 累计原始费用]
 
-    E --> H[[按 目标+匹配键 汇总:<br/>RI 收益池 & 目标项目费用池<br/>接收池含加回后的 RI 记录全价]]
+    H[[按 目标+匹配键 汇总:<br/>RI 收益池 & 目标项目费用池<br/>接收池含加回后的 RI 记录全价]]
     G --> H
     H --> I{每个 目标+匹配键 校验<br/>目标池 ≥ RI池 且 ≠ 0?}
     I -- 否 --> X[报错并停止<br/>该目标的机型/组+区域分摊不出去]
