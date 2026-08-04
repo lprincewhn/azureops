@@ -148,13 +148,13 @@ class ReservationsFileTests(unittest.TestCase):
                 {
                     "externalReservationId": ".../reservations/ri-a",
                     "bindings": [
-                        {"projectCode": "alpha", "boundQuantity": 2},
-                        {"projectCode": "beta", "boundQuantity": 1},
+                        {"project": "alpha", "boundQuantity": 2},
+                        {"project": "beta", "boundQuantity": 1},
                     ],
                 }
             ]
         )
-        result, _modes, _dens = MODULE.load_reservations_file(path)
+        result, _modes, _dens = MODULE.load_reservations_file(path, project_tag_key="projname")
         self.assertEqual(
             result["ri-a"],
             [
@@ -165,7 +165,7 @@ class ReservationsFileTests(unittest.TestCase):
 
     def test_custom_project_tag_key(self):
         path = self._write(
-            [{"reservationId": "ri-a", "bindings": [{"projectCode": "x", "boundQuantity": 1}]}]
+            [{"reservationId": "ri-a", "bindings": [{"project": "x", "boundQuantity": 1}]}]
         )
         result, _modes, _dens = MODULE.load_reservations_file(path, project_tag_key="costcenter")
         self.assertEqual(result["ri-a"], [(("costcenter", "x"), MODULE.Decimal("1"))])
@@ -176,13 +176,13 @@ class ReservationsFileTests(unittest.TestCase):
                 {
                     "reservationId": "ri-a",
                     "bindings": [
-                        {"projectCode": "x", "boundQuantity": 2},
-                        {"projectCode": "x", "boundQuantity": 3},
+                        {"project": "x", "boundQuantity": 2},
+                        {"project": "x", "boundQuantity": 3},
                     ],
                 }
             ]
         )
-        result, _modes, _dens = MODULE.load_reservations_file(path)
+        result, _modes, _dens = MODULE.load_reservations_file(path, project_tag_key="projname")
         self.assertEqual(result["ri-a"], [(("projname", "x"), MODULE.Decimal("5"))])
 
     def test_non_positive_quantity_ignored(self):
@@ -191,40 +191,40 @@ class ReservationsFileTests(unittest.TestCase):
                 {
                     "reservationId": "ri-a",
                     "bindings": [
-                        {"projectCode": "x", "boundQuantity": 1},
-                        {"projectCode": "y", "boundQuantity": 0},
+                        {"project": "x", "boundQuantity": 1},
+                        {"project": "y", "boundQuantity": 0},
                     ],
                 }
             ]
         )
-        result, _modes, _dens = MODULE.load_reservations_file(path)
+        result, _modes, _dens = MODULE.load_reservations_file(path, project_tag_key="projname")
         self.assertEqual(result["ri-a"], [(("projname", "x"), MODULE.Decimal("1"))])
 
     def test_reservation_without_bindings_skipped(self):
         path = self._write(
             [
                 {"reservationId": "ri-empty", "bindings": []},
-                {"reservationId": "ri-a", "bindings": [{"projectCode": "x", "boundQuantity": 1}]},
+                {"reservationId": "ri-a", "bindings": [{"project": "x", "boundQuantity": 1}]},
             ]
         )
-        result, _modes, _dens = MODULE.load_reservations_file(path)
+        result, _modes, _dens = MODULE.load_reservations_file(path, project_tag_key="projname")
         self.assertNotIn("ri-empty", result)
         self.assertIn("ri-a", result)
 
     def test_no_usable_definition_raises(self):
         path = self._write([{"reservationId": "ri-a", "bindings": []}])
         with self.assertRaises(ValueError):
-            MODULE.load_reservations_file(path)
+            MODULE.load_reservations_file(path, project_tag_key="projname")
 
     def test_duplicate_reservation_id_raises(self):
         path = self._write(
             [
-                {"reservationId": "ri-a", "bindings": [{"projectCode": "x", "boundQuantity": 1}]},
-                {"reservationId": "ri-a", "bindings": [{"projectCode": "y", "boundQuantity": 1}]},
+                {"reservationId": "ri-a", "bindings": [{"project": "x", "boundQuantity": 1}]},
+                {"reservationId": "ri-a", "bindings": [{"project": "y", "boundQuantity": 1}]},
             ]
         )
         with self.assertRaises(ValueError):
-            MODULE.load_reservations_file(path)
+            MODULE.load_reservations_file(path, project_tag_key="projname")
 
     def test_external_reservation_id_takes_precedence(self):
         # Real reservations.json has no top-level reservationId; the billing GUID
@@ -234,17 +234,17 @@ class ReservationsFileTests(unittest.TestCase):
                 {
                     "id": "internal-record-uuid",
                     "externalReservationId": ".../reservations/billing-rid",
-                    "bindings": [{"projectCode": "x", "boundQuantity": 1}],
+                    "bindings": [{"project": "x", "boundQuantity": 1}],
                 }
             ]
         )
-        result, _modes, _dens = MODULE.load_reservations_file(path)
+        result, _modes, _dens = MODULE.load_reservations_file(path, project_tag_key="projname")
         self.assertIn("billing-rid", result)
         self.assertNotIn("internal-record-uuid", result)
 
     def test_build_ri_targets_reads_reservations_file(self):
         path = self._write(
-            [{"reservationId": "ri-a", "bindings": [{"projectCode": "x", "boundQuantity": 1}]}]
+            [{"reservationId": "ri-a", "bindings": [{"project": "x", "boundQuantity": 1}]}]
         )
         args = argparse.Namespace(
             reservations_file=str(path),
@@ -260,13 +260,13 @@ class ReservationsFileTests(unittest.TestCase):
                     "reservationId": "ri-a",
                     "boundTotal": 4,
                     "bindings": [
-                        {"projectCode": "x", "boundQuantity": 2},
-                        {"projectCode": "y", "boundQuantity": 1},
+                        {"project": "x", "boundQuantity": 2},
+                        {"project": "y", "boundQuantity": 1},
                     ],
                 }
             ]
         )
-        _result, _modes, dens = MODULE.load_reservations_file(path)
+        _result, _modes, dens = MODULE.load_reservations_file(path, project_tag_key="projname")
         self.assertEqual(dens["ri-a"], MODULE.Decimal("4"))
 
     def test_bound_total_missing_falls_back_to_weight_sum(self):
@@ -275,13 +275,13 @@ class ReservationsFileTests(unittest.TestCase):
                 {
                     "reservationId": "ri-a",
                     "bindings": [
-                        {"projectCode": "x", "boundQuantity": 2},
-                        {"projectCode": "y", "boundQuantity": 1},
+                        {"project": "x", "boundQuantity": 2},
+                        {"project": "y", "boundQuantity": 1},
                     ],
                 }
             ]
         )
-        _result, _modes, dens = MODULE.load_reservations_file(path)
+        _result, _modes, dens = MODULE.load_reservations_file(path, project_tag_key="projname")
         self.assertEqual(dens["ri-a"], MODULE.Decimal("3"))
 
     def test_bound_total_below_weight_sum_falls_back(self):
@@ -291,13 +291,13 @@ class ReservationsFileTests(unittest.TestCase):
                     "reservationId": "ri-a",
                     "boundTotal": 1,
                     "bindings": [
-                        {"projectCode": "x", "boundQuantity": 2},
-                        {"projectCode": "y", "boundQuantity": 1},
+                        {"project": "x", "boundQuantity": 2},
+                        {"project": "y", "boundQuantity": 1},
                     ],
                 }
             ]
         )
-        _result, _modes, dens = MODULE.load_reservations_file(path)
+        _result, _modes, dens = MODULE.load_reservations_file(path, project_tag_key="projname")
         self.assertEqual(dens["ri-a"], MODULE.Decimal("3"))
 
     def test_row_contributions_partial_when_bound_total_larger(self):
@@ -327,16 +327,16 @@ class ReservationsFileTests(unittest.TestCase):
                 {
                     "reservationId": "ri-flex",
                     "flexibility": "on",
-                    "bindings": [{"projectCode": "x", "boundQuantity": 1}],
+                    "bindings": [{"project": "x", "boundQuantity": 1}],
                 },
                 {
                     "reservationId": "ri-fixed",
                     "flexibility": "off",
-                    "bindings": [{"projectCode": "y", "boundQuantity": 1}],
+                    "bindings": [{"project": "y", "boundQuantity": 1}],
                 },
             ]
         )
-        _result, modes, _dens = MODULE.load_reservations_file(path)
+        _result, modes, _dens = MODULE.load_reservations_file(path, project_tag_key="projname")
         self.assertEqual(modes["ri-flex"], "flex-group")
         self.assertEqual(modes["ri-fixed"], "model")
 
@@ -378,6 +378,8 @@ class ReservationsReallocationTests(unittest.TestCase):
             str(src),
             "--reservations-file",
             str(resv_path),
+            "--project-tag-key",
+            "projname",
             "--output-dir",
             str(out_dir),
         ]
@@ -432,8 +434,8 @@ class ReservationsReallocationTests(unittest.TestCase):
             {
                 "externalReservationId": ".../reservations/ri-a",
                 "bindings": [
-                    {"projectCode": "alpha", "boundQuantity": 2},
-                    {"projectCode": "beta", "boundQuantity": 1},
+                    {"project": "alpha", "boundQuantity": 2},
+                    {"project": "beta", "boundQuantity": 1},
                 ],
             }
         ]
@@ -494,8 +496,8 @@ class ReservationsReallocationTests(unittest.TestCase):
                 "externalReservationId": ".../reservations/ri-a",
                 "boundTotal": 4,
                 "bindings": [
-                    {"projectCode": "alpha", "boundQuantity": 2},
-                    {"projectCode": "beta", "boundQuantity": 1},
+                    {"project": "alpha", "boundQuantity": 2},
+                    {"project": "beta", "boundQuantity": 1},
                 ],
             }
         ]
@@ -541,7 +543,7 @@ class ReservationsReallocationTests(unittest.TestCase):
         reservations = [
             {
                 "reservationId": "ri-a",
-                "bindings": [{"projectCode": "alpha", "boundQuantity": 1}],
+                "bindings": [{"project": "alpha", "boundQuantity": 1}],
             }
         ]
         result_rows, summary = self._run(rows, reservations)
@@ -580,7 +582,7 @@ class ReservationsReallocationTests(unittest.TestCase):
         reservations = [
             {
                 "reservationId": "ri-a",
-                "bindings": [{"projectCode": "alpha", "boundQuantity": 1}],
+                "bindings": [{"project": "alpha", "boundQuantity": 1}],
             }
         ]
         result_rows, _summary = self._run(rows, reservations)
@@ -621,7 +623,7 @@ class ReservationsReallocationTests(unittest.TestCase):
             {
                 "externalReservationId": ".../reservations/ri-a",
                 "flexibility": "on",
-                "bindings": [{"projectCode": "alpha", "boundQuantity": 1}],
+                "bindings": [{"project": "alpha", "boundQuantity": 1}],
             }
         ]
         result_rows, summary = self._run(rows, reservations)
@@ -661,7 +663,7 @@ class ReservationsReallocationTests(unittest.TestCase):
             {
                 "externalReservationId": ".../reservations/ri-a",
                 "flexibility": "off",
-                "bindings": [{"projectCode": "alpha", "boundQuantity": 1}],
+                "bindings": [{"project": "alpha", "boundQuantity": 1}],
             }
         ]
         with self.assertRaises(ValueError):

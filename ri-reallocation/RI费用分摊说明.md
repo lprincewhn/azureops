@@ -41,7 +41,7 @@ RI 金额默认使用：
 costInBillingCurrency
 ```
 
-分摊定义由 `--reservations-file` 指定的预留定义文件（`reservations.json`）提供：文件中每个预留的 `externalReservationId` 提供待分摊的 `reservationId`，其 `bindings` 按 `boundQuantity` 权重把该 RI 的优惠收益分摊到一个或多个项目（`projectCode`），详见 [6. 执行方法](#6-执行方法)。
+分摊定义由 `--reservations-file` 指定的预留定义文件（`reservations.json`）提供：文件中每个预留的 `externalReservationId` 提供待分摊的 `reservationId`，其 `bindings` 按 `boundQuantity` 权重把该 RI 的优惠收益分摊到一个或多个项目（`project`），详见 [6. 执行方法](#6-执行方法)。
 
 RI 收益只会分配给与 RI 使用记录同时匹配以下字段的目标项目明细：
 
@@ -60,7 +60,7 @@ RI 收益只会分配给与 RI 使用记录同时匹配以下字段的目标项�
 # 机型无法解析时，自动回退到精确机型匹配
 ```
 
-> 匹配模式是**按预留（RI）粒度**的：不同预留可各自采用 `flex-group` 或 `model`。若同一 `projectCode` 被匹配模式不同的多个预留同时绑定，收益池无法一致隔离，脚本会报错，需先统一相关预留的 `flexibility`。
+> 匹配模式是**按预留（RI）粒度**的：不同预留可各自采用 `flex-group` 或 `model`。若同一 `project` 被匹配模式不同的多个预留同时绑定，收益池无法一致隔离，脚本会报错，需先统一相关预留的 `flexibility`。
 
 
 ## 3. 分摊逻辑
@@ -287,7 +287,7 @@ reallocate_vm_ri.py
 ## 6. 执行方法
 
 分摊定义由 `--reservations-file` 指定的预留定义文件（`reservations.json`）提供：
-**一个 RI 按 `bindings` 的 `boundQuantity` 权重拆分到一个或多个 `projectCode`**。
+**一个 RI 按 `bindings` 的 `boundQuantity` 权重拆分到一个或多个 `project`**。
 
 **文件结构**（数组，或 `{"reservations": [...]}`，或单个对象）：
 
@@ -298,8 +298,8 @@ reallocate_vm_ri.py
     "flexibility": "on",
     "boundTotal": 3,
     "bindings": [
-      {"projectCode": "config-register-center", "boundQuantity": 2},
-      {"projectCode": "observe-platform", "boundQuantity": 1}
+      {"project": "config-register-center", "boundQuantity": 2},
+      {"project": "observe-platform", "boundQuantity": 1}
     ]
   }
 ]
@@ -314,13 +314,13 @@ reallocate_vm_ri.py
 - **boundTotal**：预留总份数，作为权重分摊的**分母**。每个项目分得
   `boundQuantity / boundTotal`。缺失、非正或小于 `ΣboundQuantity` 时，回退到以
   `ΣboundQuantity` 为分母（等价于全额分摊）。
-- **bindings[].projectCode**：目标项目，映射为目标标签 `projname=<projectCode>`
-  （标签键可用 `--project-tag-key` 修改，默认 `projname`）。
+- **bindings[].project**：目标项目，映射为目标标签 `<--project-tag-key>=<project>`
+  （标签键由 `--project-tag-key` **必填**指定，无默认值）。
 - **bindings[].boundQuantity**：该项目的分摊权重（分子）。同一预留内相同
-  `projectCode` 的权重合并；权重 ≤ 0 的 binding 忽略；没有有效 binding 的预留跳过。
+  `project` 的权重合并；权重 ≤ 0 的 binding 忽略；没有有效 binding 的预留跳过。
 
 **分摊规则**：某 RI 的使用金额（按匹配键分池）按 `boundQuantity / boundTotal` 的
-比例拆成子池，每个子池分摊给对应 `projectCode` 目标项目内「相同机型（或灵活性组）
+比例拆成子池，每个子池分摊给对应 `project` 目标项目内「相同机型（或灵活性组）
 + 相同区域」的虚拟机明细，并把这些子池金额之和加回各自的 RI 使用记录。
 当 `boundTotal > ΣboundQuantity`（预留只部分绑定）时，未绑定份额
 `(boundTotal − ΣboundQuantity) / boundTotal` 对应的收益**不再分摊，保留在原 RI
@@ -336,6 +336,7 @@ python3 reallocate_vm_ri.py \
   part_0_0001.csv \
   part_1_0001.csv \
   --reservations-file reservations.json \
+  --project-tag-key projname \
   --output-dir ri-reallocated
 ```
 
@@ -345,6 +346,7 @@ python3 reallocate_vm_ri.py \
 python3 reallocate_vm_ri.py \
   "part_*_0001.csv" \
   --reservations-file reservations.json \
+  --project-tag-key projname \
   --output-dir ri-reallocated
 ```
 
@@ -354,11 +356,12 @@ python3 reallocate_vm_ri.py \
 python3 reallocate_vm_ri.py \
   "part_*_0001.csv" \
   --reservations-file reservations.json \
+  --project-tag-key projname \
   --amount-field costInUsd \
   --output-dir ri-reallocated
 ```
 
-使用其他标签键作为项目匹配条件：
+使用其他标签键作为项目匹配条件（`--project-tag-key` 为必填项，无默认值）：
 
 ```bash
 python3 reallocate_vm_ri.py \
@@ -374,13 +377,14 @@ python3 reallocate_vm_ri.py \
 python3 reallocate_vm_ri.py \
   "part_*_0001.csv" \
   --reservations-file reservations.json \
+  --project-tag-key projname \
   --summary-only \
   --output-dir ri-reallocation-summary
 ```
 
-> 若某 `projectCode` 在账单里既没有对应 `projname` 的普通虚拟机明细、也没有该目标
-> 自身命中的 RI 使用记录（机型/区域也需匹配），校验会报错——这通常意味着 binding
-> 的 projectCode 与账单标签口径不一致，需先对齐命名或改用 `--project-tag-key`。
+> 若某 `project` 在账单里既没有对应 `--project-tag-key` 标签值的普通虚拟机明细、
+> 也没有该目标自身命中的 RI 使用记录（机型/区域也需匹配），校验会报错——这通常意味着
+> binding 的 `project` 与账单标签口径不一致，需先对齐命名或调整 `--project-tag-key`。
 
 ## 7. 输出文件
 

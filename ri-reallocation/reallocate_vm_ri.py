@@ -45,15 +45,15 @@ def parse_args() -> argparse.Namespace:
         required=True,
         help=(
             "预留分摊定义文件（reservations.json）。按每个预留的 bindings 将 RI "
-            "优惠收益按 boundQuantity 比例分摊到多个项目（projectCode）"
+            "优惠收益按 boundQuantity 比例分摊到多个项目（project）"
         ),
     )
     parser.add_argument(
         "--project-tag-key",
-        default="projname",
+        required=True,
         help=(
-            "把 binding 的 projectCode 映射为目标标签时使用的标签键，"
-            "默认 projname（即目标 projname=<projectCode>）"
+            "读取资源标签中项目名、并把 binding 的 project 映射为目标标签时使用的"
+            "标签键（必填，无默认值），例如 projname 或 costcenter"
         ),
     )
     parser.add_argument(
@@ -132,13 +132,13 @@ def _reservation_id_from_external(external: Any) -> str:
 
 
 def load_reservations_file(
-    path: Path, project_tag_key: str = "projname"
+    path: Path, project_tag_key: str
 ) -> tuple[RiTargets, RiModes, RiDenominators]:
     """读取 reservations.json，构建 reservationId → [(目标, 权重)] 映射、匹配模式及权重分母。
 
-    每个预留按 ``bindings`` 拆分：``projectCode`` 作为目标标签值（键由
-    ``project_tag_key`` 指定，默认 projname），``boundQuantity`` 作为权重。
-    同一预留内相同 projectCode 的多个 binding 权重合并；权重非正的 binding 忽略；
+    每个预留按 ``bindings`` 拆分：``project`` 作为目标标签值（键由
+    ``project_tag_key`` 指定，必填无默认），``boundQuantity`` 作为权重。
+    同一预留内相同 project 的多个 binding 权重合并；权重非正的 binding 忽略；
     没有有效 binding 的预留跳过。RI 收益匹配模式由预留的 ``flexibility`` 字段
     推导（``on`` → flex-group，否则 model），无需命令行指定。
 
@@ -162,7 +162,9 @@ def load_reservations_file(
     else:
         raise ValueError("reservations 文件 JSON 顶层必须是对象或数组")
 
-    key = (project_tag_key or "projname").strip() or "projname"
+    key = (project_tag_key or "").strip()
+    if not key:
+        raise ValueError("project_tag_key 不能为空，请通过 --project-tag-key 指定")
     result: RiTargets = {}
     modes: RiModes = {}
     denominators: RiDenominators = {}
@@ -181,7 +183,7 @@ def load_reservations_file(
         for binding in item.get("bindings") or []:
             if not isinstance(binding, dict):
                 continue
-            code = str(binding.get("projectCode") or "").strip()
+            code = str(binding.get("project") or "").strip()
             if not code:
                 continue
             try:
@@ -226,7 +228,7 @@ def build_ri_targets(
     """构建 reservationId → [(目标, 权重)] 映射、匹配模式及权重分母。
 
     读取 --reservations-file 指定的 reservations.json，按每个预留的 bindings
-    权重把一个 RI 分摊到多个项目（projectCode），并按预留的 flexibility 字段
+    权重把一个 RI 分摊到多个项目（project），并按预留的 flexibility 字段
     推导 RI 收益匹配模式；权重分母取 boundTotal（详见 load_reservations_file）。
     """
     return load_reservations_file(Path(args.reservations_file), args.project_tag_key)
@@ -381,9 +383,9 @@ def allocation_key(row: dict[str, str], match_mode: str = "model") -> tuple[str,
     return vm_model(row), region
 
 
-def project_of(row: dict[str, str]) -> str:
-    """获取明细的 projname；缺失时使用统一占位名称。"""
-    return str(parse_tags(row.get("tags", "")).get("projname") or "<missing>")
+def project_of(row: dict[str, str], project_tag_key: str) -> str:
+    """获取明细的项目名（来自 project_tag_key 指定的标签）；缺失时使用统一占位名称。"""
+    return str(parse_tags(row.get("tags", "")).get(project_tag_key) or "<missing>")
 
 
 def main() -> None:
@@ -456,7 +458,7 @@ def main() -> None:
                 if row.get("meterCategory") != "Virtual Machines":
                     continue
 
-                project = project_of(row)
+                project = project_of(row, args.project_tag_key)
                 amount = decimal_from_row(row, args.amount_field)
                 project_before[project] += amount
 
