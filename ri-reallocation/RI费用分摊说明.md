@@ -435,7 +435,7 @@ ri-reallocated/
 
 ## 9. 对账脚本
 
-`reconcile_vm_ri_allocation.py` 用于比较原始账单和分摊后账单，按 `ResourceId` 汇总每台虚拟机的处理前费用、处理后费用和变化金额，并补充区域与机型。
+`reconcile_vm_ri_allocation.py` 用于比较原始账单和分摊后账单，按 `ResourceId` 汇总每台虚拟机的处理前费用、处理后费用和变化金额，并补充区域与机型；同时按项目（`projname`）汇总处理前后的 RI 与按需费用。
 
 执行命令：
 
@@ -461,7 +461,18 @@ python3 reconcile_vm_ri_allocation.py \
 ```text
 ri-reallocated/
 ├── vm-cost-comparison.csv
-└── changed-vm-cost-comparison.csv
+├── changed-vm-cost-comparison.csv
+└── project-ri-ondemand-comparison.csv
 ```
 
 其中 `changed-vm-cost-comparison.csv` 仅包含发生费用变化的虚拟机，并包含 `region`、`vmModel`、处理前费用、处理后费用和 `feeChangeInBillingCurrency`。
+
+`project-ri-ondemand-comparison.csv` 按项目（`projname`）汇总处理前后的 RI 与按需费用，含以下列（`pricingModel=Reservation` 计入 RI，其余计入按需；处理前取 `costInBillingCurrency`，处理后取 `allocatedCostInBillingCurrency`）：
+
+```text
+projname
+beforeRiCostInBillingCurrency
+beforeOnDemandCostInBillingCurrency
+afterRiCostInBillingCurrency
+afterOnDemandCostInBillingCurrency
+```

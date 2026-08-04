@@ -64,6 +64,10 @@ def amount(row: dict[str, str], field: str) -> Decimal:
     return Decimal(row.get(field) or "0")
 
 
+def is_ri_row(row: dict[str, str]) -> bool:
+    return row.get("pricingModel") == "Reservation"
+
+
 def reconcile(
     before_files: list[Path], after_dir: Path, output_dir: Path
 ) -> ReconcileResult:
@@ -79,6 +83,14 @@ def reconcile(
             "delta": Decimal("0"),
             "rows": 0,
             "changedRows": 0,
+        }
+    )
+    projects: defaultdict[str, dict[str, Decimal]] = defaultdict(
+        lambda: {
+            "beforeRi": Decimal("0"),
+            "beforeOnDemand": Decimal("0"),
+            "afterRi": Decimal("0"),
+            "afterOnDemand": Decimal("0"),
         }
     )
 
@@ -132,6 +144,14 @@ def reconcile(
                 if delta:
                     record["changedRows"] += 1
 
+                project = projects[str(record["project"])]
+                if is_ri_row(before):
+                    project["beforeRi"] += before_cost
+                    project["afterRi"] += after_cost
+                else:
+                    project["beforeOnDemand"] += before_cost
+                    project["afterOnDemand"] += after_cost
+
     output_dir.mkdir(parents=True, exist_ok=True)
     all_path = output_dir / "vm-cost-comparison.csv"
     changed_path = output_dir / "changed-vm-cost-comparison.csv"
@@ -173,6 +193,29 @@ def reconcile(
                         str(record["delta"]),
                     ]
                 )
+
+    project_path = output_dir / "project-ri-ondemand-comparison.csv"
+    project_headers = [
+        "projname",
+        "beforeRiCostInBillingCurrency",
+        "beforeOnDemandCostInBillingCurrency",
+        "afterRiCostInBillingCurrency",
+        "afterOnDemandCostInBillingCurrency",
+    ]
+    with project_path.open("w", encoding="utf-8", newline="") as target:
+        writer = csv.writer(target)
+        writer.writerow(project_headers)
+        for projname in sorted(projects):
+            totals = projects[projname]
+            writer.writerow(
+                [
+                    projname,
+                    str(totals["beforeRi"]),
+                    str(totals["beforeOnDemand"]),
+                    str(totals["afterRi"]),
+                    str(totals["afterOnDemand"]),
+                ]
+            )
 
     before_total = sum(
         (record["before"] for record in records.values()), Decimal("0")
