@@ -17,6 +17,8 @@
 
 **告警命名规则**：`<前缀>-<资源组名>-<资源名>`，例如 `vm-cpu-jump-server_group-jump-server`。
 
+**告警评估设置**：每 5 分钟评估一次最近 30 分钟的指标平均值（`evaluationFrequency=PT5M`、`windowSize=PT30M`）。
+
 ## 二、前置条件
 
 1. 在 [Azure 门户](https://portal.azure.com) 右上角点击 **Cloud Shell** 图标（或访问 [https://shell.azure.com](https://shell.azure.com)），选择 **Bash** 环境。Cloud Shell 已预装 Azure CLI 并自动完成登录，无需 `az login`。首次使用需按提示创建或选择一个存储账户。
@@ -89,12 +91,20 @@ az policy assignment create \
 | `memoryThreshold` | MySQL / Redis | 80 | 内存使用率百分比阈值（`GreaterThan`） |
 | `storageThreshold` | MySQL | 85 | 存储使用率百分比阈值（`GreaterThan`） |
 | `serverLoadThreshold` | Redis | 80 | 服务器负载百分比阈值（`GreaterThan`） |
+| `evaluationFrequency` | 全部 | PT5M | 告警评估频率 |
+| `windowSize` | 全部 | PT30M | 每次评估使用的指标时间窗口 |
 | `effect` | 全部 | DeployIfNotExists | `DeployIfNotExists` 或 `Disabled` |
 
 覆盖阈值示例（分配时把 `cpuThreshold` 改为 90）：
 
 ```bash
 --params "{\"actionGroupId\": {\"value\": \"$ACTION_GROUP_ID\"}, \"cpuThreshold\": {\"value\": 90}}"
+```
+
+覆盖评估设置示例：
+
+```bash
+--params "{\"actionGroupId\": {\"value\": \"$ACTION_GROUP_ID\"}, \"evaluationFrequency\": {\"value\": \"PT15M\"}, \"windowSize\": {\"value\": \"PT30M\"}}"
 ```
 
 获取分配自动生成的托管标识 principalId：
@@ -219,6 +229,7 @@ az policy assignment create \
 - **新分配需先评估再修复**：合规评估完成后，`ExistingNonCompliant` 才能识别到不合规资源。
 - **Action Group 跨订阅可达**：管理组下多订阅可共用同一个 Action Group，AG 无跨订阅限制。
 - **告警内容**：短信为 Azure 固定精简格式，无法自定义；邮件 / Webhook / Logic App 可获得完整告警上下文。
+- **评估窗口与频率**：所有告警每 5 分钟执行一次评估，并以最近 30 分钟的指标平均值判断是否越过阈值；30 分钟窗口会降低短时波动导致的误报，但告警响应会更平滑。
 
 ## 七、卸载（回滚，管理组范围）
 

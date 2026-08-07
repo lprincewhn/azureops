@@ -18,6 +18,12 @@
             "memoryAvailablePercentThreshold": {
               "value": "[parameters('memoryAvailablePercentThreshold')]"
             },
+            "evaluationFrequency": {
+              "value": "[parameters('evaluationFrequency')]"
+            },
+            "windowSize": {
+              "value": "[parameters('windowSize')]"
+            },
             "vmId": {
               "value": "[field('id')]"
             },
@@ -37,6 +43,12 @@
               },
               "memoryAvailablePercentThreshold": {
                 "type": "int"
+              },
+              "evaluationFrequency": {
+                "type": "string"
+              },
+              "windowSize": {
+                "type": "string"
               },
               "vmId": {
                 "type": "string"
@@ -73,12 +85,12 @@
                   },
                   "description": "虚拟机 CPU 平均使用率超过阈值",
                   "enabled": true,
-                  "evaluationFrequency": "PT5M",
+                  "evaluationFrequency": "[parameters('evaluationFrequency')]",
                   "scopes": [
                     "[parameters('vmId')]"
                   ],
                   "severity": 2,
-                  "windowSize": "PT5M"
+                  "windowSize": "[parameters('windowSize')]"
                 },
                 "type": "Microsoft.Insights/metricAlerts"
               },
@@ -109,12 +121,12 @@
                   },
                   "description": "虚拟机可用内存百分比平均值低于阈值",
                   "enabled": true,
-                  "evaluationFrequency": "PT5M",
+                  "evaluationFrequency": "[parameters('evaluationFrequency')]",
                   "scopes": [
                     "[parameters('vmId')]"
                   ],
                   "severity": 2,
-                  "windowSize": "PT5M"
+                  "windowSize": "[parameters('windowSize')]"
                 },
                 "type": "Microsoft.Insights/metricAlerts"
               }

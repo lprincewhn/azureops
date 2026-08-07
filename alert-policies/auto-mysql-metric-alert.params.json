@@ -30,6 +30,39 @@
     },
     "type": "Integer"
   },
+  "evaluationFrequency": {
+    "allowedValues": [
+      "PT1M",
+      "PT5M",
+      "PT15M",
+      "PT30M",
+      "PT1H"
+    ],
+    "defaultValue": "PT5M",
+    "metadata": {
+      "description": "指标告警的评估频率。",
+      "displayName": "告警评估频率"
+    },
+    "type": "String"
+  },
+  "windowSize": {
+    "allowedValues": [
+      "PT1M",
+      "PT5M",
+      "PT15M",
+      "PT30M",
+      "PT1H",
+      "PT6H",
+      "PT12H",
+      "P1D"
+    ],
+    "defaultValue": "PT30M",
+    "metadata": {
+      "description": "每次评估所使用的指标时间窗口。",
+      "displayName": "告警评估窗口"
+    },
+    "type": "String"
+  },
   "effect": {
     "allowedValues": [
       "DeployIfNotExists",

@@ -21,6 +21,12 @@
             "serverLoadThreshold": {
               "value": "[parameters('serverLoadThreshold')]"
             },
+            "evaluationFrequency": {
+              "value": "[parameters('evaluationFrequency')]"
+            },
+            "windowSize": {
+              "value": "[parameters('windowSize')]"
+            },
             "redisId": {
               "value": "[field('id')]"
             },
@@ -43,6 +49,12 @@
               },
               "serverLoadThreshold": {
                 "type": "int"
+              },
+              "evaluationFrequency": {
+                "type": "string"
+              },
+              "windowSize": {
+                "type": "string"
               },
               "redisId": {
                 "type": "string"
@@ -79,12 +91,12 @@
                   },
                   "description": "Redis 服务器 CPU 使用率超过阈值",
                   "enabled": true,
-                  "evaluationFrequency": "PT5M",
+                  "evaluationFrequency": "[parameters('evaluationFrequency')]",
                   "scopes": [
                     "[parameters('redisId')]"
                   ],
                   "severity": 2,
-                  "windowSize": "PT5M"
+                  "windowSize": "[parameters('windowSize')]"
                 },
                 "type": "Microsoft.Insights/metricAlerts"
               },
@@ -115,12 +127,12 @@
                   },
                   "description": "Redis 服务器内存使用率超过阈值",
                   "enabled": true,
-                  "evaluationFrequency": "PT5M",
+                  "evaluationFrequency": "[parameters('evaluationFrequency')]",
                   "scopes": [
                     "[parameters('redisId')]"
                   ],
                   "severity": 2,
-                  "windowSize": "PT5M"
+                  "windowSize": "[parameters('windowSize')]"
                 },
                 "type": "Microsoft.Insights/metricAlerts"
               },
@@ -151,12 +163,12 @@
                   },
                   "description": "Redis 服务器负载超过阈值",
                   "enabled": true,
-                  "evaluationFrequency": "PT5M",
+                  "evaluationFrequency": "[parameters('evaluationFrequency')]",
                   "scopes": [
                     "[parameters('redisId')]"
                   ],
                   "severity": 2,
-                  "windowSize": "PT5M"
+                  "windowSize": "[parameters('windowSize')]"
                 },
                 "type": "Microsoft.Insights/metricAlerts"
               }

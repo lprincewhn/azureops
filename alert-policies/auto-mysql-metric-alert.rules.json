@@ -21,6 +21,12 @@
             "storageThreshold": {
               "value": "[parameters('storageThreshold')]"
             },
+            "evaluationFrequency": {
+              "value": "[parameters('evaluationFrequency')]"
+            },
+            "windowSize": {
+              "value": "[parameters('windowSize')]"
+            },
             "serverId": {
               "value": "[field('id')]"
             },
@@ -43,6 +49,12 @@
               },
               "storageThreshold": {
                 "type": "int"
+              },
+              "evaluationFrequency": {
+                "type": "string"
+              },
+              "windowSize": {
+                "type": "string"
               },
               "serverId": {
                 "type": "string"
@@ -79,12 +91,12 @@
                   },
                   "description": "MySQL 服务器 CPU 使用率超过阈值",
                   "enabled": true,
-                  "evaluationFrequency": "PT5M",
+                  "evaluationFrequency": "[parameters('evaluationFrequency')]",
                   "scopes": [
                     "[parameters('serverId')]"
                   ],
                   "severity": 2,
-                  "windowSize": "PT5M"
+                  "windowSize": "[parameters('windowSize')]"
                 },
                 "type": "Microsoft.Insights/metricAlerts"
               },
@@ -115,12 +127,12 @@
                   },
                   "description": "MySQL 服务器内存使用率超过阈值",
                   "enabled": true,
-                  "evaluationFrequency": "PT5M",
+                  "evaluationFrequency": "[parameters('evaluationFrequency')]",
                   "scopes": [
                     "[parameters('serverId')]"
                   ],
                   "severity": 2,
-                  "windowSize": "PT5M"
+                  "windowSize": "[parameters('windowSize')]"
                 },
                 "type": "Microsoft.Insights/metricAlerts"
               },
@@ -151,12 +163,12 @@
                   },
                   "description": "MySQL 服务器存储使用率超过阈值",
                   "enabled": true,
-                  "evaluationFrequency": "PT5M",
+                  "evaluationFrequency": "[parameters('evaluationFrequency')]",
                   "scopes": [
                     "[parameters('serverId')]"
                   ],
                   "severity": 2,
-                  "windowSize": "PT5M"
+                  "windowSize": "[parameters('windowSize')]"
                 },
                 "type": "Microsoft.Insights/metricAlerts"
               }
