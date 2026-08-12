@@ -340,6 +340,83 @@ class ReservationsFileTests(unittest.TestCase):
         self.assertEqual(modes["ri-flex"], "flex-group")
         self.assertEqual(modes["ri-fixed"], "model")
 
+    def test_single_scope_is_loaded_and_matches_resource_id(self):
+        path = self._write(
+            [{
+                "reservationId": "ri-a",
+                "appliedScopeType": "Single",
+                "appliedScopeId": "/subscriptions/sub-a",
+                "bindings": [{"project": "x", "boundQuantity": 1}],
+            }]
+        )
+        _targets, _modes, _dens, scopes = MODULE.load_reservations_config(
+            path, project_tag_key="projname"
+        )
+        self.assertEqual(scopes["ri-a"], ("single", "/subscriptions/sub-a"))
+        self.assertTrue(
+            MODULE.row_matches_ri_scope(
+                {"ResourceId": "/subscriptions/SUB-A/resourceGroups/rg/providers/x/y"},
+                scopes["ri-a"],
+            )
+        )
+        self.assertFalse(
+            MODULE.row_matches_ri_scope(
+                {"ResourceId": "/subscriptions/sub-b/resourceGroups/rg/providers/x/y"},
+                scopes["ri-a"],
+            )
+        )
+
+    def test_single_scope_requires_scope_id(self):
+        path = self._write(
+            [{
+                "reservationId": "ri-a",
+                "appliedScopeType": "Single",
+                "bindings": [{"project": "x", "boundQuantity": 1}],
+            }]
+        )
+        with self.assertRaises(ValueError):
+            MODULE.load_reservations_config(path, project_tag_key="projname")
+
+    def test_management_group_scope_resolves_descendant_subscriptions(self):
+        class FakeManagementGroups:
+            def get_descendants(self, group_name):
+                self.group_name = group_name
+                return [
+                    {
+                        "type": "Microsoft.Management/managementGroups",
+                        "name": "child-group",
+                    },
+                    {
+                        "type": "Microsoft.Management/managementGroups/subscriptions",
+                        "name": "SUB-A",
+                    },
+                ]
+
+        class FakeClient:
+            management_groups = FakeManagementGroups()
+
+        scope = (
+            "managementgroup",
+            "/providers/microsoft.management/managementgroups/ffalcon-us",
+        )
+        resolved = MODULE.resolve_management_group_scopes(
+            {"ri-a": scope}, client=FakeClient()
+        )
+        self.assertEqual(FakeClient.management_groups.group_name, "ffalcon-us")
+        self.assertEqual(resolved[scope], frozenset({"sub-a"}))
+        self.assertTrue(
+            MODULE.row_matches_ri_scope(
+                {"ResourceId": "/subscriptions/sub-a/resourceGroups/rg/providers/x/y"},
+                scope,
+                resolved,
+            )
+        )
+        self.assertFalse(
+            MODULE.row_matches_ri_scope(
+                {"SubscriptionId": "sub-b"}, scope, resolved
+            )
+        )
+
 
 class ReservationsReallocationTests(unittest.TestCase):
     HEADERS = [
@@ -348,6 +425,7 @@ class ReservationsReallocationTests(unittest.TestCase):
         "pricingModel",
         "chargeType",
         "reservationId",
+        "SubscriptionId",
         "meterRegion",
         "meterName",
         "additionalInfo",
@@ -668,6 +746,103 @@ class ReservationsReallocationTests(unittest.TestCase):
         ]
         with self.assertRaises(ValueError):
             self._run(rows, reservations)
+
+    def test_single_scope_only_allocates_to_eligible_subscription(self):
+        rows = [
+            self._row(
+                ResourceId="/subscriptions/sub-a/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/ri",
+                pricingModel="Reservation",
+                chargeType="Usage",
+                reservationId="ri-a",
+                meterRegion="US West 3",
+                additionalInfo='{"ServiceType":"Standard_D2s_v5"}',
+                tags='{"projname":"misc"}',
+                costInBillingCurrency="10",
+            ),
+            self._row(
+                ResourceId="/subscriptions/sub-a/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/eligible",
+                pricingModel="OnDemand",
+                chargeType="Usage",
+                meterRegion="US West 3",
+                additionalInfo='{"ServiceType":"Standard_D2s_v5"}',
+                tags='{"projname":"alpha"}',
+                costInBillingCurrency="100",
+            ),
+            self._row(
+                ResourceId="/subscriptions/sub-b/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/ineligible",
+                pricingModel="OnDemand",
+                chargeType="Usage",
+                meterRegion="US West 3",
+                additionalInfo='{"ServiceType":"Standard_D2s_v5"}',
+                tags='{"projname":"alpha"}',
+                costInBillingCurrency="100",
+            ),
+        ]
+        reservations = [{
+            "reservationId": "ri-a",
+            "appliedScopeType": "Single",
+            "appliedScopeId": "/subscriptions/sub-a",
+            "bindings": [{"project": "alpha", "boundQuantity": 1}],
+        }]
+        result_rows, summary = self._run(rows, reservations)
+        by_id = {r["ResourceId"]: r for r in result_rows}
+        self.assertEqual(by_id[next(k for k in by_id if k.endswith("/eligible"))]["riAllocationAmount"], "-10")
+        self.assertEqual(by_id[next(k for k in by_id if k.endswith("/ineligible"))]["riAllocationAmount"], "0")
+        self.assertEqual(summary["mappings"][0]["appliedScopeType"], "single")
+
+    def test_management_group_scope_only_allocates_to_descendant_subscription(self):
+        original_resolver = MODULE.resolve_management_group_scopes
+        MODULE.resolve_management_group_scopes = lambda scopes: {
+            next(iter(scopes.values())): frozenset({"sub-a"})
+        }
+        self.addCleanup(
+            setattr, MODULE, "resolve_management_group_scopes", original_resolver
+        )
+        rows = [
+            self._row(
+                ResourceId="/subscriptions/sub-a/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/ri",
+                pricingModel="Reservation",
+                chargeType="Usage",
+                reservationId="ri-a",
+                meterRegion="US West 3",
+                additionalInfo='{"ServiceType":"Standard_D2s_v5"}',
+                tags='{"projname":"misc"}',
+                costInBillingCurrency="10",
+            ),
+            self._row(
+                ResourceId="/subscriptions/sub-a/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/eligible",
+                pricingModel="OnDemand",
+                chargeType="Usage",
+                meterRegion="US West 3",
+                additionalInfo='{"ServiceType":"Standard_D2s_v5"}',
+                tags='{"projname":"alpha"}',
+                costInBillingCurrency="100",
+            ),
+            self._row(
+                ResourceId="/subscriptions/sub-b/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/ineligible",
+                pricingModel="OnDemand",
+                chargeType="Usage",
+                meterRegion="US West 3",
+                additionalInfo='{"ServiceType":"Standard_D2s_v5"}',
+                tags='{"projname":"alpha"}',
+                costInBillingCurrency="100",
+            ),
+        ]
+        reservations = [{
+            "reservationId": "ri-a",
+            "appliedScopeType": "ManagementGroup",
+            "appliedScopeId": "/providers/Microsoft.Management/managementGroups/ffalcon-us",
+            "bindings": [{"project": "alpha", "boundQuantity": 1}],
+        }]
+        result_rows, summary = self._run(rows, reservations)
+        by_id = {r["ResourceId"]: r for r in result_rows}
+        eligible = next(k for k in by_id if k.endswith("/eligible"))
+        ineligible = next(k for k in by_id if k.endswith("/ineligible"))
+        self.assertEqual(by_id[eligible]["riAllocationAmount"], "-10")
+        self.assertEqual(by_id[ineligible]["riAllocationAmount"], "0")
+        self.assertEqual(
+            summary["mappings"][0]["managementGroupSubscriptionCount"], 1
+        )
 
 
 if __name__ == "__main__":

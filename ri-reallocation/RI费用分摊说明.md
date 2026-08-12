@@ -4,7 +4,7 @@
 >
 > - 飞书文档（导出目标）：<https://my.feishu.cn/docx/EEQndRbM1occsPxh621c1miSn6b>
 > - 说明：本 Markdown 为权威源文件；后续如需同步/导出到飞书，请更新上述飞书文档。
-> - 最后导出到飞书：2026-08-01
+> - 最后导出到飞书：2026-08-12
 
 ## 1. 目的
 
@@ -295,6 +295,8 @@ reallocate_vm_ri.py
 [
   {
     "externalReservationId": ".../reservationOrders/<order>/reservations/8345b648-839b-4fdc-acbc-a776bdfe00d5",
+    "appliedScopeType": "Single",
+    "appliedScopeId": "/subscriptions/<subscription-id>",
     "flexibility": "on",
     "boundTotal": 3,
     "bindings": [
@@ -311,6 +313,10 @@ reallocate_vm_ri.py
   提取；缺失时回退到 `reservationId` 字段。需与账单 `reservationId` 列一致。
 - **flexibility**：实例大小灵活性开关。`on` → 按灵活性组匹配（`flex-group`），
   否则按精确机型匹配（`model`）。匹配模式据此**自动推导，无需命令行参数**。
+- **appliedScopeType / appliedScopeId**：RI 优惠范围。`Shared`（或字段缺失）可匹配
+  全部输入明细；`Single` 仅匹配 `ResourceId` 位于 `appliedScopeId` 指定订阅或资源组
+  下的明细；`ManagementGroup` 使用 Azure Python SDK 查询管理组全部后代订阅，只匹配
+  这些订阅内的明细。运行前需执行 `az login`，并确保当前身份有权读取该管理组。
 - **boundTotal**：预留总份数，作为权重分摊的**分母**。每个项目分得
   `boundQuantity / boundTotal`。缺失、非正或小于 `ΣboundQuantity` 时，回退到以
   `ΣboundQuantity` 为分母（等价于全额分摊）。
@@ -320,8 +326,8 @@ reallocate_vm_ri.py
   `project` 的权重合并；权重 ≤ 0 的 binding 忽略；没有有效 binding 的预留跳过。
 
 **分摊规则**：某 RI 的使用金额（按匹配键分池）按 `boundQuantity / boundTotal` 的
-比例拆成子池，每个子池分摊给对应 `project` 目标项目内「相同机型（或灵活性组）
-+ 相同区域」的虚拟机明细，并把这些子池金额之和加回各自的 RI 使用记录。
+比例拆成子池，每个子池分摊给对应 `project` 目标项目内「符合 RI scope + 相同机型
+（或灵活性组）+ 相同区域」的虚拟机明细，并把这些子池金额之和加回各自的 RI 使用记录。
 当 `boundTotal > ΣboundQuantity`（预留只部分绑定）时，未绑定份额
 `(boundTotal − ΣboundQuantity) / boundTotal` 对应的收益**不再分摊，保留在原 RI
 使用记录（消费该 RI 的项目）上**。若某条 RI 使用记录自身标签就是绑定目标之一，
@@ -332,6 +338,8 @@ reallocate_vm_ri.py
 在包含源 CSV 的目录执行：
 
 ```bash
+python3 -m pip install -r requirements.txt
+
 python3 reallocate_vm_ri.py \
   part_0_0001.csv \
   part_1_0001.csv \
@@ -418,7 +426,7 @@ ri-reallocated/
 
 - 输入文件、输出文件
 - `allocationMode`：分摊模式，固定为 `reservations`（按 binding 权重分摊到一个或多个项目）
-- `mappings`：每个 `reservationId` 的分摊目标列表（每个目标含 `key`/`value`/`weight`）及其 `matchMode`
+- `mappings`：每个 `reservationId` 的分摊目标列表、`matchMode` 及 RI scope
 - `matchModeByReservation`：每个 `reservationId` 由 `flexibility` 推导出的匹配模式（`flex-group` / `model`）
 - `targets`：全部分摊目标（`key=value` 列表）
 - RI 记录数量、RI 分摊记录数量
@@ -426,7 +434,7 @@ ri-reallocated/
 - `riAllocatableAmount`：待分摊 RI 金额（= Σ 加回金额 = 原始费用 × ΣboundQuantity/boundTotal；部分绑定时小于原始费用合计）
 - `targetVmReceiverAmount`：目标项目虚拟机接收费用（接收池，含加回后的 RI 记录全价）
 - `assignedByTarget`：每个分摊目标承接的 RI 收益总额
-- `riAllocationKeys`：每个 `(分摊目标, 匹配键)` 的 `riAmount` 与 `targetVmReceiverAmount`
+- `riAllocationKeys`：每个 `(RI scope, 分摊目标, 匹配键)` 的 `riAmount` 与 `targetVmReceiverAmount`
 - 源文件是否被修改、标签和资源 ID 是否被修改
 
 ## 8. 注意事项

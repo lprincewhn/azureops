@@ -1,0 +1,2 @@
+azure-identity>=1.25,<2
+azure-mgmt-managementgroups>=2,<3

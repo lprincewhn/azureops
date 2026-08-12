@@ -102,6 +102,8 @@ RiModes = dict[str, str]
 # reservationId → 权重分母（boundTotal）。绑定项目按 boundQuantity/boundTotal 分摊，
 # 剩余 (boundTotal - Σ boundQuantity)/boundTotal 的收益留在原 RI 使用项目（其他项目）。
 RiDenominators = dict[str, Decimal]
+# reservationId → (appliedScopeType, normalized appliedScopeId).
+RiScopes = dict[str, tuple[str, str]]
 
 
 def _match_mode_from_flexibility(flexibility: Any) -> str:
@@ -131,9 +133,131 @@ def _reservation_id_from_external(external: Any) -> str:
     return text
 
 
-def load_reservations_file(
+def _normalize_ri_scope(item: dict[str, Any]) -> tuple[str, str]:
+    """Normalize the Azure reservation benefit scope used to select receivers."""
+    scope_type = str(item.get("appliedScopeType") or "Shared").strip().lower()
+    scope_id = str(item.get("appliedScopeId") or "").strip().rstrip("/").lower()
+    if scope_type == "shared":
+        return ("shared", "")
+    if scope_type in {"single", "managementgroup"}:
+        if not scope_id:
+            raise ValueError(
+                f"{item.get('appliedScopeType')} scope reservation 缺少 appliedScopeId"
+            )
+        return (scope_type, scope_id)
+    raise ValueError(
+        f"暂不支持 appliedScopeType={item.get('appliedScopeType')!r}；"
+        "仅支持 Shared、Single（订阅或资源组）和 ManagementGroup"
+    )
+
+
+def _row_subscription_id(row: dict[str, str]) -> str:
+    """Read the subscription ID from its column or Azure resource ID."""
+    explicit = str(
+        row.get("SubscriptionId") or row.get("subscriptionId") or ""
+    ).strip()
+    if explicit:
+        return explicit.lower()
+    resource_id = str(row.get("ResourceId") or row.get("resourceId") or "").strip()
+    match = re.match(r"^/subscriptions/([^/]+)(?:/|$)", resource_id, re.IGNORECASE)
+    return match.group(1).lower() if match else ""
+
+
+def _management_group_name(scope_id: str) -> str:
+    """Extract a management group name from an Azure resource ID or bare name."""
+    marker = "/managementgroups/"
+    normalized = scope_id.strip().rstrip("/")
+    lower = normalized.lower()
+    if marker in lower:
+        start = lower.rfind(marker) + len(marker)
+        return normalized[start:].split("/", 1)[0]
+    return normalized
+
+
+def resolve_management_group_scopes(
+    scopes: RiScopes, client: Any | None = None
+) -> dict[tuple[str, str], frozenset[str]]:
+    """Resolve ManagementGroup scopes to descendant subscription IDs via Azure SDK."""
+    management_group_scopes = {
+        scope for scope in scopes.values() if scope[0] == "managementgroup"
+    }
+    if not management_group_scopes:
+        return {}
+
+    owns_client = client is None
+    if client is None:
+        try:
+            from azure.identity import AzureCliCredential
+            from azure.mgmt.managementgroups import ManagementGroupsMgmtClient
+        except ImportError as exc:
+            raise RuntimeError(
+                "ManagementGroup scope 需要安装 requirements.txt 中的 Azure SDK"
+            ) from exc
+        client = ManagementGroupsMgmtClient(credential=AzureCliCredential())
+
+    result: dict[tuple[str, str], frozenset[str]] = {}
+    try:
+        for scope in sorted(management_group_scopes):
+            group_name = _management_group_name(scope[1])
+            subscription_ids: set[str] = set()
+            for descendant in client.management_groups.get_descendants(group_name):
+                descendant_type = str(
+                    getattr(descendant, "type", None)
+                    or (descendant.get("type") if isinstance(descendant, dict) else "")
+                )
+                if descendant_type.lower() != (
+                    "microsoft.management/managementgroups/subscriptions"
+                ).lower():
+                    continue
+                name = str(
+                    getattr(descendant, "name", None)
+                    or (descendant.get("name") if isinstance(descendant, dict) else "")
+                ).strip()
+                if name:
+                    subscription_ids.add(name.lower())
+            result[scope] = frozenset(subscription_ids)
+    finally:
+        if owns_client:
+            client.close()
+    return result
+
+
+def row_matches_ri_scope(
+    row: dict[str, str],
+    scope: tuple[str, str],
+    management_group_subscriptions: dict[
+        tuple[str, str], frozenset[str]
+    ] | None = None,
+) -> bool:
+    """Return whether a billing row is eligible for the reservation scope."""
+    scope_type, scope_id = scope
+    if scope_type == "shared":
+        return True
+    if scope_type == "managementgroup":
+        subscriptions = (management_group_subscriptions or {}).get(scope)
+        if subscriptions is None:
+            raise ValueError(f"ManagementGroup scope {scope_id!r} 尚未解析")
+        return _row_subscription_id(row) in subscriptions
+
+    resource_id = str(row.get("ResourceId") or row.get("resourceId") or "").strip()
+    normalized_resource_id = resource_id.rstrip("/").lower()
+    if normalized_resource_id and (
+        normalized_resource_id == scope_id
+        or normalized_resource_id.startswith(scope_id + "/")
+    ):
+        return True
+
+    subscription_match = re.fullmatch(
+        r"/subscriptions/([^/]+)", scope_id, flags=re.IGNORECASE
+    )
+    if subscription_match:
+        return _row_subscription_id(row) == subscription_match.group(1).lower()
+    return False
+
+
+def load_reservations_config(
     path: Path, project_tag_key: str
-) -> tuple[RiTargets, RiModes, RiDenominators]:
+) -> tuple[RiTargets, RiModes, RiDenominators, RiScopes]:
     """读取 reservations.json，构建 reservationId → [(目标, 权重)] 映射、匹配模式及权重分母。
 
     每个预留按 ``bindings`` 拆分：``project`` 作为目标标签值（键由
@@ -147,7 +271,7 @@ def load_reservations_file(
     留在实际使用该 RI 的原项目（其他项目）。当 ``boundTotal`` 缺失、非正或小于
     Σ boundQuantity 时，回退为 Σ boundQuantity（即无剩余、全额分摊到绑定项目）。
 
-    返回 ``(ri_targets, ri_modes, ri_denominators)``。
+    返回 ``(ri_targets, ri_modes, ri_denominators, ri_scopes)``。
     """
     if not path.is_file():
         raise FileNotFoundError(f"找不到 reservations 文件：{path}")
@@ -168,6 +292,7 @@ def load_reservations_file(
     result: RiTargets = {}
     modes: RiModes = {}
     denominators: RiDenominators = {}
+    scopes: RiScopes = {}
     for item in items:
         if not isinstance(item, dict):
             raise ValueError("reservation 条目必须是对象")
@@ -206,6 +331,7 @@ def load_reservations_file(
         modes[reservation_id] = _match_mode_from_flexibility(
             item.get("flexibility")
         )
+        scopes[reservation_id] = _normalize_ri_scope(item)
         bound_sum = sum(weights.values(), Decimal("0"))
         try:
             bound_total = Decimal(str(item.get("boundTotal")))
@@ -219,7 +345,17 @@ def load_reservations_file(
         raise ValueError(
             "reservations 文件没有可用的 RI 分摊定义（缺少有效 bindings）"
         )
-    return result, modes, denominators
+    return result, modes, denominators, scopes
+
+
+def load_reservations_file(
+    path: Path, project_tag_key: str
+) -> tuple[RiTargets, RiModes, RiDenominators]:
+    """Load reservation targets, match modes, and allocation denominators."""
+    targets, modes, denominators, _scopes = load_reservations_config(
+        path, project_tag_key
+    )
+    return targets, modes, denominators
 
 
 def build_ri_targets(
@@ -391,7 +527,10 @@ def project_of(row: dict[str, str], project_tag_key: str) -> str:
 def main() -> None:
     """读取账单、计算分摊并生成明细副本和汇总报告。"""
     args = parse_args()
-    ri_targets, ri_modes, ri_denominators = build_ri_targets(args)
+    ri_targets, ri_modes, ri_denominators, ri_scopes = load_reservations_config(
+        Path(args.reservations_file), args.project_tag_key
+    )
+    management_group_subscriptions = resolve_management_group_scopes(ri_scopes)
     reservation_ids = set(ri_targets)
     targets = sorted(
         {target for entries in ri_targets.values() for target, _weight in entries}
@@ -399,8 +538,12 @@ def main() -> None:
     # 每个分摊目标的匹配模式来自绑定它的预留的 flexibility。若同一目标被匹配模式
     # 不同的预留同时绑定，收益池无法一致隔离，直接报错要求先统一口径。
     target_modes: dict[tuple[str, str], str] = {}
+    target_profiles: defaultdict[
+        tuple[str, str], set[tuple[tuple[str, str], str]]
+    ] = defaultdict(set)
     for reservation_id, entries in ri_targets.items():
         mode = ri_modes[reservation_id]
+        scope = ri_scopes[reservation_id]
         for target, _weight in entries:
             existing = target_modes.get(target)
             if existing is not None and existing != mode:
@@ -409,6 +552,7 @@ def main() -> None:
                     f"（{existing} 与 {mode}）；请统一相关预留的 flexibility。"
                 )
             target_modes[target] = mode
+            target_profiles[target].add((scope, mode))
     input_paths = expand_inputs(args.inputs)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -425,8 +569,8 @@ def main() -> None:
     ri_raw_total = Decimal("0")
     project_before: defaultdict[str, Decimal] = defaultdict(Decimal)
     project_ri: defaultdict[str, Decimal] = defaultdict(Decimal)
-    # 收益池和目标费用池按 (分摊目标, 匹配键) 隔离，确保每个 RI 的收益只流向自己的目标。
-    pool_key_type = tuple[tuple[str, str], tuple[str, str]]
+    # 收益池按 (RI scope, 分摊目标, 匹配键) 隔离，避免跨订阅/资源组使用 RI。
+    pool_key_type = tuple[tuple[str, str], tuple[str, str], tuple[str, str]]
     target_non_ri_indexes: defaultdict[pool_key_type, list[int]] = defaultdict(list)
     target_non_ri_total_by_key: defaultdict[pool_key_type, Decimal] = defaultdict(
         Decimal
@@ -482,7 +626,9 @@ def main() -> None:
                     ri_label_by_index[row_index] = label
                     alloc_key = allocation_key(row, ri_modes[reservation_id])
                     for target, contribution in contributions:
-                        ri_amount_by_key[(target, alloc_key)] += contribution
+                        ri_amount_by_key[
+                            (ri_scopes[reservation_id], target, alloc_key)
+                        ] += contribution
                     # 加回后的 RI 使用记录以全价（原始金额 + 加回金额）参与其自身所属
                     # 目标的收益分摊，避免该目标项目仅靠其它明细承接、拿到的收益少于
                     # binding 权重应得份额。
@@ -495,13 +641,19 @@ def main() -> None:
                         )
                     if matched:
                         full_price = amount + add_back
-                        pool_key = (
-                            matched[0],
-                            allocation_key(row, target_modes[matched[0]]),
-                        )
-                        target_non_ri_indexes[pool_key].append(row_index)
-                        target_non_ri_total_by_key[pool_key] += full_price
                         receiver_basis_by_index[row_index] = full_price
+                        for scope, mode in target_profiles[matched[0]]:
+                            if not row_matches_ri_scope(
+                                row, scope, management_group_subscriptions
+                            ):
+                                continue
+                            pool_key = (
+                                scope,
+                                matched[0],
+                                allocation_key(row, mode),
+                            )
+                            target_non_ri_indexes[pool_key].append(row_index)
+                            target_non_ri_total_by_key[pool_key] += full_price
                 else:
                     matched = [t for t in targets if has_target_tag(row, t)]
                     if len(matched) > 1:
@@ -512,20 +664,26 @@ def main() -> None:
                         )
                     if matched:
                         row_index = len(rows) - 1
-                        pool_key = (
-                            matched[0],
-                            allocation_key(row, target_modes[matched[0]]),
-                        )
-                        target_non_ri_indexes[pool_key].append(row_index)
-                        target_non_ri_total_by_key[pool_key] += amount
                         receiver_basis_by_index[row_index] = amount
+                        for scope, mode in target_profiles[matched[0]]:
+                            if not row_matches_ri_scope(
+                                row, scope, management_group_subscriptions
+                            ):
+                                continue
+                            pool_key = (
+                                scope,
+                                matched[0],
+                                allocation_key(row, mode),
+                            )
+                            target_non_ri_indexes[pool_key].append(row_index)
+                            target_non_ri_total_by_key[pool_key] += amount
 
     target_non_ri_total = sum(
         target_non_ri_total_by_key.values(), Decimal("0")
     )
 
     for pool_key, key_ri_amount in ri_amount_by_key.items():
-        target, alloc_key = pool_key
+        scope, target, alloc_key = pool_key
         target_label = "=".join(target)
         # RI 金额为 0 时无需分摊，跳过校验，避免对零成本 RI 记录误报。
         if key_ri_amount == 0:
@@ -534,7 +692,8 @@ def main() -> None:
         if key_target_total == 0:
             raise ValueError(
                 f"找不到分摊目标 {target_label!r} 与 RI 机型和区域 {alloc_key!r} "
-                "匹配的虚拟机明细（含加回后的 RI 使用记录）。"
+                f"且符合 RI scope {scope!r} 的虚拟机明细"
+                "（含加回后的 RI 使用记录）。"
             )
         if key_target_total < key_ri_amount:
             raise ValueError(
@@ -554,7 +713,7 @@ def main() -> None:
     # 每条目标明细只承接相同分摊目标、相同机型和区域 RI 收益池中的金额；加回后的
     # RI 使用记录以全价基数参与，普通非 RI 明细以原始费用基数参与。
     for pool_key, indexes in target_non_ri_indexes.items():
-        target, _alloc_key = pool_key
+        _scope, target, _alloc_key = pool_key
         key_ri_amount = ri_amount_by_key.get(pool_key, Decimal("0"))
         # 没有 RI 收益可分摊（含仅有接收明细而无对应 RI 的池），保持金额不变。
         if key_ri_amount == 0:
@@ -623,7 +782,7 @@ def main() -> None:
 
     # 每个分摊目标承接的 RI 收益总额（按目标标签值汇总）。
     assigned_by_target: defaultdict[str, Decimal] = defaultdict(Decimal)
-    for (target, _alloc_key), key_ri_amount in ri_amount_by_key.items():
+    for (_scope, target, _alloc_key), key_ri_amount in ri_amount_by_key.items():
         assigned_by_target[target[1]] += key_ri_amount
 
     project_after = dict(project_before)
@@ -673,6 +832,13 @@ def main() -> None:
             {
                 "reservationId": reservation_id,
                 "matchMode": ri_modes[reservation_id],
+                "appliedScopeType": ri_scopes[reservation_id][0],
+                "appliedScopeId": ri_scopes[reservation_id][1],
+                "managementGroupSubscriptionCount": (
+                    len(management_group_subscriptions[ri_scopes[reservation_id]])
+                    if ri_scopes[reservation_id][0] == "managementgroup"
+                    else None
+                ),
                 "boundTotal": str(ri_denominators[reservation_id]),
                 "boundWeightSum": str(
                     sum(
@@ -720,15 +886,19 @@ def main() -> None:
         },
         "riAllocationKeys": [
             {
+                "appliedScopeType": scope[0],
+                "appliedScopeId": scope[1],
                 "target": "=".join(target),
                 "matchKey": alloc_key[0],
                 "region": alloc_key[1],
-                "riAmount": str(ri_amount_by_key[(target, alloc_key)]),
+                "riAmount": str(ri_amount_by_key[(scope, target, alloc_key)]),
                 "targetVmReceiverAmount": str(
-                    target_non_ri_total_by_key.get((target, alloc_key), Decimal("0"))
+                    target_non_ri_total_by_key.get(
+                        (scope, target, alloc_key), Decimal("0")
+                    )
                 ),
             }
-            for (target, alloc_key) in sorted(ri_amount_by_key)
+            for (scope, target, alloc_key) in sorted(ri_amount_by_key)
         ],
         "sourceFilesModified": False,
         "resourceTagsModified": False,
