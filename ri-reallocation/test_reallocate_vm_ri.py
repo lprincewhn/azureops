@@ -124,6 +124,44 @@ class ReallocationFilterTests(unittest.TestCase):
         )
 
 
+class PriceSheetTests(unittest.TestCase):
+    def test_consumption_unit_price_matches_meter_date_and_currency(self):
+        content = (
+            "meterId,priceType,tierMinimumUnits,unitPrice,billingCurrency,"
+            "effectiveStartDate,effectiveEndDate\n"
+            "meter-a,Consumption,0,2.5,USD,2026-07-01,2026-07-31\n"
+            "meter-a,ReservedInstance,0,1.0,USD,2026-07-01,2026-07-31\n"
+        ).encode()
+        rates = MODULE.parse_price_sheet(content, "prices.csv")
+        self.assertEqual(
+            MODULE.price_for_row(
+                {
+                    "meterId": "METER-A",
+                    "date": "07/18/2026",
+                    "billingCurrency": "USD",
+                },
+                rates,
+            ),
+            MODULE.Decimal("2.5"),
+        )
+
+    def test_missing_meter_price_raises(self):
+        rates = MODULE.parse_price_sheet(
+            b"meterId,priceType,tierMinimumUnits,unitPrice,billingCurrency\n"
+            b"meter-a,Consumption,0,2.5,USD\n",
+            "prices.csv",
+        )
+        with self.assertRaises(ValueError):
+            MODULE.price_for_row(
+                {
+                    "meterId": "meter-b",
+                    "date": "2026-07-18",
+                    "billingCurrency": "USD",
+                },
+                rates,
+            )
+
+
 class ReservationsFileTests(unittest.TestCase):
     def _write(self, data):
         tmp = tempfile.TemporaryDirectory()
@@ -426,8 +464,15 @@ class ReservationsReallocationTests(unittest.TestCase):
         "chargeType",
         "reservationId",
         "SubscriptionId",
+        "meterId",
         "meterRegion",
         "meterName",
+        "date",
+        "quantity",
+        "billingCurrency",
+        "billingAccountId",
+        "billingProfileId",
+        "invoiceId",
         "additionalInfo",
         "tags",
         "costInBillingCurrency",
@@ -436,6 +481,10 @@ class ReservationsReallocationTests(unittest.TestCase):
     def _row(self, **kw):
         row = {h: "" for h in self.HEADERS}
         row["meterCategory"] = "Virtual Machines"
+        row["meterId"] = "meter-vm"
+        row["date"] = "07/01/2026"
+        row["quantity"] = "1"
+        row["billingCurrency"] = "USD"
         row.update(kw)
         return row
 
@@ -450,6 +499,38 @@ class ReservationsReallocationTests(unittest.TestCase):
             writer.writerows(rows)
         resv_path = root / "reservations.json"
         resv_path.write_text(json.dumps(reservations), encoding="utf-8")
+        prices: dict[str, MODULE.Decimal] = {}
+        for row in rows:
+            if (
+                row.get("pricingModel") == "Reservation"
+                and row.get("chargeType") == "Usage"
+            ):
+                quantity = MODULE.Decimal(row.get("quantity") or "0")
+                amount = MODULE.Decimal(row.get("costInBillingCurrency") or "0")
+                prices[row["meterId"]] = amount * 2 / quantity
+        price_path = root / "price-sheet.csv"
+        with price_path.open("w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(
+                f,
+                fieldnames=[
+                    "meterId",
+                    "priceType",
+                    "tierMinimumUnits",
+                    "unitPrice",
+                    "billingCurrency",
+                ],
+            )
+            writer.writeheader()
+            for meter_id, unit_price in prices.items():
+                writer.writerow(
+                    {
+                        "meterId": meter_id,
+                        "priceType": "Consumption",
+                        "tierMinimumUnits": "0",
+                        "unitPrice": str(unit_price),
+                        "billingCurrency": "USD",
+                    }
+                )
         out_dir = root / "out"
         argv = [
             "prog",
@@ -458,6 +539,8 @@ class ReservationsReallocationTests(unittest.TestCase):
             str(resv_path),
             "--project-tag-key",
             "projname",
+            "--price-sheet-file",
+            str(price_path),
             "--output-dir",
             str(out_dir),
         ]
@@ -843,6 +926,49 @@ class ReservationsReallocationTests(unittest.TestCase):
         self.assertEqual(
             summary["mappings"][0]["managementGroupSubscriptionCount"], 1
         )
+
+    def test_unused_reservation_cost_is_reported_but_not_allocated(self):
+        rows = [
+            self._row(
+                ResourceId="/vm/ri-usage",
+                pricingModel="Reservation",
+                chargeType="Usage",
+                reservationId="ri-a",
+                meterRegion="US West 3",
+                additionalInfo='{"ServiceType":"Standard_D2s_v5"}',
+                tags='{"projname":"misc"}',
+                costInBillingCurrency="10",
+            ),
+            self._row(
+                ResourceId="",
+                pricingModel="Reservation",
+                chargeType="UnusedReservation",
+                reservationId="ri-a",
+                costInBillingCurrency="4",
+            ),
+            self._row(
+                ResourceId="/vm/alpha",
+                pricingModel="OnDemand",
+                chargeType="Usage",
+                meterRegion="US West 3",
+                additionalInfo='{"ServiceType":"Standard_D2s_v5"}',
+                tags='{"projname":"alpha"}',
+                costInBillingCurrency="100",
+            ),
+        ]
+        reservations = [{
+            "reservationId": "ri-a",
+            "bindings": [{"project": "alpha", "boundQuantity": 1}],
+        }]
+        result_rows, summary = self._run(rows, reservations)
+        by_id = {r["ResourceId"]: r for r in result_rows}
+        self.assertEqual(by_id["/vm/ri-usage"]["riPaygEquivalentAmount"], "20")
+        self.assertEqual(by_id["/vm/ri-usage"]["riGrossSavings"], "10")
+        self.assertEqual(by_id["/vm/ri-usage"]["riAllocationAmount"], "10")
+        self.assertEqual(by_id["/vm/alpha"]["riAllocationAmount"], "-10")
+        self.assertEqual(summary["riGrossSavings"], "10")
+        self.assertEqual(summary["riUnusedCost"], "4")
+        self.assertEqual(summary["riPortfolioNetSavings"], "6")
 
 
 if __name__ == "__main__":

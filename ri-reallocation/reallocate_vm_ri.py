@@ -7,8 +7,8 @@
 2. 只处理 meterCategory=Virtual Machines 的记录。
 3. 原 RI 使用记录的 tags 和 ResourceId 保持不变。
 4. 原 RI 使用记录不是目标项目时：
-     allocatedCostInBillingCurrency = costInBillingCurrency + RI 使用金额
-5. 目标项目的 VM 记录按费用比例扣减 RI 使用金额（若某条 RI 使用记录自身命中
+     allocatedCostInBillingCurrency = costInBillingCurrency + RI 净收益
+5. 目标项目的 VM 记录按费用比例扣减 RI 净收益（若某条 RI 使用记录自身命中
    目标，则加回后以全价一并参与该目标分摊）：
      allocatedCostInBillingCurrency = costInBillingCurrency - 分摊金额
 
@@ -21,12 +21,16 @@ from __future__ import annotations
 import argparse
 import csv
 import glob
+import io
 import json
 import re
+import urllib.request
+import zipfile
 from collections import defaultdict
+from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 
 def parse_args() -> argparse.Namespace:
@@ -59,8 +63,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--amount-field",
         default="costInBillingCurrency",
-        choices=("costInBillingCurrency", "costInPricingCurrency", "costInUsd"),
-        help="RI 分摊金额字段，默认：costInBillingCurrency",
+        choices=("costInBillingCurrency",),
+        help="RI 收益分摊金额字段，固定为 costInBillingCurrency",
+    )
+    parser.add_argument(
+        "--price-sheet-file",
+        help=(
+            "Azure Price Sheet CSV/ZIP。未指定时通过 Azure Cost Management SDK "
+            "按账单中的 billingAccountId/billingProfileId/invoiceId 自动下载"
+        ),
     )
     parser.add_argument(
         "--summary-only",
@@ -408,6 +419,233 @@ def decimal_from_row(row: dict[str, str], field: str) -> Decimal:
         raise ValueError(f"{field} 不是有效金额：{raw!r}") from exc
 
 
+class PriceRate(NamedTuple):
+    """A customer Consumption rate from an Azure Price Sheet."""
+
+    meter_id: str
+    unit_price: Decimal
+    currency: str
+    effective_start: date | None
+    effective_end: date | None
+
+
+def _canonical_header(value: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", value.lower())
+
+
+def _parse_date(value: str) -> date | None:
+    text = (value or "").strip()
+    if not text:
+        return None
+    if "T" in text:
+        text = text.split("T", 1)[0]
+    for pattern in ("%Y-%m-%d", "%m/%d/%Y", "%Y/%m/%d"):
+        try:
+            return datetime.strptime(text, pattern).date()
+        except ValueError:
+            pass
+    raise ValueError(f"无法解析日期：{value!r}")
+
+
+def _csv_payloads(payload: bytes, source: str) -> list[tuple[str, bytes]]:
+    if payload.startswith(b"PK\x03\x04"):
+        with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+            files = [
+                (name, archive.read(name))
+                for name in archive.namelist()
+                if name.lower().endswith(".csv") and not name.endswith("/")
+            ]
+        if not files:
+            raise ValueError(f"Azure Price Sheet ZIP 不包含 CSV：{source}")
+        return files
+    return [(source, payload)]
+
+
+def parse_price_sheet(payload: bytes, source: str) -> dict[str, list[PriceRate]]:
+    """Parse Consumption tier-zero customer rates from an Azure Price Sheet."""
+    rates: defaultdict[str, set[PriceRate]] = defaultdict(set)
+    for name, content in _csv_payloads(payload, source):
+        reader = csv.DictReader(io.StringIO(content.decode("utf-8-sig")))
+        if reader.fieldnames is None:
+            raise ValueError(f"Azure Price Sheet CSV 没有表头：{name}")
+        headers = {_canonical_header(field): field for field in reader.fieldnames}
+
+        def field(row: dict[str, str], *aliases: str) -> str:
+            for alias in aliases:
+                original = headers.get(_canonical_header(alias))
+                if original is not None:
+                    return (row.get(original) or "").strip()
+            return ""
+
+        for row in reader:
+            price_type = field(row, "priceType")
+            if price_type and price_type.lower() != "consumption":
+                continue
+            tier = field(row, "tierMinimumUnits")
+            if tier:
+                try:
+                    if Decimal(tier) != 0:
+                        continue
+                except InvalidOperation as exc:
+                    raise ValueError(
+                        f"Azure Price Sheet tierMinimumUnits 非法：{tier!r}"
+                    ) from exc
+            meter_id = field(row, "meterId").lower()
+            raw_price = field(row, "unitPrice")
+            if not meter_id or not raw_price:
+                continue
+            try:
+                unit_price = Decimal(raw_price)
+            except InvalidOperation as exc:
+                raise ValueError(
+                    f"Azure Price Sheet unitPrice 非法：{raw_price!r}"
+                ) from exc
+            rates[meter_id].add(
+                PriceRate(
+                    meter_id=meter_id,
+                    unit_price=unit_price,
+                    currency=field(
+                        row, "billingCurrency", "currency", "currencyCode"
+                    ).upper(),
+                    effective_start=_parse_date(field(row, "effectiveStartDate")),
+                    effective_end=_parse_date(field(row, "effectiveEndDate")),
+                )
+            )
+    if not rates:
+        raise ValueError("Azure Price Sheet 中没有可用的 Consumption tier-zero 价格")
+    return {meter_id: sorted(values, key=repr) for meter_id, values in rates.items()}
+
+
+def price_for_row(row: dict[str, str], rates: dict[str, list[PriceRate]]) -> Decimal:
+    """Return the unique active customer PAYG unit price for a usage row."""
+    meter_id = (row.get("meterId") or "").strip().lower()
+    if not meter_id:
+        raise ValueError("RI Usage 明细缺少 meterId，无法匹配 Azure Price Sheet")
+    usage_date = _parse_date(row.get("date") or "")
+    if usage_date is None:
+        raise ValueError("RI Usage 明细缺少 date，无法匹配 Azure Price Sheet")
+    currency = (row.get("billingCurrency") or "").strip().upper()
+    candidates = []
+    for rate in rates.get(meter_id, []):
+        if rate.currency and currency and rate.currency != currency:
+            continue
+        if rate.effective_start and usage_date < rate.effective_start:
+            continue
+        if rate.effective_end and usage_date > rate.effective_end:
+            continue
+        candidates.append(rate)
+    prices = {rate.unit_price for rate in candidates}
+    if not prices:
+        raise ValueError(
+            f"Azure Price Sheet 找不到 meterId={meter_id!r}、date={usage_date}、"
+            f"currency={currency!r} 的 Consumption 价格"
+        )
+    if len(prices) != 1:
+        raise ValueError(
+            f"Azure Price Sheet 对 meterId={meter_id!r}、date={usage_date} "
+            f"匹配到多个 unitPrice：{sorted(prices)}"
+        )
+    return next(iter(prices))
+
+
+def _model_value(value: Any, *names: str) -> Any:
+    for name in names:
+        if isinstance(value, dict) and name in value:
+            return value[name]
+        result = getattr(value, name, None)
+        if result is not None:
+            return result
+    return None
+
+
+def download_price_sheet(rows: list[dict[str, str]], client: Any | None = None) -> bytes:
+    """Download the applicable Azure Price Sheet through Cost Management SDK."""
+    def unique(field: str, required: bool = True) -> str:
+        values = {(row.get(field) or "").strip() for row in rows}
+        values.discard("")
+        if len(values) > 1:
+            raise ValueError(f"输入账单包含多个 {field}，请分批处理")
+        if required and not values:
+            raise ValueError(f"输入账单缺少 {field}，无法下载 Azure Price Sheet")
+        return next(iter(values), "")
+
+    billing_account_id = unique("billingAccountId")
+    billing_profile_id = unique("billingProfileId", required=False)
+    invoice_id = unique("invoiceId", required=False)
+    usage_dates = {
+        parsed
+        for row in rows
+        if (parsed := _parse_date(row.get("date") or "")) is not None
+    }
+    if not usage_dates:
+        raise ValueError("输入账单缺少 date，无法确定 Azure Price Sheet 账期")
+    periods = {(item.year, item.month) for item in usage_dates}
+    if len(periods) != 1:
+        raise ValueError("输入账单跨多个自然月，请按月分批处理")
+
+    owns_client = client is None
+    if client is None:
+        try:
+            from azure.identity import AzureCliCredential
+            from azure.mgmt.costmanagement import CostManagementClient
+        except ImportError as exc:
+            raise RuntimeError(
+                "自动下载 Azure Price Sheet 需要安装 requirements.txt 中的 Azure SDK"
+            ) from exc
+        client = CostManagementClient(credential=AzureCliCredential())
+
+    try:
+        if billing_profile_id:
+            if invoice_id:
+                result = client.price_sheet.begin_download_by_invoice(
+                    billing_account_name=billing_account_id,
+                    billing_profile_name=billing_profile_id,
+                    invoice_name=invoice_id,
+                ).result()
+            else:
+                year_month = next(iter(periods))
+                current = datetime.now(timezone.utc)
+                if year_month != (current.year, current.month):
+                    raise ValueError(
+                        "历史 MCA/MPA 账单没有 invoiceId，无法自动取得对应历史 Price "
+                        "Sheet；请通过 --price-sheet-file 提供该账期价格表"
+                    )
+                result = client.price_sheet.begin_download_by_billing_profile(
+                    billing_account_name=billing_account_id,
+                    billing_profile_name=billing_profile_id,
+                ).result()
+        else:
+            year, month = next(iter(periods))
+            result = client.price_sheet.begin_download_by_billing_account(
+                billing_account_id=billing_account_id,
+                billing_period_name=f"{year:04d}{month:02d}",
+            ).result()
+
+        url = _model_value(result, "download_url", "downloadUrl")
+        if not url:
+            properties = _model_value(result, "properties") or {}
+            url = _model_value(properties, "report_url", "reportUrl")
+        if not url:
+            raise ValueError("Azure Price Sheet API 响应中缺少下载 URL")
+        with urllib.request.urlopen(str(url), timeout=120) as response:
+            return response.read()
+    finally:
+        if owns_client:
+            client.close()
+
+
+def load_price_sheet(
+    rows: list[dict[str, str]], price_sheet_file: str | None
+) -> tuple[dict[str, list[PriceRate]], str]:
+    if price_sheet_file:
+        path = Path(price_sheet_file)
+        if not path.is_file():
+            raise FileNotFoundError(f"找不到 Azure Price Sheet：{path}")
+        return parse_price_sheet(path.read_bytes(), str(path)), str(path)
+    payload = download_price_sheet(rows)
+    return parse_price_sheet(payload, "Azure Cost Management API"), "Azure Cost Management API"
+
+
 def is_ri_usage(row: dict[str, str], reservation_ids: set[str]) -> bool:
     """判断明细是否属于指定 reservationId 的实际 RI 使用记录。"""
     return (
@@ -567,6 +805,9 @@ def main() -> None:
     ri_size_flexible_rows = 0
     ri_amount = Decimal("0")
     ri_raw_total = Decimal("0")
+    ri_payg_total = Decimal("0")
+    ri_gross_savings_total = Decimal("0")
+    ri_unused_cost_total = Decimal("0")
     project_before: defaultdict[str, Decimal] = defaultdict(Decimal)
     project_ri: defaultdict[str, Decimal] = defaultdict(Decimal)
     # 收益池按 (RI scope, 分摊目标, 匹配键) 隔离，避免跨订阅/资源组使用 RI。
@@ -583,6 +824,8 @@ def main() -> None:
     ri_label_by_index: dict[int, str] = {}
     receiver_basis_by_index: dict[int, Decimal] = {}
 
+    # First load all source rows. Real RI savings require reservation-level totals
+    # (including UnusedReservation), so allocation starts only after the full scan.
     for input_path in input_paths:
         source_files.append(str(input_path))
         with input_path.open("r", encoding="utf-8-sig", newline="") as source:
@@ -599,84 +842,117 @@ def main() -> None:
                 row["_source_file"] = str(input_path)
                 rows.append(row)
 
-                if row.get("meterCategory") != "Virtual Machines":
-                    continue
+    price_rates, price_sheet_source = load_price_sheet(rows, args.price_sheet_file)
+    gross_by_index: dict[int, Decimal] = {}
+    payg_by_index: dict[int, Decimal] = {}
+    gross_by_reservation: defaultdict[str, Decimal] = defaultdict(Decimal)
+    unused_by_reservation: defaultdict[str, Decimal] = defaultdict(Decimal)
 
-                project = project_of(row, args.project_tag_key)
-                amount = decimal_from_row(row, args.amount_field)
-                project_before[project] += amount
+    for row_index, row in enumerate(rows):
+        reservation_id = row.get("reservationId", "").strip()
+        if is_ri_usage(row, reservation_ids):
+            quantity = decimal_from_row(row, "quantity")
+            if quantity < 0:
+                raise ValueError("RI Usage quantity 不能为负数")
+            payg_equivalent = price_for_row(row, price_rates) * quantity
+            amortized_cost = decimal_from_row(row, args.amount_field)
+            gross_savings = payg_equivalent - amortized_cost
+            if gross_savings < 0:
+                raise ValueError(
+                    f"RI {reservation_id!r} 的 PAYG 等价成本 {payg_equivalent} "
+                    f"小于摊销成本 {amortized_cost}；请检查 Price Sheet 与账单账期"
+                )
+            payg_by_index[row_index] = payg_equivalent
+            gross_by_index[row_index] = gross_savings
+            gross_by_reservation[reservation_id] += gross_savings
+        elif (
+            reservation_id in reservation_ids
+            and row.get("chargeType") == "UnusedReservation"
+            and row.get("pricingModel") == "Reservation"
+        ):
+            unused_by_reservation[reservation_id] += decimal_from_row(
+                row, args.amount_field
+            )
 
-                if is_ri_usage(row, reservation_ids):
-                    reservation_id = row.get("reservationId", "").strip()
-                    targets_list = ri_targets[reservation_id]
-                    ri_usage_rows += 1
-                    ri_service_types[reservation_id].add(vm_model(row))
-                    if is_size_flexible(row):
-                        ri_size_flexible_rows += 1
-                    add_back, contributions, label = _row_contributions(
-                        amount, targets_list, ri_denominators[reservation_id]
+    ri_payg_total = sum(payg_by_index.values(), Decimal("0"))
+    ri_gross_savings_total = sum(gross_by_index.values(), Decimal("0"))
+    ri_unused_cost_total = sum(unused_by_reservation.values(), Decimal("0"))
+
+    for row_index, row in enumerate(rows):
+        if row.get("meterCategory") != "Virtual Machines":
+            continue
+
+        project = project_of(row, args.project_tag_key)
+        amount = decimal_from_row(row, args.amount_field)
+        project_before[project] += amount
+
+        if is_ri_usage(row, reservation_ids):
+            reservation_id = row.get("reservationId", "").strip()
+            targets_list = ri_targets[reservation_id]
+            ri_usage_rows += 1
+            ri_service_types[reservation_id].add(vm_model(row))
+            if is_size_flexible(row):
+                ri_size_flexible_rows += 1
+            gross_savings = gross_by_index[row_index]
+            add_back, contributions, label = _row_contributions(
+                gross_savings, targets_list, ri_denominators[reservation_id]
+            )
+            ri_reallocated_rows += 1
+            ri_amount += add_back
+            ri_raw_total += amount
+            project_ri[project] += add_back
+            ri_usage_indexes.add(row_index)
+            ri_add_back_by_index[row_index] = add_back
+            ri_label_by_index[row_index] = label
+            alloc_key = allocation_key(row, ri_modes[reservation_id])
+            for target, contribution in contributions:
+                ri_amount_by_key[
+                    (ri_scopes[reservation_id], target, alloc_key)
+                ] += contribution
+            matched = [t for t in targets if has_target_tag(row, t)]
+            if len(matched) > 1:
+                labels = "、".join("=".join(t) for t in matched)
+                raise ValueError(
+                    f"虚拟机明细同时匹配多个分摊目标（{labels}）；"
+                    "一条明细只能归属一个分摊目标。"
+                )
+            if matched:
+                full_price = amount + add_back
+                receiver_basis_by_index[row_index] = full_price
+                for scope, mode in target_profiles[matched[0]]:
+                    if not row_matches_ri_scope(
+                        row, scope, management_group_subscriptions
+                    ):
+                        continue
+                    pool_key = (
+                        scope,
+                        matched[0],
+                        allocation_key(row, mode),
                     )
-                    ri_reallocated_rows += 1
-                    ri_amount += add_back
-                    ri_raw_total += amount
-                    project_ri[project] += add_back
-                    row_index = len(rows) - 1
-                    ri_usage_indexes.add(row_index)
-                    ri_add_back_by_index[row_index] = add_back
-                    ri_label_by_index[row_index] = label
-                    alloc_key = allocation_key(row, ri_modes[reservation_id])
-                    for target, contribution in contributions:
-                        ri_amount_by_key[
-                            (ri_scopes[reservation_id], target, alloc_key)
-                        ] += contribution
-                    # 加回后的 RI 使用记录以全价（原始金额 + 加回金额）参与其自身所属
-                    # 目标的收益分摊，避免该目标项目仅靠其它明细承接、拿到的收益少于
-                    # binding 权重应得份额。
-                    matched = [t for t in targets if has_target_tag(row, t)]
-                    if len(matched) > 1:
-                        labels = "、".join("=".join(t) for t in matched)
-                        raise ValueError(
-                            f"虚拟机明细同时匹配多个分摊目标（{labels}）；"
-                            "一条明细只能归属一个分摊目标。"
-                        )
-                    if matched:
-                        full_price = amount + add_back
-                        receiver_basis_by_index[row_index] = full_price
-                        for scope, mode in target_profiles[matched[0]]:
-                            if not row_matches_ri_scope(
-                                row, scope, management_group_subscriptions
-                            ):
-                                continue
-                            pool_key = (
-                                scope,
-                                matched[0],
-                                allocation_key(row, mode),
-                            )
-                            target_non_ri_indexes[pool_key].append(row_index)
-                            target_non_ri_total_by_key[pool_key] += full_price
-                else:
-                    matched = [t for t in targets if has_target_tag(row, t)]
-                    if len(matched) > 1:
-                        labels = "、".join("=".join(t) for t in matched)
-                        raise ValueError(
-                            f"虚拟机明细同时匹配多个分摊目标（{labels}）；"
-                            "一条明细只能归属一个分摊目标。"
-                        )
-                    if matched:
-                        row_index = len(rows) - 1
-                        receiver_basis_by_index[row_index] = amount
-                        for scope, mode in target_profiles[matched[0]]:
-                            if not row_matches_ri_scope(
-                                row, scope, management_group_subscriptions
-                            ):
-                                continue
-                            pool_key = (
-                                scope,
-                                matched[0],
-                                allocation_key(row, mode),
-                            )
-                            target_non_ri_indexes[pool_key].append(row_index)
-                            target_non_ri_total_by_key[pool_key] += amount
+                    target_non_ri_indexes[pool_key].append(row_index)
+                    target_non_ri_total_by_key[pool_key] += full_price
+        else:
+            matched = [t for t in targets if has_target_tag(row, t)]
+            if len(matched) > 1:
+                labels = "、".join("=".join(t) for t in matched)
+                raise ValueError(
+                    f"虚拟机明细同时匹配多个分摊目标（{labels}）；"
+                    "一条明细只能归属一个分摊目标。"
+                )
+            if matched:
+                receiver_basis_by_index[row_index] = amount
+                for scope, mode in target_profiles[matched[0]]:
+                    if not row_matches_ri_scope(
+                        row, scope, management_group_subscriptions
+                    ):
+                        continue
+                    pool_key = (
+                        scope,
+                        matched[0],
+                        allocation_key(row, mode),
+                    )
+                    target_non_ri_indexes[pool_key].append(row_index)
+                    target_non_ri_total_by_key[pool_key] += amount
 
     target_non_ri_total = sum(
         target_non_ri_total_by_key.values(), Decimal("0")
@@ -695,10 +971,10 @@ def main() -> None:
                 f"且符合 RI scope {scope!r} 的虚拟机明细"
                 "（含加回后的 RI 使用记录）。"
             )
-        if key_target_total < key_ri_amount:
+        if key_ri_amount > 0 and key_target_total < key_ri_amount:
             raise ValueError(
                 f"分摊目标 {target_label!r} 的匹配机型和区域 {alloc_key!r} "
-                f"虚拟机全价费用 {key_target_total} 小于待分摊 RI 金额 "
+                f"虚拟机全价费用 {key_target_total} 小于待分摊 RI 净收益 "
                 f"{key_ri_amount}，无法按比例分摊后保持非负费用。"
             )
 
@@ -738,6 +1014,9 @@ def main() -> None:
             *fieldnames,
             allocated_field,
             "riAllocationAmount",
+            "riPaygEquivalentAmount",
+            "riAmortizedCost",
+            "riGrossSavings",
             "allocationType",
             "allocationTarget",
         ]
@@ -761,7 +1040,15 @@ def main() -> None:
                         original + adjustment
                     )
                     row["riAllocationAmount"] = str(adjustment)
-                    # RI 使用记录：其 RI 成本被重新分配（可能同时又接收了本项目应得
+                    if index in ri_usage_indexes:
+                        row["riPaygEquivalentAmount"] = str(payg_by_index[index])
+                        row["riAmortizedCost"] = str(original)
+                        row["riGrossSavings"] = str(gross_by_index[index])
+                    else:
+                        row["riPaygEquivalentAmount"] = ""
+                        row["riAmortizedCost"] = ""
+                        row["riGrossSavings"] = ""
+                    # RI 使用记录：其 RI 使用收益被重新分配（可能同时又接收了本项目应得
                     # 收益），净额可正可负；统一标记为 RI_USAGE_COST_REASSIGNED。
                     if index in ri_usage_indexes and adjustment != 0:
                         row["allocationType"] = "RI_USAGE_COST_REASSIGNED"
@@ -857,6 +1144,8 @@ def main() -> None:
         "reservationIds": sorted(reservation_ids),
         "amountField": args.amount_field,
         "allocatedCostField": allocated_field,
+        "priceSheetSource": price_sheet_source,
+        "priceBasis": "Azure Price Sheet Consumption unitPrice × quantity",
         "matchModeByReservation": {
             reservation_id: ri_modes[reservation_id]
             for reservation_id in sorted(ri_modes)
@@ -879,6 +1168,24 @@ def main() -> None:
         },
         "riAllocatableAmount": str(ri_amount),
         "riRawTotalAmount": str(ri_raw_total),
+        "riPaygEquivalentAmount": str(ri_payg_total),
+        "riAmortizedCost": str(ri_raw_total),
+        "riGrossSavings": str(ri_gross_savings_total),
+        "riUnusedCost": str(ri_unused_cost_total),
+        "riPortfolioNetSavings": str(
+            ri_gross_savings_total - ri_unused_cost_total
+        ),
+        "riSavingsByReservation": {
+            reservation_id: {
+                "grossSavings": str(gross_by_reservation[reservation_id]),
+                "unusedCost": str(unused_by_reservation[reservation_id]),
+                "portfolioNetSavings": str(
+                    gross_by_reservation[reservation_id]
+                    - unused_by_reservation[reservation_id]
+                ),
+            }
+            for reservation_id in sorted(reservation_ids)
+        },
         "targetVmReceiverAmount": str(target_non_ri_total),
         "assignedByTarget": {
             target_value: str(amount)
@@ -913,8 +1220,12 @@ def main() -> None:
 
     print(f"分摊目标数：{len(targets)}")
     print(f"RI 使用记录：{ri_usage_rows} 条")
-    print(f"RI 原始费用合计：{ri_raw_total}")
-    print(f"待分摊 RI 金额：{ri_amount}")
+    print(f"RI PAYG 等价成本：{ri_payg_total}")
+    print(f"RI 摊销成本：{ri_raw_total}")
+    print(f"RI 使用毛收益：{ri_gross_savings_total}")
+    print(f"RI 未使用成本：{ri_unused_cost_total}")
+    print(f"RI 组合净收益（仅汇总）：{ri_gross_savings_total - ri_unused_cost_total}")
+    print(f"按 binding 待分摊使用收益：{ri_amount}")
     print(f"目标项目虚拟机接收费用：{target_non_ri_total}")
     print(f"输出目录：{output_dir}")
     print(f"汇总文件：{summary_path}")

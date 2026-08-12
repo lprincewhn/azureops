@@ -8,7 +8,7 @@
 
 ## 1. 目的
 
-本方案用于生成一份新的 Azure 成本明细副本，将预留（RI）使用金额按 `reservations.json` 中每个预留 `bindings` 的 `boundQuantity` 权重重新分摊到一个或多个项目，同时保留源文件不变。
+本方案用于生成一份新的 Azure 成本明细副本，将预留（RI）的**实际使用收益**按 `reservations.json` 中每个预留 `bindings` 的 `boundQuantity` 权重重新分摊到一个或多个项目，同时保留源文件不变。
 
 原始资源的以下字段保持不变：
 
@@ -35,11 +35,24 @@ reservationId = reservations.json 中定义的 reservationId
 meterCategory = Virtual Machines
 ```
 
-RI 金额默认使用：
+RI 摊销成本固定使用：
 
 ```text
 costInBillingCurrency
 ```
+
+PAYG 等价成本统一使用 Azure Price Sheet，不读取账单行中的 `paygCostInBillingCurrency`
+或同批 OnDemand 行：
+
+```text
+RI Usage PAYG 等价成本 = Price Sheet Consumption unitPrice × quantity
+RI 使用毛收益 = PAYG 等价成本 − RI Usage costInBillingCurrency
+```
+
+`UnusedReservation` 成本不参与分摊，保留在原账单归属；仅在汇总中展示未使用成本及
+“使用毛收益 − 未使用成本”的组合净收益，供整体 RI 经济性分析。
+Price Sheet 必须与账单的 `meterId`、使用日期和 `billingCurrency` 唯一匹配；缺价、跨币种
+或多价格歧义都会报错，不回退到公开零售价。
 
 分摊定义由 `--reservations-file` 指定的预留定义文件（`reservations.json`）提供：文件中每个预留的 `externalReservationId` 提供待分摊的 `reservationId`，其 `bindings` 按 `boundQuantity` 权重把该 RI 的优惠收益分摊到一个或多个项目（`project`），详见 [6. 执行方法](#6-执行方法)。
 
@@ -87,7 +100,7 @@ flowchart TD
       VM -- 否 --> KEEP[原样保留 不处理]
       VM -- 是 --> ACC[累计 project_before 项目原始费用]
       ACC --> ISRI{是指定 RI 使用记录?}
-      ISRI -- 是 --> SPLIT[按 boundTotal 拆分 RI 金额<br/>按 binding 权重计入各目标收益池<br/>自身命中目标则以全价入接收池]
+      ISRI -- 是 --> SPLIT[Price Sheet unitPrice × quantity<br/>减 RI Usage 摊销成本<br/>按 binding 权重计入各目标收益池]
       ISRI -- 否 --> HASTAG{带目标标签?}
       HASTAG -- 是 --> RECV[按原始费用计入<br/>目标接收池 目标+匹配键]
       HASTAG -- 否 --> NEXT1[下一行]
@@ -144,12 +157,12 @@ flowchart TD
 
     subgraph FANOUT[多目标权重分摊：分母 boundTotal]
       direction TB
-      SPLIT --> W1[目标1 分得<br/>= RI金额 × boundQuantity1 / boundTotal<br/>计入 目标1+匹配键 收益池]
-      SPLIT --> W2[目标2 分得<br/>= RI金额 × boundQuantity2 / boundTotal<br/>计入 目标2+匹配键 收益池]
+      SPLIT --> W1[目标1 分得<br/>= RI使用收益 × boundQuantity1 / boundTotal<br/>计入 目标1+匹配键 收益池]
+      SPLIT --> W2[目标2 分得<br/>= RI使用收益 × boundQuantity2 / boundTotal<br/>计入 目标2+匹配键 收益池]
       SPLIT --> Wd[…… 其余绑定目标同理]
       W1 --> REM
       W2 --> REM
-      Wd --> REM[未绑定份额<br/>= RI金额 ×（boundTotal − ΣboundQuantity）/ boundTotal<br/>保留在原 RI 使用记录]
+      Wd --> REM[未绑定份额<br/>= RI使用收益 ×（boundTotal − ΣboundQuantity）/ boundTotal<br/>保留在原 RI 使用记录]
     end
 
     REM --> LBL[加回金额 = Σ各目标分得<br/>allocationTarget = 全部目标以竖线连接<br/>如 alpha&#124;beta]
@@ -180,12 +193,15 @@ flowchart TD
 
 ### 3.1 RI 使用记录
 
-对每一条 RI 使用记录（无论其自身标签），按该预留的 `bindings` 权重把该行的 RI 使用金额拆分到各目标项目。拆分的分母为该预留的 `boundTotal`（预留总份数），每个项目获得 `boundQuantity / boundTotal` 的比例；若 `boundTotal` 缺失或不大于权重合计，则回退到以 `ΣboundQuantity` 为分母（等价于全额分摊）。
+对每一条 RI 使用记录（无论其自身标签），先根据 Azure Price Sheet 计算该行的 PAYG
+等价成本和使用收益，再按该预留的 `bindings` 权重把使用收益拆分到各目标项目。
+`UnusedReservation` 成本不参与该过程。拆分分母为 `boundTotal`，每个项目获得
+`boundQuantity / boundTotal` 的比例。
 
 加回原 RI 使用记录的金额为所有目标项目分得金额之和：
 
 ```text
-加回金额 = RI使用金额 × ΣboundQuantity / boundTotal
+加回金额 = RI使用收益 × ΣboundQuantity / boundTotal
 allocatedCostInBillingCurrency = costInBillingCurrency + 加回金额
 ```
 
@@ -216,7 +232,7 @@ RI 收益按 `(分摊目标, 机型或灵活性组, 区域)` 分池，只在同�
 设某一 `(分摊目标, 匹配键)` 池：
 
 ```text
-RI收益池金额 = 所有 RI 使用记录按 boundQuantity 权重分配到该目标、
+RI收益池金额 = 所有 RI 使用记录的使用收益按 boundQuantity 权重分配到该目标、
               且匹配键（机型或灵活性组 + 区域）一致的贡献之和
 目标项目费用总额 = 该池内所有接收明细的费用基数合计
               （普通非 RI 明细取原始费用；加回后的 RI 使用记录取全价 = 原始金额 + 加回金额）
@@ -269,12 +285,15 @@ riAllocationAmount = 负数
 
 | 字段 | 说明 |
 |---|---|
-| `allocated<金额字段>` | 分摊后的计算金额；列名随 `--amount-field` 变化，默认 `allocatedCostInBillingCurrency`，使用 `--amount-field costInUsd` 时为 `allocatedCostInUsd` |
+| `allocatedCostInBillingCurrency` | 分摊后的账单币种金额 |
 | `riAllocationAmount` | 本行 RI 分摊调整金额，正数为加回，负数为扣减 |
+| `riPaygEquivalentAmount` | RI Usage 按 Azure Price Sheet 计算的 PAYG 等价成本 |
+| `riAmortizedCost` | RI Usage 原摊销成本 |
+| `riGrossSavings` | PAYG 等价成本减摊销成本 |
 | `allocationType` | 分摊类型 |
 | `allocationTarget` | 分摊目标项目，即目标标签的值 |
 
-分摊后金额列的货币与 `--amount-field` 一致；汇总 `ri-summary.json` 的 `allocatedCostField` 字段记录了本次使用的列名。原始金额字段不修改，便于对账。
+真实收益统一按账单币种计算，`--amount-field` 固定为 `costInBillingCurrency`。原始金额字段不修改，便于对账。
 
 ## 5. 脚本文件
 
@@ -325,7 +344,7 @@ reallocate_vm_ri.py
 - **bindings[].boundQuantity**：该项目的分摊权重（分子）。同一预留内相同
   `project` 的权重合并；权重 ≤ 0 的 binding 忽略；没有有效 binding 的预留跳过。
 
-**分摊规则**：某 RI 的使用金额（按匹配键分池）按 `boundQuantity / boundTotal` 的
+**分摊规则**：某 RI 的使用收益（按匹配键分池）按 `boundQuantity / boundTotal` 的
 比例拆成子池，每个子池分摊给对应 `project` 目标项目内「符合 RI scope + 相同机型
 （或灵活性组）+ 相同区域」的虚拟机明细，并把这些子池金额之和加回各自的 RI 使用记录。
 当 `boundTotal > ΣboundQuantity`（预留只部分绑定）时，未绑定份额
@@ -348,6 +367,20 @@ python3 reallocate_vm_ri.py \
   --output-dir ri-reallocated
 ```
 
+默认通过 `AzureCliCredential` 使用当前 `az login` 身份下载 Azure Price Sheet。
+MCA/MPA 已出账数据优先按 `invoiceId` 下载；未出账数据按 billing profile 下载当前月
+价格表；EA 按 billing account 和账期下载。历史 MCA/MPA 数据缺少 `invoiceId` 时，
+必须显式提供该账期已下载的 Azure Price Sheet：
+
+```bash
+python3 reallocate_vm_ri.py \
+  "part_*_0001.csv" \
+  --reservations-file reservations.json \
+  --project-tag-key projname \
+  --price-sheet-file pricesheet.zip \
+  --output-dir ri-reallocated
+```
+
 也可以使用 glob：
 
 ```bash
@@ -355,17 +388,6 @@ python3 reallocate_vm_ri.py \
   "part_*_0001.csv" \
   --reservations-file reservations.json \
   --project-tag-key projname \
-  --output-dir ri-reallocated
-```
-
-指定其他金额字段：
-
-```bash
-python3 reallocate_vm_ri.py \
-  "part_*_0001.csv" \
-  --reservations-file reservations.json \
-  --project-tag-key projname \
-  --amount-field costInUsd \
   --output-dir ri-reallocated
 ```
 
@@ -430,8 +452,14 @@ ri-reallocated/
 - `matchModeByReservation`：每个 `reservationId` 由 `flexibility` 推导出的匹配模式（`flex-group` / `model`）
 - `targets`：全部分摊目标（`key=value` 列表）
 - RI 记录数量、RI 分摊记录数量
-- `riRawTotalAmount`：RI 使用记录原始费用合计（对账用，未乘权重）
-- `riAllocatableAmount`：待分摊 RI 金额（= Σ 加回金额 = 原始费用 × ΣboundQuantity/boundTotal；部分绑定时小于原始费用合计）
+- `priceSheetSource` / `priceBasis`：Price Sheet 来源及计价公式
+- `riRawTotalAmount` / `riAmortizedCost`：RI Usage 摊销成本合计
+- `riPaygEquivalentAmount`：Price Sheet PAYG 等价成本合计
+- `riGrossSavings`：RI 使用毛收益
+- `riUnusedCost`：`UnusedReservation` 成本，仅汇总、不参与分摊
+- `riPortfolioNetSavings`：使用毛收益减未使用成本，仅用于组合经济性分析
+- `riAllocatableAmount`：按 binding 比例实际待分摊的使用收益
+- `riSavingsByReservation`：每个 RI 的使用毛收益、未使用成本和组合净收益
 - `targetVmReceiverAmount`：目标项目虚拟机接收费用（接收池，含加回后的 RI 记录全价）
 - `assignedByTarget`：每个分摊目标承接的 RI 收益总额
 - `riAllocationKeys`：每个 `(RI scope, 分摊目标, 匹配键)` 的 `riAmount` 与 `targetVmReceiverAmount`
