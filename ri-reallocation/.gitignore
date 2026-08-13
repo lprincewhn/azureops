@@ -1,4 +1,3 @@
 *.csv
-ri-reallocated*/
+realtests/
 __pycache__/
-reservations.json
