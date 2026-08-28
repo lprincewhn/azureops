@@ -377,7 +377,7 @@ class TestLiveRedis:
 
 # ── Upload failure injection against real Redis ───────────────────────────────
 #
-# The suite previously injected no upload failures at all, which is why B2 and B3
+# The suite originally injected no upload failures at all, which is why B2 and B3
 # went undetected under a fully green run.  These tests exercise the same failure
 # paths as tests/test_failure_paths.py, but with SLOWLOG rows produced by a real
 # Azure Managed Redis — so the fields the exporter fingerprints are the fields the
@@ -517,9 +517,10 @@ class TestLiveUploadFailure:
 
     @needs_redis
     @pytest.mark.xfail(
-        reason="B3: `not fingerprints` reads a legacy state file's missing key as a "
-               "reset, so the first poll after upgrade re-appends the batch "
-               "(live counterpart of FP-11 / FP-12)",
+        reason="待真实 Redis 验证 / pending real-Redis verification: B3 is fixed and its "
+               "offline counterparts (FP-11 / FP-12) pass, but this live case has not "
+               "been run against a real Azure Managed Redis instance yet. Remove this "
+               "marker once it is confirmed green there.",
         strict=False,
     )
     def test_live_14_legacy_state_does_not_duplicate(self, live_client, live_env, la_intercept):
