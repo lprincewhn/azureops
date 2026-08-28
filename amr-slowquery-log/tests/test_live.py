@@ -16,8 +16,10 @@ from pathlib import Path
 
 import pytest
 import redis as redis_lib
+from azure.core.exceptions import AzureError
 
 import exporter
+from tests.failure_injection import InjectableUpload
 
 # ── Live config ───────────────────────────────────────────────────────────────
 
@@ -50,18 +52,9 @@ needs_redis = pytest.mark.skipif(
 )
 
 # ── Upload capture ────────────────────────────────────────────────────────────
-
-
-class UploadCapture:
-    def __init__(self):
-        self.batches: list[list[dict]] = []
-
-    def upload(self, rule_id, stream_name, logs):
-        self.batches.append(list(logs))
-
-    @property
-    def rows(self) -> list[dict]:
-        return [r for b in self.batches for r in b]
+#
+# Uploads go through InjectableUpload (tests/failure_injection.py) so live tests can
+# inject upload failures against a real Redis instance, not just assert the happy path.
 
 
 # ── ExporterRun helper ────────────────────────────────────────────────────────
@@ -190,8 +183,13 @@ def live_client(live_env):
 
 @pytest.fixture(autouse=True)
 def la_intercept():
-    """Intercept Log Analytics uploads so no real Azure calls are made."""
-    capture = UploadCapture()
+    """Intercept Log Analytics uploads so no real Azure calls are made.
+
+    InjectableUpload behaves like the old always-succeed capture until a test
+    programs a failure, so the existing LIVE-01..09 tests are unaffected while
+    upload-failure scenarios become expressible against a real Redis.
+    """
+    capture = InjectableUpload()
     exporter._logs_client = capture
     yield capture
     exporter._logs_client = None
@@ -375,3 +373,181 @@ class TestLiveRedis:
         else:
             for entry in formatted:
                 assert "node" not in entry, f"Enterprise entry has unexpected 'node': {entry}"
+
+
+# ── Upload failure injection against real Redis ───────────────────────────────
+#
+# The suite previously injected no upload failures at all, which is why B2 and B3
+# went undetected under a fully green run.  These tests exercise the same failure
+# paths as tests/test_failure_paths.py, but with SLOWLOG rows produced by a real
+# Azure Managed Redis — so the fields the exporter fingerprints are the fields the
+# instance actually returns, rather than the ones a fake chose to provide.
+
+
+def _row_key(row: dict) -> tuple:
+    """Identity of a JSONL row for duplicate detection."""
+    return (row["id"], row["timestamp"], row["duration_us"], row["command"], row.get("node"))
+
+
+def _duplicates(rows: list[dict]) -> list[tuple]:
+    """Row identities that appear more than once."""
+    seen: set = set()
+    duplicated: list[tuple] = []
+    for row in rows:
+        key = _row_key(row)
+        if key in seen:
+            duplicated.append(key)
+        seen.add(key)
+    return duplicated
+
+
+class TestLiveUploadFailure:
+    """Assertions here are phrased as "nothing was duplicated / nothing was lost"
+    rather than "the file is unchanged".  A live instance keeps logging while the
+    test runs — with a low slowlog threshold even the exporter's own SLOWLOG GET
+    is recorded — so row counts legitimately grow between polls.  Growth is not the
+    defect; re-appending a row that was already backed up is."""
+
+    def _prepare(self, client) -> None:
+        if not _config_set(client, "slowlog-log-slower-than", "0"):
+            pytest.skip("CONFIG SET not permitted on this instance")
+        _slowlog_reset(client)
+
+    @needs_redis
+    def test_live_10_upload_failure_preserves_cursor(self, live_client, live_env, la_intercept):
+        """LIVE-10: A failed upload leaves the durable cursor unadvanced."""
+        self._prepare(live_client)
+        _run_commands(live_client, 3)
+        la_intercept.fail_always(AzureError("simulated Log Analytics outage"))
+
+        run = ExporterRun()
+        if not run.poll(live_client):
+            pytest.skip("No SLOWLOG entries captured")
+
+        state = _read_state(live_env / ".state.json")
+        assert "_jsonl" in state, "pending backup cursor not persisted"
+        cursor_key = "nodes" if _is_oss() else "last_id"
+        assert cursor_key not in state, (
+            f"durable cursor advanced despite upload failure: {state}"
+        )
+        assert la_intercept.accepted == []
+
+    @needs_redis
+    def test_live_11_retry_after_failure_appends_once(self, live_client, live_env, la_intercept):
+        """LIVE-11: Recovery after an outage uploads the batch once and appends once."""
+        self._prepare(live_client)
+        _run_commands(live_client, 3)
+        la_intercept.fail_always(AzureError("simulated Log Analytics outage"))
+
+        if not ExporterRun().poll(live_client):
+            pytest.skip("No SLOWLOG entries captured")
+
+        rows_after_failure = _read_jsonl(live_env / "slowquery.jsonl")
+        assert rows_after_failure, "rows must be backed up locally before the retry"
+
+        la_intercept.succeed()
+        ExporterRun().poll(live_client)   # restart — reloads state from disk
+
+        rows_after_retry = _read_jsonl(live_env / "slowquery.jsonl")
+        assert _duplicates(rows_after_retry) == [], (
+            "retry re-appended rows that were already backed up locally"
+        )
+        assert rows_after_retry[: len(rows_after_failure)] == rows_after_failure, (
+            "the retry rewrote or reordered rows that were already backed up"
+        )
+
+    @needs_redis
+    def test_live_12_restarts_during_outage_do_not_duplicate(self, live_client, live_env, la_intercept):
+        """LIVE-12: Repeated restarts while Log Analytics is down do not grow the JSONL."""
+        self._prepare(live_client)
+        _run_commands(live_client, 3)
+        la_intercept.fail_always(AzureError("simulated Log Analytics outage"))
+
+        if not ExporterRun().poll(live_client):
+            pytest.skip("No SLOWLOG entries captured")
+
+        baseline = _read_jsonl(live_env / "slowquery.jsonl")
+        for _ in range(2):
+            ExporterRun().poll(live_client)
+
+        rows = _read_jsonl(live_env / "slowquery.jsonl")
+        assert _duplicates(rows) == [], (
+            f"restarts during the outage duplicated already-backed-up rows: "
+            f"{_duplicates(rows)}"
+        )
+        assert rows[: len(baseline)] == baseline
+
+    @needs_redis
+    def test_live_13_reset_during_pending_upload_keeps_every_row(
+        self, live_client, live_env, la_intercept
+    ):
+        """LIVE-13: SLOWLOG RESET while an upload is pending must not drop rows.
+
+        Everything Log Analytics accepts has to be in the local JSONL too.  On a real
+        instance the new generation's rows carry whatever entropy that instance
+        provides, so this is the honest version of the B2 scenario.
+        """
+        self._prepare(live_client)
+        _run_commands(live_client, 5)
+        la_intercept.fail_always(AzureError("simulated Log Analytics outage"))
+
+        run = ExporterRun()
+        if not run.poll(live_client):
+            pytest.skip("No SLOWLOG entries captured")
+
+        rows_before_reset = len(_read_jsonl(live_env / "slowquery.jsonl"))
+
+        _slowlog_reset(live_client)
+        _run_commands(live_client, 8)
+        la_intercept.succeed()
+        if not run.poll(live_client):
+            pytest.skip("No SLOWLOG entries captured after reset")
+
+        appended = _read_jsonl(live_env / "slowquery.jsonl")[rows_before_reset:]
+        local_keys = {(row["id"], row["command"]) for row in appended}
+        missing = [
+            (row["SlowlogId"], row["Command"])
+            for row in la_intercept.accepted_rows
+            if (row["SlowlogId"], row["Command"]) not in local_keys
+        ]
+        assert not missing, (
+            f"{len(missing)} row(s) reached Log Analytics but never reached the local "
+            f"JSONL: {missing[:10]}"
+        )
+
+    @needs_redis
+    @pytest.mark.xfail(
+        reason="B3: `not fingerprints` reads a legacy state file's missing key as a "
+               "reset, so the first poll after upgrade re-appends the batch "
+               "(live counterpart of FP-11 / FP-12)",
+        strict=False,
+    )
+    def test_live_14_legacy_state_does_not_duplicate(self, live_client, live_env, la_intercept):
+        """LIVE-14: Upgrading over a pre-fingerprint pending state must not re-append.
+
+        Writes the state file shape the previous version left behind mid-outage
+        (a `_jsonl` cursor with no `fingerprints` key), then polls.
+        """
+        self._prepare(live_client)
+        _run_commands(live_client, 3)
+        la_intercept.fail_always(AzureError("simulated Log Analytics outage"))
+
+        if not ExporterRun().poll(live_client):
+            pytest.skip("No SLOWLOG entries captured")
+
+        rows = _read_jsonl(live_env / "slowquery.jsonl")
+        state = _read_state(live_env / ".state.json")
+        pending = state["_jsonl"]
+        # Strip fingerprints to reproduce the legacy on-disk shape exactly.
+        legacy = {"nodes": pending["nodes"]} if _is_oss() else {"last_id": pending["last_id"]}
+        exporter.save_state({"_jsonl": legacy})
+
+        la_intercept.succeed()
+        ExporterRun().poll(live_client)
+
+        after = _read_jsonl(live_env / "slowquery.jsonl")
+        assert _duplicates(after) == [], (
+            f"legacy state file caused already-backed-up rows to be appended again: "
+            f"{_duplicates(after)}"
+        )
+        assert after[: len(rows)] == rows
