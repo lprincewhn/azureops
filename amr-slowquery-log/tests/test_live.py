@@ -74,14 +74,15 @@ class ExporterRun:
         self.state = exporter.load_state()
 
     def poll(self, client) -> list[dict]:
-        new_entries, self.state = exporter.fetch_new_entries(client, self.state)
+        new_entries, next_state = exporter.fetch_new_entries(client, self.state)
         if not new_entries:
             return []
         exported_at = datetime.now(tz=timezone.utc).isoformat()
         formatted = [exporter.format_entry(e, exported_at) for e in new_entries]
         exporter.append_to_jsonl(formatted)
         exporter.send_to_log_analytics(formatted)
-        exporter.save_state(self.state)
+        exporter.save_state(next_state)
+        self.state = next_state
         return formatted
 
 
