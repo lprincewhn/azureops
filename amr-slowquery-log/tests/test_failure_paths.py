@@ -5,19 +5,24 @@ during review, never by the test suite — because the suite could not express "
 upload failed".  These tests close that gap.  They use the shared harness in
 `failure_injection.py` and drive only production code paths (`run_once`, `main`).
 
-Tests marked xfail describe behaviour the exporter does not yet have.  They are the
-red-light list for the follow-up fix task: making them pass IS the acceptance
-criterion.  The reason string on each names the blocker it pins down.
+B1/B2/B3 below were fixed in `4406118`; every test here now asserts the fixed
+behaviour and stands as its regression guard.  The three bugs, and what each group
+pins down so it cannot come back:
 
-    B1  `except Exception` in run_once swallows the _Stop sentinel that main()'s
-        SIGTERM handler raises, so graceful shutdown never happens and batches the
-        service already accepted get re-uploaded after restart.
-    B2  Content fingerprints collide on deterministic periodic workloads, so a whole
-        generation of SLOWLOG rows can be judged "already backed up" and never reach
-        the local JSONL.
+    B1  `except Exception` in run_once swallowed the _Stop sentinel that main()'s
+        SIGTERM handler raises, so graceful shutdown never happened and batches the
+        service had already accepted got re-uploaded after restart.  Fixed by making
+        _Stop a BaseException and narrowing the upload handler to
+        `(AzureError, ValueError)`.
+    B2  Content fingerprints collided on deterministic periodic workloads, so a whole
+        generation of SLOWLOG rows could be judged "already backed up" and never reach
+        the local JSONL.  Fixed by detecting the reset against the persisted backup
+        cursor (`_jsonl_cursor_reset`) before filtering by ID.
     B3  A pending-upload state file written before fingerprints existed has no
-        `fingerprints` key, and `not fingerprints` reads that as a reset — so the
-        first poll after upgrade re-appends an already-backed-up batch.
+        `fingerprints` key, and `not fingerprints` read that as a reset — so the
+        first poll after upgrade re-appended an already-backed-up batch.  Fixed by
+        trusting the legacy cursor by ID instead of inferring a reset from the
+        missing key.
 
 Groups
 ------
@@ -133,15 +138,10 @@ def seed_backed_up_jsonl(commands: list[str], node: str | None = None) -> None:
 class TestSigtermDuringUpload:
     """The upload is the slowest, most network-bound part of a poll, so it is where
     SIGTERM most often lands during a rolling update.  main() raises _Stop from its
-    handler and relies on `except _Stop` to shut down; run_once's `except Exception`
-    sits in between."""
+    handler and relies on `except _Stop` to shut down; nothing in run_once may sit in
+    between and consume it."""
 
     # FP-01 ───────────────────────────────────────────────────────────────────
-    @pytest.mark.xfail(
-        reason="B1: _Stop subclasses Exception, so run_once's `except Exception` "
-               "swallows the SIGTERM sentinel and main() never exits",
-        strict=True,
-    )
     def test_fp01_sigterm_during_upload_exits_the_process(self, enterprise, upload, monkeypatch):
         """SIGTERM delivered inside the upload window must terminate the poll loop."""
         slowlog = AmrSlowlog()
@@ -159,11 +159,6 @@ class TestSigtermDuringUpload:
         assert not result.budget_exhausted
 
     # FP-02 ───────────────────────────────────────────────────────────────────
-    @pytest.mark.xfail(
-        reason="B1: the swallowed _Stop leaves the loop spinning until SIGKILL "
-               "instead of stopping after the interrupted poll",
-        strict=True,
-    )
     def test_fp02_sigterm_stops_polling_immediately(self, enterprise, upload, monkeypatch):
         """No further poll may start after the signal — the container is shutting down."""
         slowlog = AmrSlowlog()
@@ -177,11 +172,6 @@ class TestSigtermDuringUpload:
         assert result.polls <= 1, f"kept polling after SIGTERM: {result.polls} polls"
 
     # FP-03 ───────────────────────────────────────────────────────────────────
-    @pytest.mark.xfail(
-        reason="B1: main()'s `except _Stop: save_state(state)` never runs because "
-               "run_once already consumed the _Stop",
-        strict=True,
-    )
     def test_fp03_save_on_exit_runs_on_sigterm(self, enterprise, upload, monkeypatch):
         """main()'s shutdown handler must persist state before the process dies."""
         slowlog = AmrSlowlog()
@@ -195,11 +185,6 @@ class TestSigtermDuringUpload:
         assert result.saved_on_exit, "save_state was never called from main()'s _Stop handler"
 
     # FP-04 ───────────────────────────────────────────────────────────────────
-    @pytest.mark.xfail(
-        reason="B1: a batch the service already accepted is recorded as failed, so "
-               "the restart re-uploads it and Log Analytics gets duplicate rows",
-        strict=True,
-    )
     def test_fp04_accepted_batch_is_not_re_uploaded_after_sigterm(
         self, enterprise, upload, monkeypatch
     ):
@@ -221,11 +206,6 @@ class TestSigtermDuringUpload:
         )
 
     # FP-05 ───────────────────────────────────────────────────────────────────
-    @pytest.mark.xfail(
-        reason="B1: `except Exception` turns programming errors into an indefinite "
-               "silent retry loop instead of surfacing them",
-        strict=True,
-    )
     @pytest.mark.parametrize(
         "failure",
         [
@@ -261,17 +241,11 @@ class TestSigtermDuringUpload:
         )
 
     # FP-06 ───────────────────────────────────────────────────────────────────
-    @pytest.mark.xfail(
-        reason="B1: run_once's `except Exception` catches the _Stop sentinel instead "
-               "of letting it reach main()'s shutdown handler",
-        strict=True,
-    )
     def test_fp06_stop_sentinel_propagates_out_of_run_once(self, enterprise, upload):
         """The narrow unit form of B1, independent of signal delivery timing.
 
-        Whatever shape the fix takes — _Stop no longer subclassing Exception, or an
-        explicit re-raise ahead of `except Exception` — a _Stop raised inside the
-        upload must leave run_once.
+        Whatever shape the exception handling takes, a _Stop raised inside the upload
+        must leave run_once.
         """
         slowlog = AmrSlowlog()
         slowlog.add(1, command=b"GET k")
@@ -287,13 +261,13 @@ class TestSigtermDuringUpload:
 
 
 class TestFingerprintCollision:
-    """`_jsonl_append_indexes` decides "was there a reset?" by comparing content
-    fingerprints of the overlapping ID range.  On Azure Managed Redis the available
-    entropy is thin: start_time is second-granular, duration is an integer, and under
-    the default Enterprise cluster policy redis-py leaves client_address / client_name
-    absent while injecting a `complexity` field the fingerprint ignores.  A periodic
-    task issuing the same slow command therefore produces byte-identical rows across
-    generations."""
+    """Reset detection compares content fingerprints of the overlapping ID range.  On
+    Azure Managed Redis the available entropy is thin: start_time is second-granular,
+    duration is an integer, and under the default Enterprise cluster policy redis-py
+    leaves client_address / client_name absent while injecting a `complexity` field the
+    fingerprint ignores.  A periodic task issuing the same slow command therefore
+    produces byte-identical rows across generations, so fingerprints alone cannot see
+    the reset — the exporter must fall back to the persisted backup cursor."""
 
     # FP-07 ───────────────────────────────────────────────────────────────────
     def test_fp07_identical_amr_rows_across_generations_collide(self):
@@ -317,11 +291,6 @@ class TestFingerprintCollision:
         )
 
     # FP-08 ───────────────────────────────────────────────────────────────────
-    @pytest.mark.xfail(
-        reason="B2: every overlapping row collides, the reset goes undetected, and "
-               "the whole new generation is skipped as already-backed-up",
-        strict=True,
-    )
     def test_fp08_enterprise_collision_keeps_new_generation_in_jsonl(
         self, enterprise, upload
     ):
@@ -355,11 +324,6 @@ class TestFingerprintCollision:
         )
 
     # FP-09 ───────────────────────────────────────────────────────────────────
-    @pytest.mark.xfail(
-        reason="B2: the small-scale collision drops exactly the rows whose IDs the "
-               "previous generation already used",
-        strict=True,
-    )
     def test_fp09_enterprise_collision_small_batch_loses_no_rows(self, enterprise, upload):
         """Three identical commands, reset, five identical commands → 8 JSONL rows."""
         slowlog = AmrSlowlog()
@@ -377,11 +341,6 @@ class TestFingerprintCollision:
         )
 
     # FP-10 ───────────────────────────────────────────────────────────────────
-    @pytest.mark.xfail(
-        reason="B2: per-shard cursors are independent, so a collision on one shard "
-               "drops that shard's generation while the other shard is unaffected",
-        strict=True,
-    )
     def test_fp10_oss_collision_is_isolated_to_the_resetting_shard(self, oss, upload):
         """OSS: shard-0 resets under a deterministic load, shard-1 keeps counting."""
         shard_0, shard_1 = AmrSlowlog(), AmrSlowlog()
@@ -428,11 +387,6 @@ class TestLegacyStateUpgrade:
     the same thing as having no history."""
 
     # FP-11 ───────────────────────────────────────────────────────────────────
-    @pytest.mark.xfail(
-        reason="B3: `not fingerprints` treats a legacy state file's missing key as a "
-               "reset, so the already-backed-up batch is appended a second time",
-        strict=True,
-    )
     def test_fp11_enterprise_legacy_state_does_not_duplicate_jsonl(
         self, enterprise, upload
     ):
@@ -452,11 +406,6 @@ class TestLegacyStateUpgrade:
         )
 
     # FP-12 ───────────────────────────────────────────────────────────────────
-    @pytest.mark.xfail(
-        reason="B3: the OSS per-node legacy state shape hits the same "
-               "`not fingerprints` path and re-appends the batch",
-        strict=True,
-    )
     def test_fp12_oss_legacy_state_does_not_duplicate_jsonl(self, oss, upload):
         """OSS: `{"_jsonl": {"nodes": {...}}}` must be trusted by ID."""
         commands = [f"A{index}" for index in range(1, 6)]
@@ -480,7 +429,7 @@ class TestLegacyStateUpgrade:
 
 
 class TestUploadFailureNonRegression:
-    """These all pass on da5a997 and must keep passing after B1/B2/B3 are fixed.
+    """These all passed on da5a997 and still pass with the B1/B2/B3 fix in place.
     They are the guardrail against the pattern this component has repeated three
     times: a fix for the reported scenario that reintroduces an older one."""
 
@@ -699,12 +648,6 @@ class TestUploadFailureNonRegression:
 class TestStateGrowth:
 
     # FP-21 ───────────────────────────────────────────────────────────────────
-    @pytest.mark.xfail(
-        reason="non-blocking (round-3 suggestion 1): the fingerprint map is unbounded "
-               "during an outage even though only SLOWLOG_BATCH_SIZE rows can ever "
-               "be re-fetched",
-        strict=True,
-    )
     def test_fp21_fingerprint_map_is_bounded_by_batch_size(self, enterprise, upload):
         """A long outage must not grow the state file without bound.
 
