@@ -42,7 +42,7 @@ class DistributionReportTests(unittest.TestCase):
                 {
                     "reservationIds": ["ri-1"],
                     "riSavingsByReservation": {
-                        "ri-1": {"grossSavings": "30"}
+                        "ri-1": {"netBenefitOrLoss": "30"}
                     },
                 }
             ),
@@ -62,12 +62,12 @@ class DistributionReportTests(unittest.TestCase):
             "quantity",
             "costInBillingCurrency",
             "costInBillingCurrencyAfterActualReconciliation",
-            "riGrossSavings",
+            "riBenefitOrLoss",
             "riPaygEquivalentAmount",
             "riAmortizedCost",
         ]
         for row in bill_rows:
-            if row.get("riGrossSavings"):
+            if row.get("riBenefitOrLoss"):
                 row.setdefault("riPaygEquivalentAmount", "50")
                 row.setdefault("riAmortizedCost", "20")
                 row.setdefault(
@@ -103,7 +103,7 @@ class DistributionReportTests(unittest.TestCase):
                         "reservationId": "ri-1",
                         "reservationName": "RI One",
                         "tags": '{"projname":"source"}',
-                        "riGrossSavings": "30",
+                        "riBenefitOrLoss": "30",
                     }
                 ],
                 [
@@ -175,7 +175,7 @@ class DistributionReportTests(unittest.TestCase):
                         "costInBillingCurrencyAfterActualReconciliation": "20",
                         "riAmortizedCost": "20",
                         "riPaygEquivalentAmount": "50",
-                        "riGrossSavings": "30",
+                        "riBenefitOrLoss": "30",
                     }
                 ],
                 [],
@@ -209,7 +209,7 @@ class DistributionReportTests(unittest.TestCase):
                         "reservationId": "ri-1",
                         "reservationName": "Unused RI",
                         "tags": '{"projname":"source"}',
-                        "riGrossSavings": "",
+                        "riBenefitOrLoss": "",
                         "riPaygEquivalentAmount": "",
                         "riAmortizedCost": "",
                     }
@@ -221,8 +221,8 @@ class DistributionReportTests(unittest.TestCase):
                     {
                         "reservationIds": ["ri-1", "ri-2"],
                         "riSavingsByReservation": {
-                            "ri-1": {"grossSavings": "0"},
-                            "ri-2": {"grossSavings": "0"},
+                            "ri-1": {"netBenefitOrLoss": "0"},
+                            "ri-2": {"netBenefitOrLoss": "0"},
                         },
                     }
                 ),
@@ -273,7 +273,7 @@ class DistributionReportTests(unittest.TestCase):
                         "billingCurrency": "USD",
                         "quantity": "2",
                         "costInBillingCurrency": "4",
-                        "riGrossSavings": "",
+                        "riBenefitOrLoss": "",
                         "riPaygEquivalentAmount": "",
                         "riAmortizedCost": "",
                     }
@@ -333,7 +333,8 @@ class DistributionReportTests(unittest.TestCase):
             self.assertEqual(row["project"], "actual-project-rg")
             self.assertEqual(row["paygEquivalentCost"], "10")
             self.assertEqual(row["riAmortizedCost"], "4")
-            self.assertEqual(row["grossSavings"], "6")
+            self.assertEqual(row["netBenefitOrLoss"], "6")
+            self.assertNotIn("grossSavings", row)
             self.assertEqual(row["beforeBenefit"], "6")
             self.assertEqual(row["afterBenefit"], "6")
 
@@ -355,7 +356,7 @@ class DistributionReportTests(unittest.TestCase):
                         "quantity": "2",
                         "costInBillingCurrency": "4",
                         "costInBillingCurrencyAfterActualReconciliation": "12",
-                        "riGrossSavings": "",
+                        "riBenefitOrLoss": "",
                     }
                 ],
                 [],
@@ -402,7 +403,7 @@ class DistributionReportTests(unittest.TestCase):
             self.assertEqual(
                 row["riAmortizedCostAfterActualReconciliation"], "12"
             )
-            self.assertEqual(row["grossSavings"], "-2")
+            self.assertEqual(row["netBenefitOrLoss"], "-2")
 
     def test_self_receiver_is_counted_once(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -414,7 +415,7 @@ class DistributionReportTests(unittest.TestCase):
                         "reservationId": "ri-1",
                         "reservationName": "",
                         "tags": '{"projname":"source"}',
-                        "riGrossSavings": "30",
+                        "riBenefitOrLoss": "30",
                     }
                 ],
                 [
@@ -463,7 +464,7 @@ class DistributionReportTests(unittest.TestCase):
                         "reservationId": "ri-1",
                         "reservationName": "",
                         "tags": '{"projname":"source"}',
-                        "riGrossSavings": "30",
+                        "riBenefitOrLoss": "30",
                     }
                 ],
                 [
@@ -500,7 +501,7 @@ class DistributionReportTests(unittest.TestCase):
                         "reservationId": "ri-1",
                         "reservationName": "RI One",
                         "tags": '{"projname":"source"}',
-                        "riGrossSavings": "-20",
+                        "riBenefitOrLoss": "-20",
                         "riPaygEquivalentAmount": "100",
                         "riAmortizedCost": "120",
                     }
@@ -531,7 +532,7 @@ class DistributionReportTests(unittest.TestCase):
                     {
                         "reservationIds": ["ri-1"],
                         "riSavingsByReservation": {
-                            "ri-1": {"grossSavings": "-20"}
+                            "ri-1": {"netBenefitOrLoss": "-20"}
                         },
                     }
                 ),
@@ -559,7 +560,7 @@ class DistributionReportTests(unittest.TestCase):
                         "reservationId": "ri-1",
                         "reservationName": "RI One",
                         "tags": '{"projname":"source"}',
-                        "riGrossSavings": "1",
+                        "riBenefitOrLoss": "1",
                     }
                 ],
                 [
@@ -588,7 +589,7 @@ class DistributionReportTests(unittest.TestCase):
                     {
                         "reservationIds": ["ri-1"],
                         "riSavingsByReservation": {
-                            "ri-1": {"grossSavings": "1"}
+                            "ri-1": {"netBenefitOrLoss": "1"}
                         },
                     }
                 ),

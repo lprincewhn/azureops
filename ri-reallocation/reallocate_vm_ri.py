@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""生成 RI 费用重新分摊后的明细副本，不修改源 CSV。
+"""生成 RI 经济收益或损失重新分摊后的明细副本，不修改源 CSV。
 
 分摊规则：
 1. RI 使用记录：pricingModel=Reservation、chargeType=Usage、reservationId
@@ -7,13 +7,13 @@
 2. 只处理 meterCategory=Virtual Machines 的记录。
 3. 原 RI 使用记录的 tags 和 ResourceId 保持不变。
 4. 原 RI 使用记录不是目标项目时：
-     allocatedCostInBillingCurrency = costInBillingCurrency + RI 净收益
-5. 目标项目的 VM 记录按费用比例扣减 RI 净收益（若某条 RI 使用记录自身命中
+     allocatedCostInBillingCurrency = 成本基准 + RI 净收益/损失
+5. 目标项目的 VM 记录按费用比例承接 RI 净收益/损失（若某条 RI 使用记录自身命中
    目标，则加回后以全价一并参与该目标分摊）：
-     allocatedCostInBillingCurrency = costInBillingCurrency - 分摊金额
+     allocatedCostInBillingCurrency = 成本基准 - 分摊金额
 
-这样非目标的 RI 使用记录 allocatedCost 大于原始 cost，目标项目接收记录的
-allocatedCost 小于原始 cost，整体金额保持不变。
+正收益降低目标项目费用；负收益代表 RI 超额成本，会增加目标项目费用。
+两种场景的整体金额均保持不变。
 """
 
 from __future__ import annotations
@@ -24,7 +24,9 @@ import glob
 import io
 import json
 import re
+import time
 import urllib.request
+import urllib.parse
 import zipfile
 from collections import defaultdict
 from datetime import date, datetime, timezone
@@ -63,15 +65,45 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--amount-field",
         default="costInBillingCurrency",
-        choices=("costInBillingCurrency",),
-        help="RI 收益分摊金额字段，固定为 costInBillingCurrency",
+        choices=(
+            "costInBillingCurrency",
+            "costInBillingCurrencyAfterActualReconciliation",
+        ),
+        help=(
+            "RI 经济收益/损失的成本基准字段；使用 allocate_ri_difference.py "
+            "输出时指定 costInBillingCurrencyAfterActualReconciliation"
+        ),
     )
     parser.add_argument(
         "--price-sheet-file",
         help=(
-            "Azure Price Sheet CSV/ZIP。未指定时通过 Azure Cost Management SDK "
+            "Azure Price Sheet CSV/ZIP/JSON。未指定时通过 Azure Cost Management SDK "
             "按账单中的 billingAccountId/billingProfileId/invoiceId 自动下载"
         ),
+    )
+    parser.add_argument(
+        "--invoice-id",
+        help=(
+            "下载 MCA/MPA Price Sheet 时使用的发票 ID。账单包含多个 invoiceId "
+            "或历史 Usage 行缺少 invoiceId 时应显式指定"
+        ),
+    )
+    parser.add_argument(
+        "--billing-account-name",
+        help=(
+            "完整 MCA/MPA Billing Account Name。未指定时根据账单中的短 "
+            "billingAccountId 通过 Microsoft.Billing API 自动解析"
+        ),
+    )
+    parser.add_argument(
+        "--price-sheet-timeout",
+        type=int,
+        default=1800,
+        help="等待 Azure 生成 Price Sheet 的最长秒数，默认：1800",
+    )
+    parser.add_argument(
+        "--save-price-sheet-file",
+        help="将自动下载的 Azure Price Sheet 原始 CSV/ZIP/JSON 保存到指定路径",
     )
     parser.add_argument(
         "--summary-only",
@@ -185,6 +217,49 @@ def _management_group_name(scope_id: str) -> str:
     return normalized
 
 
+def resolve_management_group_scopes_from_entities(
+    scopes: RiScopes, credential: Any
+) -> dict[tuple[str, str], frozenset[str]]:
+    """Resolve management-group membership through the tenant entity hierarchy."""
+    token = credential.get_token("https://management.azure.com/.default").token
+    request = urllib.request.Request(
+        "https://management.azure.com/providers/Microsoft.Management/"
+        "getEntities?api-version=2020-05-01",
+        data=json.dumps({"query": "", "view": "FullHierarchy"}).encode(),
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=120) as response:
+        payload = json.load(response)
+    subscriptions: list[tuple[str, set[str]]] = []
+    for entity in payload.get("value", []):
+        if not isinstance(entity, dict):
+            continue
+        if str(entity.get("type") or "").lower() != "/subscriptions":
+            continue
+        subscription_id = str(entity.get("name") or "").strip().lower()
+        properties = entity.get("properties") or {}
+        parent_chain = {
+            str(parent).strip().lower()
+            for parent in properties.get("parentNameChain") or []
+        }
+        if subscription_id:
+            subscriptions.append((subscription_id, parent_chain))
+
+    result: dict[tuple[str, str], frozenset[str]] = {}
+    for scope in {item for item in scopes.values() if item[0] == "managementgroup"}:
+        group_name = _management_group_name(scope[1]).lower()
+        result[scope] = frozenset(
+            subscription_id
+            for subscription_id, parent_chain in subscriptions
+            if group_name in parent_chain
+        )
+    return result
+
+
 def resolve_management_group_scopes(
     scopes: RiScopes, client: Any | None = None
 ) -> dict[tuple[str, str], frozenset[str]]:
@@ -196,37 +271,59 @@ def resolve_management_group_scopes(
         return {}
 
     owns_client = client is None
+    credential = None
     if client is None:
         try:
             from azure.identity import AzureCliCredential
+            from azure.core.exceptions import HttpResponseError
             from azure.mgmt.managementgroups import ManagementGroupsMgmtClient
         except ImportError as exc:
             raise RuntimeError(
                 "ManagementGroup scope 需要安装 requirements.txt 中的 Azure SDK"
             ) from exc
-        client = ManagementGroupsMgmtClient(credential=AzureCliCredential())
+        credential = AzureCliCredential()
+        client = ManagementGroupsMgmtClient(credential=credential)
 
     result: dict[tuple[str, str], frozenset[str]] = {}
     try:
-        for scope in sorted(management_group_scopes):
-            group_name = _management_group_name(scope[1])
-            subscription_ids: set[str] = set()
-            for descendant in client.management_groups.get_descendants(group_name):
-                descendant_type = str(
-                    getattr(descendant, "type", None)
-                    or (descendant.get("type") if isinstance(descendant, dict) else "")
-                )
-                if descendant_type.lower() != (
-                    "microsoft.management/managementgroups/subscriptions"
-                ).lower():
-                    continue
-                name = str(
-                    getattr(descendant, "name", None)
-                    or (descendant.get("name") if isinstance(descendant, dict) else "")
-                ).strip()
-                if name:
-                    subscription_ids.add(name.lower())
-            result[scope] = frozenset(subscription_ids)
+        try:
+            for scope in sorted(management_group_scopes):
+                group_name = _management_group_name(scope[1])
+                subscription_ids: set[str] = set()
+                for descendant in client.management_groups.get_descendants(group_name):
+                    descendant_type = str(
+                        getattr(descendant, "type", None)
+                        or (
+                            descendant.get("type")
+                            if isinstance(descendant, dict)
+                            else ""
+                        )
+                    )
+                    if descendant_type.lower() != (
+                        "microsoft.management/managementgroups/subscriptions"
+                    ).lower():
+                        continue
+                    name = str(
+                        getattr(descendant, "name", None)
+                        or (
+                            descendant.get("name")
+                            if isinstance(descendant, dict)
+                            else ""
+                        )
+                    ).strip()
+                    if name:
+                        subscription_ids.add(name.lower())
+                result[scope] = frozenset(subscription_ids)
+        except HttpResponseError as exc:
+            if (
+                not owns_client
+                or credential is None
+                or getattr(exc, "status_code", None) != 403
+            ):
+                raise
+            result = resolve_management_group_scopes_from_entities(
+                scopes, credential
+            )
     finally:
         if owns_client:
             client.close()
@@ -462,22 +559,42 @@ def _csv_payloads(payload: bytes, source: str) -> list[tuple[str, bytes]]:
 
 
 def parse_price_sheet(payload: bytes, source: str) -> dict[str, list[PriceRate]]:
-    """Parse Consumption tier-zero customer rates from an Azure Price Sheet."""
+    """Parse Consumption tier-zero rates from CSV, ZIP, or JSON Price Sheets."""
     rates: defaultdict[str, set[PriceRate]] = defaultdict(set)
-    for name, content in _csv_payloads(payload, source):
-        reader = csv.DictReader(io.StringIO(content.decode("utf-8-sig")))
-        if reader.fieldnames is None:
-            raise ValueError(f"Azure Price Sheet CSV 没有表头：{name}")
-        headers = {_canonical_header(field): field for field in reader.fieldnames}
+    stripped = payload.lstrip(b"\xef\xbb\xbf \t\r\n")
+    if stripped.startswith(b"["):
+        parsed = json.loads(payload.decode("utf-8-sig"))
+        if not isinstance(parsed, list) or not all(
+            isinstance(row, dict) for row in parsed
+        ):
+            raise ValueError("Azure Price Sheet JSON 顶层必须是对象数组")
+        sources: list[tuple[str, list[dict[str, Any]], list[str]]] = [
+            (
+                source,
+                parsed,
+                list(parsed[0]) if parsed else [],
+            )
+        ]
+    else:
+        sources = []
+        for name, content in _csv_payloads(payload, source):
+            reader = csv.DictReader(io.StringIO(content.decode("utf-8-sig")))
+            if reader.fieldnames is None:
+                raise ValueError(f"Azure Price Sheet CSV 没有表头：{name}")
+            sources.append((name, list(reader), list(reader.fieldnames)))
 
-        def field(row: dict[str, str], *aliases: str) -> str:
+    for name, rows, fieldnames in sources:
+        headers = {_canonical_header(field): field for field in fieldnames}
+
+        def field(row: dict[str, Any], *aliases: str) -> str:
             for alias in aliases:
                 original = headers.get(_canonical_header(alias))
                 if original is not None:
-                    return (row.get(original) or "").strip()
+                    value = row.get(original)
+                    return "" if value is None else str(value).strip()
             return ""
 
-        for row in reader:
+        for row in rows:
             price_type = field(row, "priceType")
             if price_type and price_type.lower() != "consumption":
                 continue
@@ -558,7 +675,154 @@ def _model_value(value: Any, *names: str) -> Any:
     return None
 
 
-def download_price_sheet(rows: list[dict[str, str]], client: Any | None = None) -> bytes:
+def wait_for_price_sheet(poller: Any, timeout: int) -> Any:
+    """Wait for a Price Sheet LRO and fail clearly when the deadline expires."""
+    poller.wait(timeout=timeout)
+    if not poller.done():
+        raise TimeoutError(
+            f"Azure Price Sheet 在 {timeout} 秒内未生成完成；"
+            "服务端任务可能仍在运行，请稍后重试或使用已取得的 downloadUrl"
+        )
+    return poller.result()
+
+
+def resolve_billing_account_name(
+    billing_account_id: str, credential: Any
+) -> str:
+    """Resolve a Cost Export MCA account ID to its full Billing account name."""
+    if ":" in billing_account_id:
+        return billing_account_id
+    token = credential.get_token("https://management.azure.com/.default").token
+    request = urllib.request.Request(
+        "https://management.azure.com/providers/Microsoft.Billing/"
+        "billingAccounts?api-version=2020-05-01",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    with urllib.request.urlopen(request, timeout=120) as response:
+        payload = json.load(response)
+    names = [
+        str(item.get("name") or "")
+        for item in payload.get("value", [])
+        if isinstance(item, dict)
+    ]
+    matches = [
+        name
+        for name in names
+        if name == billing_account_id or name.startswith(f"{billing_account_id}:")
+    ]
+    if len(matches) != 1:
+        raise ValueError(
+            f"无法将 billingAccountId={billing_account_id!r} 唯一映射为完整 "
+            f"Billing Account Name（匹配数：{len(matches)}）；"
+            "请通过 --billing-account-name 显式指定"
+        )
+    return matches[0]
+
+
+def _authorized_json_request(
+    url: str, credential: Any, method: str = "GET"
+) -> tuple[Any, Any]:
+    token = credential.get_token("https://management.azure.com/.default").token
+    request = urllib.request.Request(
+        url,
+        data=b"" if method == "POST" else None,
+        headers={"Authorization": f"Bearer {token}"},
+        method=method,
+    )
+    with urllib.request.urlopen(request, timeout=120) as response:
+        body = response.read()
+        return response, json.loads(body) if body else {}
+
+
+def download_price_sheet_by_invoice(
+    billing_account_name: str,
+    billing_profile_id: str,
+    invoice_id: str,
+    credential: Any,
+    timeout: int,
+) -> Any:
+    """Run the invoice Price Sheet LRO using its Completed terminal status."""
+    quote = lambda value: urllib.parse.quote(value, safe=":-_")
+    url = (
+        "https://management.azure.com/providers/Microsoft.Billing/"
+        f"billingAccounts/{quote(billing_account_name)}/"
+        f"billingProfiles/{quote(billing_profile_id)}/"
+        f"invoices/{quote(invoice_id)}/providers/Microsoft.CostManagement/"
+        "pricesheets/default/download?api-version=2025-03-01"
+    )
+    response, payload = _authorized_json_request(url, credential, method="POST")
+    if getattr(response, "status", None) == 200:
+        return payload
+    if getattr(response, "status", None) != 202:
+        raise ValueError(
+            f"Azure Price Sheet API 返回非预期状态：{response.status}"
+        )
+
+    async_url = response.headers.get("Azure-AsyncOperation")
+    location_url = response.headers.get("Location")
+    if not async_url or not location_url:
+        raise ValueError(
+            "Azure Price Sheet API 的 202 响应缺少 "
+            "Azure-AsyncOperation 或 Location"
+        )
+    retry_after = int(response.headers.get("Retry-After") or "10")
+    deadline = time.monotonic() + timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(
+                f"Azure Price Sheet 在 {timeout} 秒内未生成完成；"
+                "服务端任务可能仍在运行，请稍后重试"
+            )
+        time.sleep(min(retry_after, remaining))
+        status_response, status_payload = _authorized_json_request(
+            async_url, credential
+        )
+        status = str(status_payload.get("status") or "").strip().lower()
+        if status in {"completed", "succeeded"}:
+            _final_response, final_payload = _authorized_json_request(
+                location_url, credential
+            )
+            return final_payload
+        if status in {"failed", "canceled", "cancelled"}:
+            raise ValueError(
+                f"Azure Price Sheet 生成失败，状态：{status_payload.get('status')}"
+            )
+        if getattr(status_response, "status", None) not in {200, 202}:
+            raise ValueError(
+                "Azure Price Sheet 状态查询返回非预期状态："
+                f"{status_response.status}"
+            )
+        retry_after = int(status_response.headers.get("Retry-After") or "10")
+
+
+def price_sheet_download_url(result: Any) -> str:
+    """Extract a temporary download URL from direct and wrapped API results."""
+    url = _model_value(result, "download_url", "downloadUrl")
+    if url:
+        return str(url)
+    properties = _model_value(result, "properties") or {}
+    url = _model_value(properties, "report_url", "reportUrl", "downloadUrl")
+    if url:
+        return str(url)
+    published = _model_value(result, "published_entity", "publishedEntity") or {}
+    published_properties = _model_value(published, "properties") or {}
+    return str(
+        _model_value(
+            published_properties, "download_url", "downloadUrl", "reportUrl"
+        )
+        or ""
+    )
+
+
+def download_price_sheet(
+    rows: list[dict[str, str]],
+    invoice_id: str | None = None,
+    billing_account_name: str | None = None,
+    timeout: int = 1800,
+    client: Any | None = None,
+    credential: Any | None = None,
+) -> bytes:
     """Download the applicable Azure Price Sheet through Cost Management SDK."""
     def unique(field: str, required: bool = True) -> str:
         values = {(row.get(field) or "").strip() for row in rows}
@@ -571,7 +835,9 @@ def download_price_sheet(rows: list[dict[str, str]], client: Any | None = None) 
 
     billing_account_id = unique("billingAccountId")
     billing_profile_id = unique("billingProfileId", required=False)
-    invoice_id = unique("invoiceId", required=False)
+    selected_invoice_id = (invoice_id or "").strip()
+    if not selected_invoice_id:
+        selected_invoice_id = unique("invoiceId", required=False)
     usage_dates = {
         parsed
         for row in rows
@@ -583,6 +849,8 @@ def download_price_sheet(rows: list[dict[str, str]], client: Any | None = None) 
     if len(periods) != 1:
         raise ValueError("输入账单跨多个自然月，请按月分批处理")
 
+    if timeout <= 0:
+        raise ValueError("price_sheet_timeout 必须大于 0")
     owns_client = client is None
     if client is None:
         try:
@@ -592,16 +860,42 @@ def download_price_sheet(rows: list[dict[str, str]], client: Any | None = None) 
             raise RuntimeError(
                 "自动下载 Azure Price Sheet 需要安装 requirements.txt 中的 Azure SDK"
             ) from exc
-        client = CostManagementClient(credential=AzureCliCredential())
+        credential = credential or AzureCliCredential()
+        client = CostManagementClient(credential=credential)
 
     try:
         if billing_profile_id:
-            if invoice_id:
-                result = client.price_sheet.begin_download_by_invoice(
-                    billing_account_name=billing_account_id,
-                    billing_profile_name=billing_profile_id,
-                    invoice_name=invoice_id,
-                ).result()
+            if selected_invoice_id:
+                account_name = (billing_account_name or "").strip()
+                if not account_name:
+                    if credential is None:
+                        raise ValueError(
+                            "自动解析完整 Billing Account Name 需要 Azure credential；"
+                            "传入自定义 client 时请同时传入 credential，或通过 "
+                            "--billing-account-name 显式指定"
+                        )
+                    account_name = resolve_billing_account_name(
+                        billing_account_id, credential
+                    )
+                print(
+                    f"正在生成 invoiceId={selected_invoice_id} 的 Azure Price Sheet，"
+                    f"最长等待 {timeout} 秒..."
+                )
+                if credential is not None:
+                    result = download_price_sheet_by_invoice(
+                        account_name,
+                        billing_profile_id,
+                        selected_invoice_id,
+                        credential,
+                        timeout,
+                    )
+                else:
+                    poller = client.price_sheet.begin_download_by_invoice(
+                        billing_account_name=account_name,
+                        billing_profile_name=billing_profile_id,
+                        invoice_name=selected_invoice_id,
+                    )
+                    result = wait_for_price_sheet(poller, timeout)
             else:
                 year_month = next(iter(periods))
                 current = datetime.now(timezone.utc)
@@ -610,21 +904,20 @@ def download_price_sheet(rows: list[dict[str, str]], client: Any | None = None) 
                         "历史 MCA/MPA 账单没有 invoiceId，无法自动取得对应历史 Price "
                         "Sheet；请通过 --price-sheet-file 提供该账期价格表"
                     )
-                result = client.price_sheet.begin_download_by_billing_profile(
+                poller = client.price_sheet.begin_download_by_billing_profile(
                     billing_account_name=billing_account_id,
                     billing_profile_name=billing_profile_id,
-                ).result()
+                )
+                result = wait_for_price_sheet(poller, timeout)
         else:
             year, month = next(iter(periods))
-            result = client.price_sheet.begin_download_by_billing_account(
+            poller = client.price_sheet.begin_download_by_billing_account(
                 billing_account_id=billing_account_id,
                 billing_period_name=f"{year:04d}{month:02d}",
-            ).result()
+            )
+            result = wait_for_price_sheet(poller, timeout)
 
-        url = _model_value(result, "download_url", "downloadUrl")
-        if not url:
-            properties = _model_value(result, "properties") or {}
-            url = _model_value(properties, "report_url", "reportUrl")
+        url = price_sheet_download_url(result)
         if not url:
             raise ValueError("Azure Price Sheet API 响应中缺少下载 URL")
         with urllib.request.urlopen(str(url), timeout=120) as response:
@@ -635,14 +928,28 @@ def download_price_sheet(rows: list[dict[str, str]], client: Any | None = None) 
 
 
 def load_price_sheet(
-    rows: list[dict[str, str]], price_sheet_file: str | None
+    rows: list[dict[str, str]],
+    price_sheet_file: str | None,
+    invoice_id: str | None = None,
+    billing_account_name: str | None = None,
+    timeout: int = 1800,
+    save_price_sheet_file: str | None = None,
 ) -> tuple[dict[str, list[PriceRate]], str]:
     if price_sheet_file:
         path = Path(price_sheet_file)
         if not path.is_file():
             raise FileNotFoundError(f"找不到 Azure Price Sheet：{path}")
         return parse_price_sheet(path.read_bytes(), str(path)), str(path)
-    payload = download_price_sheet(rows)
+    payload = download_price_sheet(
+        rows,
+        invoice_id=invoice_id,
+        billing_account_name=billing_account_name,
+        timeout=timeout,
+    )
+    if save_price_sheet_file:
+        target = Path(save_price_sheet_file)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(payload)
     return parse_price_sheet(payload, "Azure Cost Management API"), "Azure Cost Management API"
 
 
@@ -727,6 +1034,8 @@ def allocated_field_name(amount_field: str) -> str:
     使输出列货币与 --amount-field 一致，避免用非账单货币时列名产生误导。
     默认 costInBillingCurrency 仍产出 allocatedCostInBillingCurrency（向后兼容）。
     """
+    if amount_field == "costInBillingCurrencyAfterActualReconciliation":
+        return "allocatedCostInBillingCurrency"
     return "allocated" + amount_field[:1].upper() + amount_field[1:]
 
 
@@ -817,6 +1126,9 @@ def main() -> None:
         Decimal
     )
     ri_amount_by_key: defaultdict[pool_key_type, Decimal] = defaultdict(Decimal)
+    ri_amount_by_reservation_key: defaultdict[
+        tuple[pool_key_type, str], Decimal
+    ] = defaultdict(Decimal)
     ri_service_types: defaultdict[str, set[str]] = defaultdict(set)
     # RI 使用记录加回后的信息：加回金额、目标标签、以及作为接收方时的全价基数。
     ri_usage_indexes: set[int] = set()
@@ -836,16 +1148,30 @@ def main() -> None:
                 fieldnames = list(reader.fieldnames)
             elif fieldnames != list(reader.fieldnames):
                 raise ValueError(f"{input_path} 的 CSV 表头与其他输入文件不一致")
+            if args.amount_field not in reader.fieldnames:
+                raise ValueError(
+                    f"{input_path} 缺少成本基准字段 {args.amount_field!r}"
+                )
 
-            for row in reader:
+            for source_row_number, row in enumerate(reader, start=2):
                 total_rows += 1
                 row["_source_file"] = str(input_path)
+                row["_source_row_number"] = str(source_row_number)
                 rows.append(row)
 
-    price_rates, price_sheet_source = load_price_sheet(rows, args.price_sheet_file)
+    price_rates, price_sheet_source = load_price_sheet(
+        rows,
+        args.price_sheet_file,
+        invoice_id=args.invoice_id,
+        billing_account_name=args.billing_account_name,
+        timeout=args.price_sheet_timeout,
+        save_price_sheet_file=args.save_price_sheet_file,
+    )
     gross_by_index: dict[int, Decimal] = {}
     payg_by_index: dict[int, Decimal] = {}
     gross_by_reservation: defaultdict[str, Decimal] = defaultdict(Decimal)
+    benefit_by_reservation: defaultdict[str, Decimal] = defaultdict(Decimal)
+    excess_cost_by_reservation: defaultdict[str, Decimal] = defaultdict(Decimal)
     unused_by_reservation: defaultdict[str, Decimal] = defaultdict(Decimal)
 
     for row_index, row in enumerate(rows):
@@ -857,14 +1183,13 @@ def main() -> None:
             payg_equivalent = price_for_row(row, price_rates) * quantity
             amortized_cost = decimal_from_row(row, args.amount_field)
             gross_savings = payg_equivalent - amortized_cost
-            if gross_savings < 0:
-                raise ValueError(
-                    f"RI {reservation_id!r} 的 PAYG 等价成本 {payg_equivalent} "
-                    f"小于摊销成本 {amortized_cost}；请检查 Price Sheet 与账单账期"
-                )
             payg_by_index[row_index] = payg_equivalent
             gross_by_index[row_index] = gross_savings
             gross_by_reservation[reservation_id] += gross_savings
+            if gross_savings > 0:
+                benefit_by_reservation[reservation_id] += gross_savings
+            elif gross_savings < 0:
+                excess_cost_by_reservation[reservation_id] -= gross_savings
         elif (
             reservation_id in reservation_ids
             and row.get("chargeType") == "UnusedReservation"
@@ -906,9 +1231,12 @@ def main() -> None:
             ri_label_by_index[row_index] = label
             alloc_key = allocation_key(row, ri_modes[reservation_id])
             for target, contribution in contributions:
-                ri_amount_by_key[
-                    (ri_scopes[reservation_id], target, alloc_key)
-                ] += contribution
+                pool_key = (ri_scopes[reservation_id], target, alloc_key)
+                ri_amount_by_key[pool_key] += contribution
+                if contribution != 0:
+                    ri_amount_by_reservation_key[
+                        (pool_key, reservation_id)
+                    ] += contribution
             matched = [t for t in targets if has_target_tag(row, t)]
             if len(matched) > 1:
                 labels = "、".join("=".join(t) for t in matched)
@@ -982,25 +1310,55 @@ def main() -> None:
     # 某个分摊目标，则加回后再以全价参与该目标收益分摊，净额为加回金额减去应摊份额。
     allocation_by_index: dict[int, Decimal] = {}
     target_value_by_index: dict[int, str] = {}
+    allocation_details_by_index: defaultdict[
+        int, list[tuple[str, str, str, Decimal]]
+    ] = defaultdict(list)
     for index in ri_usage_indexes:
-        allocation_by_index[index] = ri_add_back_by_index[index]
+        add_back = ri_add_back_by_index[index]
+        allocation_by_index[index] = add_back
         target_value_by_index[index] = ri_label_by_index[index]
+        reservation_id = rows[index].get("reservationId", "").strip()
+        if reservation_id and add_back != 0:
+            allocation_details_by_index[index].append(
+                (
+                    "RI_USAGE_COST_REASSIGNED",
+                    ri_label_by_index[index],
+                    reservation_id,
+                    add_back,
+                )
+            )
 
     # 每条目标明细只承接相同分摊目标、相同机型和区域 RI 收益池中的金额；加回后的
     # RI 使用记录以全价基数参与，普通非 RI 明细以原始费用基数参与。
     for pool_key, indexes in target_non_ri_indexes.items():
         _scope, target, _alloc_key = pool_key
         key_ri_amount = ri_amount_by_key.get(pool_key, Decimal("0"))
-        # 没有 RI 收益可分摊（含仅有接收明细而无对应 RI 的池），保持金额不变。
+        # 没有 RI 收益或超额成本可分摊时保持金额不变。
         if key_ri_amount == 0:
             continue
         key_target_total = target_non_ri_total_by_key[pool_key]
         for index in indexes:
             basis = receiver_basis_by_index[index]
-            share = key_ri_amount * basis / key_target_total
-            allocation_by_index[index] = (
-                allocation_by_index.get(index, Decimal("0")) - share
-            )
+            for (
+                contribution_pool_key,
+                reservation_id,
+            ), reservation_amount in ri_amount_by_reservation_key.items():
+                if contribution_pool_key != pool_key:
+                    continue
+                share = reservation_amount * basis / key_target_total
+                if share == 0:
+                    continue
+                allocation_by_index[index] = (
+                    allocation_by_index.get(index, Decimal("0")) - share
+                )
+                allocation_details_by_index[index].append(
+                    (
+                        "RI_BENEFIT_ASSIGNED",
+                        target[1],
+                        reservation_id,
+                        -share,
+                    )
+                )
             # RI 使用记录本身也是接收方时保留其加回目标标签，其余用池目标标签。
             if index not in ri_usage_indexes:
                 target_value_by_index[index] = target[1]
@@ -1016,7 +1374,7 @@ def main() -> None:
             "riAllocationAmount",
             "riPaygEquivalentAmount",
             "riAmortizedCost",
-            "riGrossSavings",
+            "riBenefitOrLoss",
             "allocationType",
             "allocationTarget",
         ]
@@ -1034,6 +1392,7 @@ def main() -> None:
                 for index in range(row_offset, row_offset + source_row_count):
                     row = dict(rows[index])
                     row.pop("_source_file", None)
+                    row.pop("_source_row_number", None)
                     original = decimal_from_row(row, args.amount_field)
                     adjustment = allocation_by_index.get(index, Decimal("0"))
                     row[allocated_field] = str(
@@ -1043,23 +1402,19 @@ def main() -> None:
                     if index in ri_usage_indexes:
                         row["riPaygEquivalentAmount"] = str(payg_by_index[index])
                         row["riAmortizedCost"] = str(original)
-                        row["riGrossSavings"] = str(gross_by_index[index])
+                        row["riBenefitOrLoss"] = str(gross_by_index[index])
                     else:
                         row["riPaygEquivalentAmount"] = ""
                         row["riAmortizedCost"] = ""
-                        row["riGrossSavings"] = ""
+                        row["riBenefitOrLoss"] = ""
                     # RI 使用记录：其 RI 使用收益被重新分配（可能同时又接收了本项目应得
                     # 收益），净额可正可负；统一标记为 RI_USAGE_COST_REASSIGNED。
                     if index in ri_usage_indexes and adjustment != 0:
                         row["allocationType"] = "RI_USAGE_COST_REASSIGNED"
                         row["allocationTarget"] = target_value_by_index.get(index, "")
-                    # 负数表示把 RI 优惠收益分配给目标项目。
-                    elif adjustment < 0:
+                    # 非 RI 接收记录：负调整为收益，正调整为超额成本。
+                    elif adjustment != 0:
                         row["allocationType"] = "RI_BENEFIT_ASSIGNED"
-                        row["allocationTarget"] = target_value_by_index.get(index, "")
-                    # 兜底：非 RI 记录理论上不会出现正调整。
-                    elif adjustment > 0:
-                        row["allocationType"] = "RI_USAGE_COST_REASSIGNED"
                         row["allocationTarget"] = target_value_by_index.get(index, "")
                     else:
                         row["allocationType"] = ""
@@ -1067,10 +1422,61 @@ def main() -> None:
                     writer.writerow(row)
             row_offset += source_row_count
 
-    # 每个分摊目标承接的 RI 收益总额（按目标标签值汇总）。
+        allocation_details_path = output_dir / "ri-allocation-details.csv"
+        with allocation_details_path.open(
+            "w", encoding="utf-8", newline=""
+        ) as target:
+            writer = csv.writer(target)
+            writer.writerow(
+                [
+                    "sourceFile",
+                    "sourceRowNumber",
+                    "ResourceId",
+                    "allocationType",
+                    "allocationTarget",
+                    "riAllocationReservationIds",
+                    "allocationAmount",
+                ]
+            )
+            for index in sorted(allocation_details_by_index):
+                source_row = rows[index]
+                for (
+                    allocation_type,
+                    allocation_target,
+                    reservation_id,
+                    amount,
+                ) in sorted(
+                    allocation_details_by_index[index],
+                    key=lambda detail: (detail[0], detail[2]),
+                ):
+                    writer.writerow(
+                        [
+                            source_row["_source_file"],
+                            source_row["_source_row_number"],
+                            source_row.get("ResourceId")
+                            or source_row.get("resourceId")
+                            or "",
+                            allocation_type,
+                            allocation_target,
+                            reservation_id,
+                            str(amount),
+                        ]
+                    )
+        output_paths.append(str(allocation_details_path))
+
+    # 每个分摊目标承接的有符号 RI 经济差额（按目标标签值汇总）。
     assigned_by_target: defaultdict[str, Decimal] = defaultdict(Decimal)
     for (_scope, target, _alloc_key), key_ri_amount in ri_amount_by_key.items():
         assigned_by_target[target[1]] += key_ri_amount
+
+    ri_gross_benefit_total = sum(
+        (amount for amount in gross_by_index.values() if amount > 0),
+        Decimal("0"),
+    )
+    ri_excess_cost_total = -sum(
+        (amount for amount in gross_by_index.values() if amount < 0),
+        Decimal("0"),
+    )
 
     project_after = dict(project_before)
     for project, added_amount in project_ri.items():
@@ -1170,14 +1576,18 @@ def main() -> None:
         "riRawTotalAmount": str(ri_raw_total),
         "riPaygEquivalentAmount": str(ri_payg_total),
         "riAmortizedCost": str(ri_raw_total),
-        "riGrossSavings": str(ri_gross_savings_total),
+        "riGrossBenefit": str(ri_gross_benefit_total),
+        "riExcessCost": str(ri_excess_cost_total),
+        "riNetBenefitOrLoss": str(ri_gross_savings_total),
         "riUnusedCost": str(ri_unused_cost_total),
         "riPortfolioNetSavings": str(
             ri_gross_savings_total - ri_unused_cost_total
         ),
         "riSavingsByReservation": {
             reservation_id: {
-                "grossSavings": str(gross_by_reservation[reservation_id]),
+                "netBenefitOrLoss": str(gross_by_reservation[reservation_id]),
+                "grossBenefit": str(benefit_by_reservation[reservation_id]),
+                "excessCost": str(excess_cost_by_reservation[reservation_id]),
                 "unusedCost": str(unused_by_reservation[reservation_id]),
                 "portfolioNetSavings": str(
                     gross_by_reservation[reservation_id]
@@ -1221,8 +1631,10 @@ def main() -> None:
     print(f"分摊目标数：{len(targets)}")
     print(f"RI 使用记录：{ri_usage_rows} 条")
     print(f"RI PAYG 等价成本：{ri_payg_total}")
-    print(f"RI 摊销成本：{ri_raw_total}")
-    print(f"RI 使用毛收益：{ri_gross_savings_total}")
+    print(f"RI 成本基准（{args.amount_field}）：{ri_raw_total}")
+    print(f"RI 使用正收益：{ri_gross_benefit_total}")
+    print(f"RI 使用超额成本：{ri_excess_cost_total}")
+    print(f"RI 使用净收益/损失：{ri_gross_savings_total}")
     print(f"RI 未使用成本：{ri_unused_cost_total}")
     print(f"RI 组合净收益（仅汇总）：{ri_gross_savings_total - ri_unused_cost_total}")
     print(f"按 binding 待分摊使用收益：{ri_amount}")

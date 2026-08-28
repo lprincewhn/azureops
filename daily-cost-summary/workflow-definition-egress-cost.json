@@ -1,0 +1,305 @@
+{
+  "definition": {
+    "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
+    "contentVersion": "1.0.0.0",
+    "parameters": {
+      "$connections": {
+        "type": "Object",
+        "defaultValue": {}
+      },
+      "sender": {
+        "type": "String",
+        "defaultValue": "${EMAIL_SENDER}"
+      },
+      "recipients": {
+        "type": "String",
+        "defaultValue": "${LA_RECIPIENTS}"
+      }
+    },
+    "triggers": {
+      "Recurrence": {
+        "type": "Recurrence",
+        "recurrence": {
+          "frequency": "Day",
+          "interval": 1,
+          "timeZone": "UTC",
+          "schedule": {
+            "hours": [
+              2
+            ],
+            "minutes": [
+              0
+            ]
+          }
+        }
+      }
+    },
+    "actions": {
+      "Query_detail": {
+        "type": "Http",
+        "inputs": {
+          "method": "POST",
+          "uri": "https://management.azure.com/${COST_SCOPE}/providers/Microsoft.CostManagement/query?api-version=2023-11-01",
+          "authentication": {
+            "type": "ManagedServiceIdentity",
+            "audience": "https://management.azure.com/"
+          },
+          "body": {
+            "type": "ActualCost",
+            "timeframe": "Custom",
+            "timePeriod": {
+              "from": "@{formatDateTime(addDays(utcNow(), -1), 'yyyy-MM-ddT00:00:00Z')}",
+              "to": "@{formatDateTime(addDays(utcNow(), -1), 'yyyy-MM-ddT23:59:59Z')}"
+            },
+            "dataset": {
+              "granularity": "None",
+              "aggregation": {
+                "totalCost": {
+                  "name": "PreTaxCost",
+                  "function": "Sum"
+                }
+              },
+              "filter": {
+                "dimensions": {
+                  "name": "MeterCategory",
+                  "operator": "In",
+                  "values": [
+                    "${METER_CATEGORY}"
+                  ]
+                }
+              },
+              "grouping": [
+                {
+                  "type": "Dimension",
+                  "name": "SubscriptionName"
+                }
+              ]
+            }
+          },
+          "retryPolicy": {
+            "type": "exponential",
+            "count": 4,
+            "interval": "PT20S"
+          }
+        }
+      },
+      "Query_yesterday_total": {
+        "type": "Http",
+        "inputs": {
+          "method": "POST",
+          "uri": "https://management.azure.com/${COST_SCOPE}/providers/Microsoft.CostManagement/query?api-version=2023-11-01",
+          "authentication": {
+            "type": "ManagedServiceIdentity",
+            "audience": "https://management.azure.com/"
+          },
+          "body": {
+            "type": "ActualCost",
+            "timeframe": "Custom",
+            "timePeriod": {
+              "from": "@{formatDateTime(addDays(utcNow(), -1), 'yyyy-MM-ddT00:00:00Z')}",
+              "to": "@{formatDateTime(addDays(utcNow(), -1), 'yyyy-MM-ddT23:59:59Z')}"
+            },
+            "dataset": {
+              "granularity": "None",
+              "aggregation": {
+                "totalCost": {
+                  "name": "PreTaxCost",
+                  "function": "Sum"
+                }
+              },
+              "filter": {
+                "dimensions": {
+                  "name": "MeterCategory",
+                  "operator": "In",
+                  "values": [
+                    "${METER_CATEGORY}"
+                  ]
+                }
+              }
+            }
+          },
+          "retryPolicy": {
+            "type": "exponential",
+            "count": 4,
+            "interval": "PT20S"
+          }
+        },
+        "runAfter": {
+          "Query_detail": [
+            "Succeeded"
+          ]
+        }
+      },
+      "Query_prev_total": {
+        "type": "Http",
+        "inputs": {
+          "method": "POST",
+          "uri": "https://management.azure.com/${COST_SCOPE}/providers/Microsoft.CostManagement/query?api-version=2023-11-01",
+          "authentication": {
+            "type": "ManagedServiceIdentity",
+            "audience": "https://management.azure.com/"
+          },
+          "body": {
+            "type": "ActualCost",
+            "timeframe": "Custom",
+            "timePeriod": {
+              "from": "@{formatDateTime(addDays(utcNow(), -2), 'yyyy-MM-ddT00:00:00Z')}",
+              "to": "@{formatDateTime(addDays(utcNow(), -2), 'yyyy-MM-ddT23:59:59Z')}"
+            },
+            "dataset": {
+              "granularity": "None",
+              "aggregation": {
+                "totalCost": {
+                  "name": "PreTaxCost",
+                  "function": "Sum"
+                }
+              },
+              "filter": {
+                "dimensions": {
+                  "name": "MeterCategory",
+                  "operator": "In",
+                  "values": [
+                    "${METER_CATEGORY}"
+                  ]
+                }
+              }
+            }
+          },
+          "retryPolicy": {
+            "type": "exponential",
+            "count": 4,
+            "interval": "PT20S"
+          }
+        },
+        "runAfter": {
+          "Query_yesterday_total": [
+            "Succeeded"
+          ]
+        }
+      },
+      "Compose_total": {
+        "type": "Compose",
+        "runAfter": {
+          "Query_prev_total": [
+            "Succeeded"
+          ]
+        },
+        "inputs": "@if(greater(length(coalesce(body('Query_yesterday_total')?['properties']?['rows'],json('[]'))),0),float(first(coalesce(body('Query_yesterday_total')?['properties']?['rows'],json('[]')))?[0]),0)"
+      },
+      "Compose_currency": {
+        "type": "Compose",
+        "runAfter": {
+          "Compose_total": [
+            "Succeeded"
+          ]
+        },
+        "inputs": "@if(greater(length(coalesce(body('Query_yesterday_total')?['properties']?['rows'],json('[]'))),0),coalesce(first(coalesce(body('Query_yesterday_total')?['properties']?['rows'],json('[]')))?[1],'USD'),'USD')"
+      },
+      "Compose_prev": {
+        "type": "Compose",
+        "runAfter": {
+          "Compose_currency": [
+            "Succeeded"
+          ]
+        },
+        "inputs": "@if(greater(length(coalesce(body('Query_prev_total')?['properties']?['rows'],json('[]'))),0),float(first(coalesce(body('Query_prev_total')?['properties']?['rows'],json('[]')))?[0]),0)"
+      },
+      "Compose_pctnum": {
+        "type": "Compose",
+        "runAfter": {
+          "Compose_prev": [
+            "Succeeded"
+          ]
+        },
+        "inputs": "@mul(div(sub(outputs('Compose_total'),outputs('Compose_prev')),if(equals(outputs('Compose_prev'),0),1,outputs('Compose_prev'))),100)"
+      },
+      "Compose_pct_text": {
+        "type": "Compose",
+        "runAfter": {
+          "Compose_pctnum": [
+            "Succeeded"
+          ]
+        },
+        "inputs": "@if(equals(outputs('Compose_prev'),0),if(equals(outputs('Compose_total'),0),'0.00%（与前一天持平，均为 0）','—（前一天无费用，无法计算百分比）'),concat(if(greaterOrEquals(outputs('Compose_pctnum'),0),'▲ +','▼ -'),formatNumber(if(greaterOrEquals(outputs('Compose_pctnum'),0),outputs('Compose_pctnum'),mul(outputs('Compose_pctnum'),-1)),'F2'),'%'))"
+      },
+      "Select_rows": {
+        "type": "Select",
+        "runAfter": {
+          "Compose_pct_text": [
+            "Succeeded"
+          ]
+        },
+        "inputs": {
+          "from": "@coalesce(body('Query_detail')?['properties']?['rows'],json('[]'))",
+          "select": "@concat('<tr><td style=\"padding:4px 10px;border:1px solid #ddd\">',string(item()?[1]),'</td><td style=\"padding:4px 10px;border:1px solid #ddd;text-align:right\">',formatNumber(float(item()?[0]),'F4'),' ',string(item()?[2]),'</td></tr>')"
+        }
+      },
+      "Compose_table": {
+        "type": "Compose",
+        "runAfter": {
+          "Select_rows": [
+            "Succeeded"
+          ]
+        },
+        "inputs": "@if(greater(length(coalesce(body('Query_detail')?['properties']?['rows'],json('[]'))),0),concat('<table style=\"border-collapse:collapse;font-size:13px;margin:4px 0\"><thead><tr><th style=\"padding:4px 10px;border:1px solid #ddd;text-align:left;background:#f4f4f4\">订阅</th><th style=\"padding:4px 10px;border:1px solid #ddd;text-align:right;background:#f4f4f4\">费用</th></tr></thead><tbody>',join(body('Select_rows'),''),'</tbody></table>'),'<p style=\"color:#888\">（前一天无出网费用明细）</p>')"
+      },
+      "Select_recipients": {
+        "type": "Select",
+        "runAfter": {
+          "Compose_table": [
+            "Succeeded"
+          ]
+        },
+        "inputs": {
+          "from": "@split(parameters('recipients'), ';')",
+          "select": {
+            "address": "@trim(item())"
+          }
+        }
+      },
+      "Send_email": {
+        "type": "ApiConnection",
+        "runAfter": {
+          "Select_recipients": [
+            "Succeeded"
+          ]
+        },
+        "inputs": {
+          "host": {
+            "connection": {
+              "name": "@parameters('$connections')['acsemail']['connectionId']"
+            }
+          },
+          "method": "post",
+          "path": "/emails:sendGAVersion",
+          "queries": {
+            "api-version": "2023-03-31"
+          },
+          "body": {
+            "senderAddress": "@parameters('sender')",
+            "recipients": {
+              "to": "@body('Select_recipients')"
+            },
+            "content": {
+              "subject": "@{concat('[出网费用] ',formatDateTime(addDays(utcNow(),-1),'yyyy-MM-dd'),' 合计 ',formatNumber(outputs('Compose_total'),'F4'),' ',outputs('Compose_currency'),'（较前一天 ',outputs('Compose_pct_text'),'）')}",
+              "html": "@concat('<div style=\"font-family:Segoe UI,Arial,sans-serif;font-size:14px;color:#222\">','<h3 style=\"margin:0 0 8px\">出网流量费用日报 · ',formatDateTime(addDays(utcNow(),-1),'yyyy-MM-dd'),'</h3>','<p>合计：<b>',formatNumber(outputs('Compose_total'),'F4'),' ',outputs('Compose_currency'),'</b></p>','<p>较前一天（',formatDateTime(addDays(utcNow(),-2),'yyyy-MM-dd'),'）：<b>',outputs('Compose_pct_text'),'</b>（前一天合计 ',formatNumber(outputs('Compose_prev'),'F4'),' ',outputs('Compose_currency'),'）</p>','<h4 style=\"margin:12px 0 4px\">分项明细（按订阅）</h4>',outputs('Compose_table'),'<p style=\"color:#888;font-size:12px;margin-top:12px\">由 Logic App 自动生成（数据来源：Azure Cost Management）。</p>','</div>')"
+            },
+            "importance": "Normal"
+          }
+        }
+      }
+    },
+    "outputs": {}
+  },
+  "parameters": {
+    "$connections": {
+      "value": {
+        "acsemail": {
+          "connectionId": "${CONN_ID}",
+          "connectionName": "${CONN_NAME}",
+          "id": "${API_ID}"
+        }
+      }
+    }
+  }
+}

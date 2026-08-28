@@ -81,7 +81,7 @@ def project_from_row(row: dict[str, str], project_tag_key: str) -> str:
 
 def discover_allocated_csvs(input_dir: Path) -> list[Path]:
     result: list[Path] = []
-    required = {"reservationId", "riGrossSavings", "tags"}
+    required = {"reservationId", "riBenefitOrLoss", "tags"}
     for path in sorted(input_dir.glob("*.csv")):
         with path.open(encoding="utf-8-sig", newline="") as source:
             fieldnames = set(csv.DictReader(source).fieldnames or [])
@@ -110,8 +110,8 @@ def load_summary(
         raise ValueError("ri-summary.json 的 riSavingsByReservation 不是对象")
     gross_by_reservation = {
         reservation_id: decimal_value(
-            (savings.get(reservation_id) or {}).get("grossSavings"),
-            f"riSavingsByReservation.{reservation_id}.grossSavings",
+            (savings.get(reservation_id) or {}).get("netBenefitOrLoss"),
+            f"riSavingsByReservation.{reservation_id}.netBenefitOrLoss",
         )
         for reservation_id in ids
     }
@@ -238,7 +238,7 @@ def build_distribution(
                     and row.get("pricingModel") == "Reservation"
                 )
                 has_calculated_savings = bool(
-                    (row.get("riGrossSavings") or "").strip()
+                    (row.get("riBenefitOrLoss") or "").strip()
                 )
                 if reservation_id and (is_ri_usage or has_calculated_savings):
                     reservation_name = (row.get("reservationName") or "").strip()
@@ -261,7 +261,7 @@ def build_distribution(
                         row.get("riAmortizedCost"), "riAmortizedCost"
                     )
                     gross_savings = decimal_value(
-                        row.get("riGrossSavings"), "riGrossSavings"
+                        row.get("riBenefitOrLoss"), "riBenefitOrLoss"
                     )
                 else:
                     if price_rates is None:
@@ -454,7 +454,7 @@ def build_distribution(
                         amortized_by_reservation[reservation_id]
                     ),
                     "riAmortizedCost": str(amortized_by_reservation[reservation_id]),
-                    "grossSavings": str(total),
+                    "netBenefitOrLoss": str(total),
                     "beforeBenefit": str(before_amount),
                     "beforeShare": str(before_amount / total if total else ZERO),
                     "afterBenefit": str(after_amount),
@@ -473,7 +473,7 @@ def build_distribution(
         "riAmortizedCostBeforeActualReconciliation",
         "riAmortizedCostAfterActualReconciliation",
         "riAmortizedCost",
-        "grossSavings",
+        "netBenefitOrLoss",
         "beforeBenefit",
         "beforeShare",
         "afterBenefit",
@@ -532,7 +532,7 @@ def write_html_report(
         if not ri_rows:
             continue
         name = ri_rows[0]["reservationName"]
-        total = Decimal(ri_rows[0]["grossSavings"])
+        total = Decimal(ri_rows[0]["netBenefitOrLoss"])
         payg_cost = Decimal(ri_rows[0]["paygEquivalentCost"])
         amortized_cost_before = Decimal(
             ri_rows[0]["riAmortizedCostBeforeActualReconciliation"]

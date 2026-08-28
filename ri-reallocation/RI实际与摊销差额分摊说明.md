@@ -318,3 +318,29 @@ Amortized RI Cost = 100
 7. 如果不同输入目录中存在同名 Amortized CSV，输出时可能使用相同文件名，请分别指定输出目录以避免覆盖。
 8. 完全未使用且差额不为 0 的 RI 没有虚拟机 Usage 行可承接，脚本会报错。
 9. 本脚本处理的是 RI 实际成本与摊销成本的对齐，不计算 PAYG 原价，也不计算或分配真实 RI 优惠收益。
+
+## 12. 与 RI 经济责任重分配配合
+
+需要完整重分配 RI 的收益和超额成本时，本脚本必须先执行。随后将本脚本输出的
+Amortized 明细交给 `reallocate_vm_ri.py`，并显式指定调整后成本字段：
+
+```bash
+python3 reallocate_vm_ri.py \
+  "ri_reallocated/Amortized_*.csv" \
+  --reservations-file reservations.json \
+  --project-tag-key projname \
+  --amount-field costInBillingCurrencyAfterActualReconciliation \
+  --price-sheet-file azure-price-sheet.json \
+  --output-dir ri_economic_reallocated
+```
+
+`reallocate_vm_ri.py` 将按以下口径计算有符号经济差额：
+
+```text
+RI净收益/损失
+= PAYG等价成本
+− costInBillingCurrencyAfterActualReconciliation
+```
+
+正数作为 RI 收益分配给绑定项目，负数作为 RI 超额成本由绑定项目承担。最终结果写入
+`allocatedCostInBillingCurrency`，因此无需手工合并两个脚本的调整列。
