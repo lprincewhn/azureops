@@ -19,6 +19,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import redis
+from azure.core.exceptions import AzureError
 
 import exporter
 
@@ -430,12 +431,13 @@ class TestSendToLogAnalytics:
                 assert field in row, f"Missing Log Analytics field: {field}"
 
     # TC-36
-    def test_upload_failure_does_not_propagate_exception(self, monkeypatch):
+    def test_upload_failure_propagates_to_caller(self, monkeypatch):
         monkeypatch.setattr(exporter, "DCR_RULE_ID", "dcr-123")
         mock_client = MagicMock()
-        mock_client.upload.side_effect = Exception("network error")
+        mock_client.upload.side_effect = AzureError("network error")
         with patch.object(exporter, "_get_logs_client", return_value=mock_client):
-            exporter.send_to_log_analytics([make_formatted_entry(1)])  # must not raise
+            with pytest.raises(AzureError, match="network error"):
+                exporter.send_to_log_analytics([make_formatted_entry(1)])
 
 
 # ── TC-37 ~ TC-43  Multi-cluster config loading ───────────────────────────────

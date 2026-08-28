@@ -23,6 +23,7 @@ from pathlib import Path
 
 import pytest
 import redis as redis_lib
+from azure.core.exceptions import AzureError
 
 import exporter
 
@@ -124,7 +125,7 @@ class UploadCapture:
 
     def upload(self, rule_id: str, stream_name: str, logs: list) -> None:
         if self._fail:
-            raise Exception("simulated upload failure")
+            raise AzureError("simulated upload failure")
         self.batches.append(list(logs))
 
     @property
@@ -196,14 +197,18 @@ class ExporterRun:
         self.state = exporter.load_state()
 
     def poll(self, client) -> list[dict]:
-        new_entries, self.state = exporter.fetch_new_entries(client, self.state)
+        new_entries, next_state = exporter.fetch_new_entries(client, self.state)
         if not new_entries:
             return []
         exported_at = datetime.now(tz=timezone.utc).isoformat()
         formatted = [exporter.format_entry(e, exported_at) for e in new_entries]
         exporter.append_to_jsonl(formatted)
-        exporter.send_to_log_analytics(formatted)
-        exporter.save_state(self.state)
+        try:
+            exporter.send_to_log_analytics(formatted)
+        except AzureError:
+            return formatted
+        exporter.save_state(next_state)
+        self.state = next_state
         return formatted
 
 
@@ -360,15 +365,24 @@ class TestEnterpriseE2E:
         assert read_state() == {"last_id": 2}          # counter continues from new base
 
     # E2E-09 ──────────────────────────────────────────────────────────────────
-    def test_upload_failure_still_persists_jsonl_and_state(self, env, failing_capture):
-        """If Log Analytics upload fails (silently), JSONL and state file are still written."""
+    def test_upload_failure_retries_without_advancing_state(self, env, failing_capture):
+        """A failed upload leaves the cursor unchanged so the next poll retries the batch."""
         sl = FakeSlowlog()
         sl.add(1, command=b"GET key", duration_us=9_000)
+        client = FakeEnterpriseClient(sl)
+        run = ExporterRun()
 
-        ExporterRun().poll(FakeEnterpriseClient(sl))
+        run.poll(client)
 
         assert len(read_jsonl()) == 1
+        assert read_state() == {}
+        assert failing_capture.total == 0
+
+        failing_capture._fail = False
+        run.poll(client)
+
         assert read_state() == {"last_id": 1}
+        assert failing_capture.total == 1
 
     # E2E-10 ──────────────────────────────────────────────────────────────────
     def test_jsonl_row_has_correct_field_types_and_values(self, env, capture):

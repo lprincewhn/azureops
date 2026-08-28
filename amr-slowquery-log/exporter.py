@@ -24,6 +24,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import redis
+from azure.core.exceptions import AzureError
 from azure.identity import WorkloadIdentityCredential
 from azure.monitor.ingestion import LogsIngestionClient
 from dotenv import load_dotenv
@@ -315,15 +316,12 @@ def send_to_log_analytics(entries: list[dict]) -> None:
         }
         for e in entries
     ]
-    try:
-        _get_logs_client().upload(
-            rule_id=DCR_RULE_ID,
-            stream_name=DCR_STREAM_NAME,
-            logs=body,
-        )
-        log.info("Sent %d entries to Log Analytics", len(body))
-    except Exception as exc:
-        log.error("Failed to send to Log Analytics: %s", exc)
+    _get_logs_client().upload(
+        rule_id=DCR_RULE_ID,
+        stream_name=DCR_STREAM_NAME,
+        logs=body,
+    )
+    log.info("Sent %d entries to Log Analytics", len(body))
 
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
@@ -414,13 +412,21 @@ def main() -> None:
     try:
         while True:
             try:
-                new_entries, state = fetch_new_entries(client, state)
+                new_entries, next_state = fetch_new_entries(client, state)
                 if new_entries:
                     exported_at = datetime.now(tz=timezone.utc).isoformat()
                     formatted = [format_entry(e, exported_at) for e in new_entries]
                     append_to_jsonl(formatted)
-                    send_to_log_analytics(formatted)
-                    save_state(state)
+                    try:
+                        send_to_log_analytics(formatted)
+                    except AzureError as exc:
+                        log.error(
+                            "Failed to send to Log Analytics; cursor not advanced: %s",
+                            exc,
+                        )
+                    else:
+                        save_state(next_state)
+                        state = next_state
                 else:
                     log.debug("No new slow query entries")
 
