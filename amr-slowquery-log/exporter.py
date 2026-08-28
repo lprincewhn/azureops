@@ -13,6 +13,7 @@ Connection notes:
     or query each node separately.
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -24,7 +25,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import redis
-from azure.core.exceptions import AzureError
 from azure.identity import WorkloadIdentityCredential
 from azure.monitor.ingestion import LogsIngestionClient
 from dotenv import load_dotenv
@@ -260,6 +260,21 @@ def _decode(val) -> str:
     return val or ""
 
 
+def _entry_fingerprint(entry: dict) -> str:
+    """Identify a SLOWLOG row across retries without relying on its recyclable ID."""
+    identity = {
+        "id": entry.get("id"),
+        "start_time": entry.get("start_time"),
+        "duration": entry.get("duration"),
+        "command": _decode(entry.get("command")),
+        "client_address": _decode(entry.get("client_address")),
+        "client_name": _decode(entry.get("client_name")),
+        "node": entry.get("_node"),
+    }
+    encoded = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def format_entry(entry: dict, exported_at: str) -> dict:
     ts = entry.get("start_time", 0)
     duration_us = entry.get("duration", 0)
@@ -292,15 +307,35 @@ def _jsonl_append_indexes(entries: list[dict], state: dict) -> tuple[list[int], 
     if AMR_CLUSTER_POLICY != "oss":
         last_id = jsonl_state.get("last_id", -1)
         max_id = max(entry["id"] for entry in entries)
-        reset = 0 < last_id and max_id < last_id
+        fingerprints = dict(jsonl_state.get("fingerprints", {}))
+        overlap = [entry for entry in entries if entry["id"] <= last_id]
+        reset = bool(overlap) and (
+            not fingerprints
+            or any(
+                fingerprints.get(str(entry["id"])) != _entry_fingerprint(entry)
+                for entry in overlap
+            )
+        )
         indexes = [
             index
             for index, entry in enumerate(entries)
             if reset or entry["id"] > last_id
         ]
-        return indexes, {"last_id": max_id if reset else max(last_id, max_id)}
+        if reset:
+            fingerprints = {}
+        fingerprints.update(
+            {str(entry["id"]): _entry_fingerprint(entry) for entry in entries}
+        )
+        return indexes, {
+            "last_id": max_id if reset else max(last_id, max_id),
+            "fingerprints": fingerprints,
+        }
 
     node_last_ids = dict(jsonl_state.get("nodes", {}))
+    node_fingerprints = {
+        node: dict(fingerprints)
+        for node, fingerprints in jsonl_state.get("fingerprints", {}).items()
+    }
     by_node: dict[str, list[tuple[int, dict]]] = {}
     for index, entry in enumerate(entries):
         by_node.setdefault(entry["_node"], []).append((index, entry))
@@ -309,16 +344,33 @@ def _jsonl_append_indexes(entries: list[dict], state: dict) -> tuple[list[int], 
     for node, node_entries in by_node.items():
         last_id = node_last_ids.get(node, -1)
         max_id = max(entry["id"] for _, entry in node_entries)
-        reset = 0 < last_id and max_id < last_id
+        fingerprints = node_fingerprints.get(node, {})
+        overlap = [entry for _, entry in node_entries if entry["id"] <= last_id]
+        reset = bool(overlap) and (
+            not fingerprints
+            or any(
+                fingerprints.get(str(entry["id"])) != _entry_fingerprint(entry)
+                for entry in overlap
+            )
+        )
         indexes.extend(
             index
             for index, entry in node_entries
             if reset or entry["id"] > last_id
         )
         node_last_ids[node] = max_id if reset else max(last_id, max_id)
+        if reset:
+            fingerprints = {}
+        fingerprints.update(
+            {str(entry["id"]): _entry_fingerprint(entry) for _, entry in node_entries}
+        )
+        node_fingerprints[node] = fingerprints
 
     indexes.sort()
-    return indexes, {"nodes": node_last_ids}
+    return indexes, {
+        "nodes": node_last_ids,
+        "fingerprints": node_fingerprints,
+    }
 
 
 # ── Azure Monitor Log Analytics ───────────────────────────────────────────────
@@ -363,6 +415,35 @@ def send_to_log_analytics(entries: list[dict]) -> None:
 
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
+
+
+def run_once(client: redis.Redis, state: dict) -> tuple[list[dict], dict]:
+    """Run one poll, returning the formatted entries and resulting durable state."""
+    new_entries, next_state = fetch_new_entries(client, state)
+    if not new_entries:
+        log.debug("No new slow query entries")
+        return [], state
+
+    exported_at = datetime.now(tz=timezone.utc).isoformat()
+    formatted = [format_entry(entry, exported_at) for entry in new_entries]
+    append_indexes, jsonl_state = _jsonl_append_indexes(new_entries, state)
+    append_to_jsonl([formatted[index] for index in append_indexes])
+
+    pending_state = dict(state)
+    pending_state["_jsonl"] = jsonl_state
+    save_state(pending_state)
+
+    try:
+        send_to_log_analytics(formatted)
+    except Exception as exc:
+        log.error(
+            "Failed to send to Log Analytics; cursor not advanced: %s",
+            exc,
+        )
+        return formatted, pending_state
+
+    save_state(next_state)
+    return formatted, next_state
 
 
 class _Stop(Exception):
@@ -450,32 +531,7 @@ def main() -> None:
     try:
         while True:
             try:
-                new_entries, next_state = fetch_new_entries(client, state)
-                if new_entries:
-                    exported_at = datetime.now(tz=timezone.utc).isoformat()
-                    formatted = [format_entry(e, exported_at) for e in new_entries]
-                    append_indexes, jsonl_state = _jsonl_append_indexes(
-                        new_entries, state
-                    )
-                    append_to_jsonl([formatted[index] for index in append_indexes])
-
-                    pending_state = dict(state)
-                    pending_state["_jsonl"] = jsonl_state
-                    save_state(pending_state)
-                    state = pending_state
-
-                    try:
-                        send_to_log_analytics(formatted)
-                    except AzureError as exc:
-                        log.error(
-                            "Failed to send to Log Analytics; cursor not advanced: %s",
-                            exc,
-                        )
-                    else:
-                        save_state(next_state)
-                        state = next_state
-                else:
-                    log.debug("No new slow query entries")
+                _, state = run_once(client, state)
 
             except redis.ConnectionError as exc:
                 log.warning("Connection lost: %s — reconnecting in 10s", exc)
