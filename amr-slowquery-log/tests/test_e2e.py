@@ -13,8 +13,8 @@ a new ExporterRun() reloads from disk, so restart deduplication is exercised for
 Test groups
 -----------
 E2E-01 ~ E2E-11   Enterprise cluster mode  (single endpoint)
-E2E-12 ~ E2E-17   OSS cluster mode         (multi-shard, per-node state)
-E2E-18 ~ E2E-19   StatefulSet multi-cluster config loading
+E2E-12 ~ E2E-18   OSS cluster mode         (multi-shard, per-node state)
+E2E-19 ~ E2E-20   StatefulSet multi-cluster config loading
 """
 
 import json
@@ -202,7 +202,14 @@ class ExporterRun:
             return []
         exported_at = datetime.now(tz=timezone.utc).isoformat()
         formatted = [exporter.format_entry(e, exported_at) for e in new_entries]
-        exporter.append_to_jsonl(formatted)
+        append_indexes, jsonl_state = exporter._jsonl_append_indexes(
+            new_entries, self.state
+        )
+        exporter.append_to_jsonl([formatted[index] for index in append_indexes])
+        pending_state = dict(self.state)
+        pending_state["_jsonl"] = jsonl_state
+        exporter.save_state(pending_state)
+        self.state = pending_state
         try:
             exporter.send_to_log_analytics(formatted)
         except AzureError:
@@ -375,12 +382,13 @@ class TestEnterpriseE2E:
         run.poll(client)
 
         assert len(read_jsonl()) == 1
-        assert read_state() == {}
+        assert read_state() == {"_jsonl": {"last_id": 1}}
         assert failing_capture.total == 0
 
         failing_capture._fail = False
-        run.poll(client)
+        ExporterRun().poll(client)
 
+        assert len(read_jsonl()) == 1
         assert read_state() == {"last_id": 1}
         assert failing_capture.total == 1
 
@@ -442,7 +450,7 @@ class TestEnterpriseE2E:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# OSS cluster mode E2E  (TC E2E-12 ~ E2E-17)
+# OSS cluster mode E2E  (TC E2E-12 ~ E2E-18)
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -558,9 +566,47 @@ class TestOssE2E:
         timestamps = [r["timestamp"] for r in read_jsonl()]
         assert timestamps == sorted(timestamps)    # ISO 8601 UTC sorts lexicographically
 
+    # E2E-18 ──────────────────────────────────────────────────────────────────
+    def test_oss_upload_retry_after_restart_does_not_duplicate_jsonl(
+        self, failing_capture
+    ):
+        """Persisted per-shard backup cursors prevent duplicate rows on retry."""
+        shard_a = FakeSlowlog()
+        shard_a.add(1, command=b"GET a")
+        shard_b = FakeSlowlog()
+        shard_b.add(4, command=b"GET b")
+        client = FakeOssClient({
+            "shard-0:10000": shard_a,
+            "shard-1:10000": shard_b,
+        })
+
+        ExporterRun().poll(client)
+
+        assert len(read_jsonl()) == 2
+        assert read_state() == {
+            "_jsonl": {
+                "nodes": {
+                    "shard-0:10000": 1,
+                    "shard-1:10000": 4,
+                }
+            }
+        }
+
+        failing_capture._fail = False
+        ExporterRun().poll(client)
+
+        assert len(read_jsonl()) == 2
+        assert read_state() == {
+            "nodes": {
+                "shard-0:10000": 1,
+                "shard-1:10000": 4,
+            }
+        }
+        assert failing_capture.total == 2
+
 
 # ─────────────────────────────────────────────────────────────────────────────
-# StatefulSet multi-cluster config E2E  (TC E2E-18 ~ E2E-19)
+# StatefulSet multi-cluster config E2E  (TC E2E-19 ~ E2E-20)
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -584,7 +630,7 @@ class TestMultiClusterE2E:
             monkeypatch.setattr(exporter, attr, getattr(exporter, attr))
         exporter._load_cluster_config()
 
-    # E2E-18 ──────────────────────────────────────────────────────────────────
+    # E2E-19 ──────────────────────────────────────────────────────────────────
     def test_pod0_exports_entries_tagged_with_its_cluster_name(self, env, capture, monkeypatch):
         """Pod-0 loads clusters[0] from clusters.json; JSONL rows carry that cluster's
         name and host, not the values from the other cluster entry."""
@@ -607,7 +653,7 @@ class TestMultiClusterE2E:
         assert row["cluster_name"] == "prod-a"
         assert row["redis_host"]   == "prod-a.redis.azure.net"
 
-    # E2E-19 ──────────────────────────────────────────────────────────────────
+    # E2E-20 ──────────────────────────────────────────────────────────────────
     def test_pod1_exports_entries_tagged_with_its_cluster_name(self, env, capture, monkeypatch):
         """Pod-1 loads clusters[1]; JSONL rows carry that cluster's name and host."""
         clusters = [
