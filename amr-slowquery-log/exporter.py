@@ -25,6 +25,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import redis
+from azure.core.exceptions import AzureError
 from azure.identity import WorkloadIdentityCredential
 from azure.monitor.ingestion import LogsIngestionClient
 from dotenv import load_dotenv
@@ -184,6 +185,65 @@ def _filter_new(raw: list, last_id: int, node: str) -> tuple[list, int]:
     return list(reversed(new)), max(e["id"] for e in new)
 
 
+def _entry_content_fingerprint(entry: dict) -> str:
+    """Identify repeated command content independently of the recyclable ID."""
+    identity = {
+        "start_time": entry.get("start_time"),
+        "duration": entry.get("duration"),
+        "command": _decode(entry.get("command")),
+        "client_address": _decode(entry.get("client_address")),
+        "client_name": _decode(entry.get("client_name")),
+        "node": entry.get("_node"),
+    }
+    encoded = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _jsonl_cursor_reset(
+    raw: list,
+    last_id: int,
+    fingerprints: dict | None,
+    node: str,
+) -> bool:
+    """Detect a new SLOWLOG generation against the persisted backup cursor."""
+    if not raw or last_id <= 0:
+        return False
+
+    max_id = max(entry["id"] for entry in raw)
+    if max_id < last_id:
+        return True
+
+    overlap = [entry for entry in raw if entry["id"] <= last_id]
+    if not overlap:
+        return False
+
+    if fingerprints and any(
+        fingerprints.get(str(entry["id"])) != _entry_fingerprint(entry)
+        for entry in overlap
+    ):
+        return True
+
+    # AMR can return rows with no generation-distinguishing fields. In that
+    # irreducibly ambiguous case, prefer re-exporting a uniform burst over
+    # silently losing an entire post-reset generation.
+    signatures = {_entry_content_fingerprint(entry) for entry in raw}
+    if (
+        fingerprints is not None
+        and len(raw) > 1
+        and min(entry["id"] for entry in raw) == 1
+        and len(signatures) == 1
+    ):
+        log.warning(
+            "Ambiguous SLOWLOG generation on %s at backup cursor %d; "
+            "re-exporting the visible uniform burst",
+            node,
+            last_id,
+        )
+        return True
+
+    return False
+
+
 def fetch_new_entries(client: redis.Redis, state: dict) -> tuple[list, dict]:
     """Return (new_entries_oldest_first, updated_state).
 
@@ -203,9 +263,20 @@ def _fetch_enterprise(client: redis.Redis, state: dict) -> tuple[list, dict]:
         log.error("SLOWLOG GET failed: %s", exc)
         return [], state
 
-    new, new_last_id = _filter_new(raw, last_id, AMR_HOST)
+    jsonl_state = state.get("_jsonl", state)
+    jsonl_last_id = jsonl_state.get("last_id", last_id)
+    fingerprints = (
+        jsonl_state.get("fingerprints")
+        if "_jsonl" in state
+        else jsonl_state.get("fingerprints", {})
+    )
+    reset = _jsonl_cursor_reset(raw, jsonl_last_id, fingerprints, AMR_HOST)
+    new, new_last_id = _filter_new(raw, -1 if reset else last_id, AMR_HOST)
     if not new:
         return [], state
+    if reset:
+        for entry in new:
+            entry["_jsonl_reset"] = True
     return new, {"last_id": new_last_id}
 
 
@@ -238,11 +309,26 @@ def _fetch_oss(client, state: dict) -> tuple[list, dict]:
             log.error("SLOWLOG GET failed on %s: %s", node_key, exc)
             continue
 
+        for entry in raw or []:
+            entry["_node"] = node_key
         last_id = node_last_ids.get(node_key, -1)
-        new, new_last_id = _filter_new(raw or [], last_id, node_key)
+        jsonl_state = state.get("_jsonl", state)
+        jsonl_last_id = jsonl_state.get("nodes", {}).get(node_key, last_id)
+        fingerprints = (
+            jsonl_state.get("fingerprints", {}).get(node_key)
+            if "_jsonl" in state
+            else jsonl_state.get("fingerprints", {}).get(node_key, {})
+        )
+        reset = _jsonl_cursor_reset(
+            raw or [], jsonl_last_id, fingerprints, node_key
+        )
+        new, new_last_id = _filter_new(
+            raw or [], -1 if reset else last_id, node_key
+        )
         if new:
             for entry in new:
-                entry["_node"] = node_key
+                if reset:
+                    entry["_jsonl_reset"] = True
             all_new.extend(new)
             node_last_ids[node_key] = new_last_id
 
@@ -309,9 +395,10 @@ def _jsonl_append_indexes(entries: list[dict], state: dict) -> tuple[list[int], 
         max_id = max(entry["id"] for entry in entries)
         fingerprints = dict(jsonl_state.get("fingerprints", {}))
         overlap = [entry for entry in entries if entry["id"] <= last_id]
-        reset = bool(overlap) and (
-            not fingerprints
-            or any(
+        reset = any(entry.get("_jsonl_reset") for entry in entries) or (
+            bool(overlap)
+            and bool(fingerprints)
+            and any(
                 fingerprints.get(str(entry["id"])) != _entry_fingerprint(entry)
                 for entry in overlap
             )
@@ -325,6 +412,11 @@ def _jsonl_append_indexes(entries: list[dict], state: dict) -> tuple[list[int], 
             fingerprints = {}
         fingerprints.update(
             {str(entry["id"]): _entry_fingerprint(entry) for entry in entries}
+        )
+        fingerprints = dict(
+            sorted(fingerprints.items(), key=lambda item: int(item[0]))[
+                -SLOWLOG_BATCH_SIZE:
+            ]
         )
         return indexes, {
             "last_id": max_id if reset else max(last_id, max_id),
@@ -346,9 +438,10 @@ def _jsonl_append_indexes(entries: list[dict], state: dict) -> tuple[list[int], 
         max_id = max(entry["id"] for _, entry in node_entries)
         fingerprints = node_fingerprints.get(node, {})
         overlap = [entry for _, entry in node_entries if entry["id"] <= last_id]
-        reset = bool(overlap) and (
-            not fingerprints
-            or any(
+        reset = any(entry.get("_jsonl_reset") for _, entry in node_entries) or (
+            bool(overlap)
+            and bool(fingerprints)
+            and any(
                 fingerprints.get(str(entry["id"])) != _entry_fingerprint(entry)
                 for entry in overlap
             )
@@ -363,6 +456,11 @@ def _jsonl_append_indexes(entries: list[dict], state: dict) -> tuple[list[int], 
             fingerprints = {}
         fingerprints.update(
             {str(entry["id"]): _entry_fingerprint(entry) for _, entry in node_entries}
+        )
+        fingerprints = dict(
+            sorted(fingerprints.items(), key=lambda item: int(item[0]))[
+                -SLOWLOG_BATCH_SIZE:
+            ]
         )
         node_fingerprints[node] = fingerprints
 
@@ -435,7 +533,7 @@ def run_once(client: redis.Redis, state: dict) -> tuple[list[dict], dict]:
 
     try:
         send_to_log_analytics(formatted)
-    except Exception as exc:
+    except (AzureError, ValueError) as exc:
         log.error(
             "Failed to send to Log Analytics; cursor not advanced: %s",
             exc,
@@ -446,7 +544,7 @@ def run_once(client: redis.Redis, state: dict) -> tuple[list[dict], dict]:
     return formatted, next_state
 
 
-class _Stop(Exception):
+class _Stop(BaseException):
     pass
 
 
