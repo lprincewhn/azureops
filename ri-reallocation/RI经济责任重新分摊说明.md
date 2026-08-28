@@ -172,7 +172,7 @@ flowchart TD
       Wd --> REM[未绑定份额<br/>= RI使用收益 ×（boundTotal − ΣboundQuantity）/ boundTotal<br/>保留在原 RI 使用记录]
     end
 
-    REM --> LBL[加回金额 = Σ各目标分得<br/>allocationTarget = 全部目标以竖线连接<br/>如 project-a&#124;project-b]
+    REM --> LBL["加回金额 = Σ各目标分得<br/>allocationTarget = 多个目标以竖线分隔<br/>例如 project-a 和 project-b"]
     LBL --> SELF{自身标签<br/>命中某分摊目标?}
     SELF -- 是 --> SELFP[以全价 原始+加回<br/>加入该目标接收池]
     SELF -- 否 --> H
@@ -182,7 +182,7 @@ flowchart TD
     F -- 否 --> Z3[不处理<br/>非目标项目普通费用]
     F -- 是 --> G[归入目标项目池<br/>按 scope+目标+匹配键 累计成本基准]
 
-    H[[按 scope+目标+匹配键 汇总:<br/>RI 收益池 & 目标项目费用池<br/>接收池含加回后的 RI 记录全价]]
+    H[[按 scope+目标+匹配键 汇总:<br/>RI 收益池和目标项目费用池<br/>接收池含加回后的 RI 记录全价]]
     G --> H
     H --> I{每个 scope+目标+匹配键 校验<br/>目标池非零，且正收益时<br/>目标池 ≥ RI池?}
     I -- 否 --> X[报错并停止<br/>该目标的机型/组+区域分摊不出去]
