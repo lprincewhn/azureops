@@ -141,12 +141,12 @@ flowchart TD
 
 ```mermaid
 flowchart LR
-    SRC[(源账单 CSV<br/>part_*.csv)] --> REALLOC[reallocate_vm_ri.py<br/>RI 费用重分摊]
-    RES[(reservations.json<br/>预留绑定定义)] --> REALLOC
-    REALLOC --> OUT[(ri-reallocated/<br/>明细副本<br/>ri-allocation-details.csv<br/>project-allocation.csv<br/>ri-summary.json)]
-    SRC --> RECON[reconcile_vm_ri_allocation.py<br/>分摊前后对账]
+    SRC["源账单 CSV<br/>part_*.csv"] --> REALLOC["reallocate_vm_ri.py<br/>RI 费用重分摊"]
+    RES["reservations.json<br/>预留绑定定义"] --> REALLOC
+    REALLOC --> OUT["ri-reallocated/<br/>明细副本<br/>ri-allocation-details.csv<br/>project-allocation.csv<br/>ri-summary.json"]
+    SRC --> RECON["reconcile_vm_ri_allocation.py<br/>分摊前后对账"]
     OUT --> RECON
-    RECON --> REPORT[(VM 级对账结果<br/>校验金额守恒)]
+    RECON --> REPORT["VM 级对账结果<br/>校验金额守恒"]
 ```
 
 #### 3.0.3 单条明细判定与分摊流程
