@@ -142,6 +142,8 @@ def connect() -> redis.Redis:
 #
 # Enterprise mode state:  {"last_id": 42}
 # OSS cluster mode state: {"nodes": {"host:port": 42, ...}}
+# While an upload is pending, "_jsonl" holds the independently persisted local
+# backup cursor so a retry does not append the same rows again.
 
 
 def load_state() -> dict:
@@ -283,6 +285,42 @@ def append_to_jsonl(entries: list[dict]) -> None:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
+def _jsonl_append_indexes(entries: list[dict], state: dict) -> tuple[list[int], dict]:
+    """Return indexes not yet backed up and the advanced JSONL cursor."""
+    jsonl_state = state.get("_jsonl", state)
+
+    if AMR_CLUSTER_POLICY != "oss":
+        last_id = jsonl_state.get("last_id", -1)
+        max_id = max(entry["id"] for entry in entries)
+        reset = 0 < last_id and max_id < last_id
+        indexes = [
+            index
+            for index, entry in enumerate(entries)
+            if reset or entry["id"] > last_id
+        ]
+        return indexes, {"last_id": max_id if reset else max(last_id, max_id)}
+
+    node_last_ids = dict(jsonl_state.get("nodes", {}))
+    by_node: dict[str, list[tuple[int, dict]]] = {}
+    for index, entry in enumerate(entries):
+        by_node.setdefault(entry["_node"], []).append((index, entry))
+
+    indexes: list[int] = []
+    for node, node_entries in by_node.items():
+        last_id = node_last_ids.get(node, -1)
+        max_id = max(entry["id"] for _, entry in node_entries)
+        reset = 0 < last_id and max_id < last_id
+        indexes.extend(
+            index
+            for index, entry in node_entries
+            if reset or entry["id"] > last_id
+        )
+        node_last_ids[node] = max_id if reset else max(last_id, max_id)
+
+    indexes.sort()
+    return indexes, {"nodes": node_last_ids}
+
+
 # ── Azure Monitor Log Analytics ───────────────────────────────────────────────
 
 _logs_client: LogsIngestionClient | None = None
@@ -416,7 +454,16 @@ def main() -> None:
                 if new_entries:
                     exported_at = datetime.now(tz=timezone.utc).isoformat()
                     formatted = [format_entry(e, exported_at) for e in new_entries]
-                    append_to_jsonl(formatted)
+                    append_indexes, jsonl_state = _jsonl_append_indexes(
+                        new_entries, state
+                    )
+                    append_to_jsonl([formatted[index] for index in append_indexes])
+
+                    pending_state = dict(state)
+                    pending_state["_jsonl"] = jsonl_state
+                    save_state(pending_state)
+                    state = pending_state
+
                     try:
                         send_to_log_analytics(formatted)
                     except AzureError as exc:
