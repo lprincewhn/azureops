@@ -18,12 +18,11 @@ E2E-19 ~ E2E-20   StatefulSet multi-cluster config loading
 """
 
 import json
-from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 import redis as redis_lib
-from azure.core.exceptions import AzureError
+from azure.core.exceptions import AzureError, SerializationError
 
 import exporter
 
@@ -119,13 +118,14 @@ def _mock_conn(slowlog: FakeSlowlog):
 class UploadCapture:
     """Collects every Log Analytics upload batch; optionally simulates failures."""
 
-    def __init__(self, fail: bool = False):
+    def __init__(self, fail: bool = False, failure: Exception | None = None):
         self.batches: list[list[dict]] = []
         self._fail = fail
+        self._failure = failure or AzureError("simulated upload failure")
 
     def upload(self, rule_id: str, stream_name: str, logs: list) -> None:
         if self._fail:
-            raise AzureError("simulated upload failure")
+            raise self._failure
         self.batches.append(list(logs))
 
     @property
@@ -197,25 +197,7 @@ class ExporterRun:
         self.state = exporter.load_state()
 
     def poll(self, client) -> list[dict]:
-        new_entries, next_state = exporter.fetch_new_entries(client, self.state)
-        if not new_entries:
-            return []
-        exported_at = datetime.now(tz=timezone.utc).isoformat()
-        formatted = [exporter.format_entry(e, exported_at) for e in new_entries]
-        append_indexes, jsonl_state = exporter._jsonl_append_indexes(
-            new_entries, self.state
-        )
-        exporter.append_to_jsonl([formatted[index] for index in append_indexes])
-        pending_state = dict(self.state)
-        pending_state["_jsonl"] = jsonl_state
-        exporter.save_state(pending_state)
-        self.state = pending_state
-        try:
-            exporter.send_to_log_analytics(formatted)
-        except AzureError:
-            return formatted
-        exporter.save_state(next_state)
-        self.state = next_state
+        formatted, self.state = exporter.run_once(client, self.state)
         return formatted
 
 
@@ -382,7 +364,9 @@ class TestEnterpriseE2E:
         run.poll(client)
 
         assert len(read_jsonl()) == 1
-        assert read_state() == {"_jsonl": {"last_id": 1}}
+        pending = read_state()
+        assert pending["_jsonl"]["last_id"] == 1
+        assert set(pending["_jsonl"]["fingerprints"]) == {"1"}
         assert failing_capture.total == 0
 
         failing_capture._fail = False
@@ -391,6 +375,54 @@ class TestEnterpriseE2E:
         assert len(read_jsonl()) == 1
         assert read_state() == {"last_id": 1}
         assert failing_capture.total == 1
+
+    def test_reset_during_pending_upload_keeps_every_new_generation_row(
+        self, env, failing_capture
+    ):
+        """A reset whose new max exceeds the backup cursor must not hide reused IDs."""
+        sl = FakeSlowlog()
+        for entry_id in range(1, 11):
+            sl.add(entry_id, command=f"CMD{entry_id}".encode())
+        client = FakeEnterpriseClient(sl)
+
+        ExporterRun().poll(client)
+        sl.reset()
+        for entry_id in range(1, 13):
+            sl.add(entry_id, command=f"NEW{entry_id}".encode())
+
+        failing_capture._fail = False
+        ExporterRun().poll(client)
+
+        rows = read_jsonl()
+        assert [row["command"] for row in rows[:10]] == [
+            f"CMD{entry_id}" for entry_id in range(1, 11)
+        ]
+        assert [row["command"] for row in rows[10:]] == [
+            f"NEW{entry_id}" for entry_id in range(1, 13)
+        ]
+        assert [row["Command"] for row in failing_capture.rows] == [
+            f"NEW{entry_id}" for entry_id in range(1, 13)
+        ]
+        assert read_state() == {"last_id": 12}
+
+    @pytest.mark.parametrize(
+        "failure",
+        [ValueError("missing workload identity"), SerializationError("bad payload")],
+    )
+    def test_non_azure_upload_exception_preserves_cursor(
+        self, env, monkeypatch, failure
+    ):
+        """Credential and serialization failures remain recoverable poll failures."""
+        capture = UploadCapture(fail=True, failure=failure)
+        monkeypatch.setattr(exporter, "_logs_client", capture)
+        sl = FakeSlowlog()
+        sl.add(1, command=b"GET key")
+
+        exported = ExporterRun().poll(FakeEnterpriseClient(sl))
+
+        assert len(exported) == 1
+        assert read_state()["_jsonl"]["last_id"] == 1
+        assert "last_id" not in read_state()
 
     # E2E-10 ──────────────────────────────────────────────────────────────────
     def test_jsonl_row_has_correct_field_types_and_values(self, env, capture):
@@ -583,13 +615,14 @@ class TestOssE2E:
         ExporterRun().poll(client)
 
         assert len(read_jsonl()) == 2
-        assert read_state() == {
-            "_jsonl": {
-                "nodes": {
-                    "shard-0:10000": 1,
-                    "shard-1:10000": 4,
-                }
-            }
+        pending = read_state()["_jsonl"]
+        assert pending["nodes"] == {
+            "shard-0:10000": 1,
+            "shard-1:10000": 4,
+        }
+        assert set(pending["fingerprints"]) == {
+            "shard-0:10000",
+            "shard-1:10000",
         }
 
         failing_capture._fail = False
@@ -603,6 +636,32 @@ class TestOssE2E:
             }
         }
         assert failing_capture.total == 2
+
+    def test_oss_reset_during_pending_upload_keeps_reused_ids(
+        self, failing_capture
+    ):
+        """Each OSS shard detects content changes independently while upload is pending."""
+        shard = FakeSlowlog()
+        for entry_id in range(1, 11):
+            shard.add(entry_id, command=f"CMD{entry_id}".encode())
+        client = FakeOssClient({"shard-0:10000": shard})
+
+        ExporterRun().poll(client)
+        shard.reset()
+        for entry_id in range(1, 13):
+            shard.add(entry_id, command=f"NEW{entry_id}".encode())
+
+        failing_capture._fail = False
+        ExporterRun().poll(client)
+
+        rows = read_jsonl()
+        assert [row["command"] for row in rows[10:]] == [
+            f"NEW{entry_id}" for entry_id in range(1, 13)
+        ]
+        assert [row["Command"] for row in failing_capture.rows] == [
+            f"NEW{entry_id}" for entry_id in range(1, 13)
+        ]
+        assert read_state() == {"nodes": {"shard-0:10000": 12}}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
