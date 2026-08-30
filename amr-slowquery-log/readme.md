@@ -131,8 +131,17 @@ amr-clusters-config (Secret)
 
 | 连接目标 | 认证方式 | 说明 |
 |---|---|---|
-| Azure Managed Redis | Access Key | 存于 `amr-clusters-config` Secret，按集群独立 |
+| Azure Managed Redis | Access Key | 存于 `amr-clusters-config` Secret，按集群独立；明文只保留在 `.env`（不纳入版本管理） |
 | Azure Monitor（Log Analytics） | AKS Workload Identity | 所有 Pod 共用同一 UAMI，零密钥管理 |
+
+上报到 Log Analytics 要求 UAMI 在 DCR 上具有 `Monitoring Metrics Publisher` 角色。
+授予该角色需要 `Microsoft.Authorization/roleAssignments/write`——**Contributor 单独不够**，
+详见 [部署指南的前置条件](docs/deployment.md)。
+
+> **已知限制**：OSS cluster policy 下 `AMR_SSL_VERIFY` 目前只能设为 `false`。OSS 模式会按分片
+> IP 直连各主分片，而 AMR 证书只对主机名有效，`true` 会失败于主机名校验。`false` 走
+> `ssl_cert_reqs="none"`，同时关掉了证书链校验，属实质性安全降级——这是临时绕过，
+> 不是推荐配置。Enterprise 模式不受影响，应保持 `true`。
 
 ---
 
@@ -142,19 +151,21 @@ amr-clusters-config (Secret)
 k8s/
 ├── base/
 │   ├── kustomization.yaml
-│   ├── serviceaccount.yaml   # UAMI client-id 注解
 │   ├── service.yaml          # StatefulSet 必需的 headless Service
 │   └── statefulset.yaml      # 公共 Pod 模板
 └── overlays/
-    └── demo/
-        ├── kustomization.yaml       # namespace + patches
+    └── template/                      # 纳入版本管理，值为 ${VAR} 占位符
+        ├── kustomization.yaml         # namespace + images 变换 + patches
         ├── namespace.yaml
-        ├── shared-secret.yaml       # DCE_ENDPOINT, DCR_RULE_ID
-        ├── clusters-config.yaml     # clusters.json（含各集群 host/key）
-        └── replicas-patch.yaml      # replicas = 集群数量
+        ├── serviceaccount.yaml        # UAMI client-id 注解
+        ├── shared-secret.yaml         # DCE_ENDPOINT, DCR_RULE_ID
+        ├── clusters-config.yaml       # clusters.json（各集群连接参数）
+        ├── replicas-patch.yaml        # replicas = 集群数量
+        └── imagepullsecret-patch.yaml # 无 AcrPull 角色时的拉取回退
 ```
 
-单集群快速部署可直接使用根目录的 `k8s.yaml`（all-in-one）。
+部署时用 `envsubst` 把 `template/` 渲染为 `k8s/overlays/prod/`，后者由 `.gitignore` 排除，
+不纳入版本管理，也不应手工编辑——所有取值来自 `.env`。
 
 ---
 
@@ -171,8 +182,11 @@ k8s/
 | `exporter.py` | 慢查询采集与上报服务主程序 |
 | `requirements.txt` | Python 依赖 |
 | `Dockerfile` | 容器镜像构建文件 |
-| `k8s.yaml` | 单集群 all-in-one 部署参考 |
+| `.env.example` | 环境变量模板，复制为 `.env` 后填写（`.env` 不纳入版本管理） |
 | `k8s/base/` | Kustomize base（公共资源） |
-| `k8s/overlays/prod/` | Kustomize overlay（环境配置 + 集群列表） |
-| `dcr-rule.json` | DCR 流声明配置 |
+| `k8s/overlays/template/` | Kustomize overlay 模板（envsubst 占位符） |
 | `deploy-workbook.py` | Workbook 部署脚本 |
+| `docs/deployment.md` | 部署指南 |
+
+> DCR 的流声明不是单独的 JSON 文件，而是内联在 `docs/deployment.md` 步骤 1.3 的
+> `az monitor data-collection rule create --stream-declarations` 参数中。

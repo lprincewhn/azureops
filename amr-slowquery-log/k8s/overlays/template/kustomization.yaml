@@ -13,3 +13,5 @@ images:
     newTag: ${IMAGE_TAG}
 patches:
   - path: replicas-patch.yaml
+  # Drop this entry when the AKS kubelet identity already has AcrPull on the registry.
+  - path: imagepullsecret-patch.yaml
