@@ -2,6 +2,10 @@
 # Pod-0 reads index 0, Pod-1 reads index 1, and so on.
 # To add a cluster: append an entry here and increase replicas-patch.yaml by 1.
 # To remove a cluster: delete the LAST entry and decrease replicas-patch.yaml by 1.
+#
+# Values are injected from .env by envsubst — never hard-code an access key here,
+# this file is under version control. For additional clusters, define suffixed
+# variables in .env (AMR_HOST_B, AMR_ACCESS_KEY_B, …) and reference them below.
 apiVersion: v1
 kind: Secret
 metadata:
@@ -11,11 +15,11 @@ stringData:
   clusters.json: |
     [
       {
-        "AMR_CLUSTER_NAME": "<cluster-a-name>",
-        "AMR_HOST": "<cluster-a>.southeastasia.redis.azure.net",
-        "AMR_PORT": 10000,
-        "AMR_ACCESS_KEY": "<access-key-a>",
-        "AMR_CLUSTER_POLICY": "oss",
-        "AMR_SSL_VERIFY": "false"
+        "AMR_CLUSTER_NAME": "${AMR_CLUSTER_NAME}",
+        "AMR_HOST": "${AMR_HOST}",
+        "AMR_PORT": ${AMR_PORT},
+        "AMR_ACCESS_KEY": "${AMR_ACCESS_KEY}",
+        "AMR_CLUSTER_POLICY": "${AMR_CLUSTER_POLICY}",
+        "AMR_SSL_VERIFY": "${AMR_SSL_VERIFY}"
       }
     ]
