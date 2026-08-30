@@ -244,15 +244,23 @@ az aks update -n "$AKS_CLUSTER_NAME" -g "$AKS_RESOURCE_GROUP" --attach-acr "$ACR
 `imagePullSecrets: [{name: acr-pull}]` 打进 StatefulSet：
 
 ```bash
+(
+set -e
+
 kubectl create namespace amr-exporter --dry-run=client -o yaml | kubectl apply -f -
 
 ACR_USER=$(az acr credential show -n "$ACR_NAME" --query username -o tsv)
 ACR_PASS=$(az acr credential show -n "$ACR_NAME" --query "passwords[0].value" -o tsv)
+DOCKER_CONFIG=$(mktemp -d)
+trap 'rm -f "$DOCKER_CONFIG/config.json"; rmdir "$DOCKER_CONFIG"' EXIT
 
-kubectl -n amr-exporter create secret docker-registry acr-pull \
-  --docker-server="${ACR_NAME}.azurecr.io" \
-  --docker-username="$ACR_USER" \
-  --docker-password="$ACR_PASS"
+printf '%s' "$ACR_PASS" | docker --config "$DOCKER_CONFIG" login \
+  "${ACR_NAME}.azurecr.io" --username "$ACR_USER" --password-stdin
+kubectl -n amr-exporter create secret generic acr-pull \
+  --from-file=.dockerconfigjson="$DOCKER_CONFIG/config.json" \
+  --type=kubernetes.io/dockerconfigjson \
+  --dry-run=client -o yaml | kubectl apply -f -
+)
 ```
 
 > 方案 B 依赖 ACR 的 admin user（`az acr update -n <acr> --admin-enabled true`），
@@ -272,7 +280,7 @@ kubectl -n amr-exporter create secret docker-registry acr-pull \
 
 ### 4.1 准备 .env
 
-以 `.env.example` 为模板创建 `.env`（该文件被 .gitignore 排除，access key 只存在这里）：
+以 `.env.example` 为模板创建 `.env`（该文件被 `.gitignore` 排除并限制为仅当前用户可读）：
 
 ```bash
 cp .env.example .env
@@ -297,7 +305,7 @@ chmod 600 .env
 
 ```bash
 az redisenterprise database show --cluster-name <name> -g <rg> \
-  --database-name default --query clusteringPolicy -o tsv
+  --query clusteringPolicy -o tsv
 # OSSCluster  → AMR_CLUSTER_POLICY=oss
 # EnterpriseCluster → AMR_CLUSTER_POLICY=enterprise
 ```
@@ -352,29 +360,53 @@ Enterprise cluster policy 单端点连接不受影响，应保持 `"true"`。
 ### 4.3 渲染部署目录
 
 ```bash
+(
+set -e
 set -a && source .env && set +a
 
-mkdir -p k8s/overlays/prod
-for f in k8s/overlays/template/*.yaml; do
-  envsubst < "$f" > "k8s/overlays/prod/$(basename $f)"
+template_vars=$(
+  envsubst --variables "$(cat k8s/overlays/template/*.yaml)" | sort -u
+)
+for name in $template_vars; do
+  test -n "$(printenv "$name")" || {
+    echo "缺少必填变量: $name" >&2
+    exit 1
+  }
 done
-```
 
-渲染后务必确认没有残留占位符：
-
-```bash
-grep -n '\${' k8s/overlays/prod/*.yaml   # 应无输出
+umask 077
+install -d -m 700 k8s/overlays/prod
+rm -f k8s/overlays/prod/*.yaml
+for f in k8s/overlays/template/*.yaml; do
+  output="k8s/overlays/prod/$(basename "$f")"
+  envsubst < "$f" > "$output"
+  chmod 600 "$output"
+done
+if grep -n '\${' k8s/overlays/prod/*.yaml; then
+  echo "渲染结果仍有未替换的占位符" >&2
+  exit 1
+fi
+sed -n '/^  clusters\.json: |$/,$p' k8s/overlays/prod/clusters-config.yaml \
+  | sed '1d;s/^    //' | python -m json.tool >/dev/null
 kubectl kustomize k8s/overlays/prod | grep -E 'image:|replicas:'
+)
 ```
+
+`prod/` 中包含渲染后的 AMR access key。目录和文件权限分别为 `700`、`600`，且被
+`.gitignore` 排除；部署完成后仍应删除，避免明文凭据长期留在本地。上面的命令会检查
+所有模板变量均非空、没有残留占位符、`clusters.json` 是有效 JSON，并验证 Kustomize 输出。
 
 ### 4.4 部署至 AKS
 
 ```bash
+(
+set -e
 az aks get-credentials \
   --name "$AKS_CLUSTER_NAME" \
   --resource-group "$AKS_RESOURCE_GROUP"
 
-kubectl apply -k k8s/overlays/prod
+kubectl apply -k k8s/overlays/prod && rm -f k8s/overlays/prod/*.yaml
+)
 ```
 
 ### 4.5 验证运行状态
@@ -433,15 +465,7 @@ python deploy-workbook.py
 1. 在 `.env` 中为新集群添加一组带后缀的变量
 2. 在 `clusters-config.yaml` 的 `clusters.json` **末尾**追加对应对象
 3. 将 `replicas-patch.yaml` 的 `replicas` 值加 1
-4. 重新渲染并部署：
-
-```bash
-set -a && source .env && set +a
-for f in k8s/overlays/template/*.yaml; do
-  envsubst < "$f" > "k8s/overlays/prod/$(basename $f)"
-done
-kubectl apply -k k8s/overlays/prod
-```
+4. 按步骤 4.3 重新渲染和校验，再按步骤 4.4 部署并清理生成文件
 
 StatefulSet 仅创建新增的 Pod（最高序号），已有 Pod 不重启。
 
@@ -468,9 +492,11 @@ AMRSlowQuery_CL
 
 ```bash
 # 原值一般是 10000（微秒）
-redis-cli -h <amr-host> -p 10000 --tls --insecure -a <access-key> \
+redis-cli -h <amr-host> -p 10000 --tls --insecure --askpass \
   config set slowlog-log-slower-than 0
 ```
+
+命令会交互式提示输入 access key，避免凭据进入 shell 历史和进程参数。
 
 > OSS 模式下 `CONFIG SET` 只作用于连上的那个分片。要覆盖全部主分片，需对
 > `CLUSTER SLOTS` 返回的每个主分片分别执行。

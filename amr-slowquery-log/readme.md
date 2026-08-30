@@ -131,7 +131,7 @@ amr-clusters-config (Secret)
 
 | 连接目标 | 认证方式 | 说明 |
 |---|---|---|
-| Azure Managed Redis | Access Key | 存于 `amr-clusters-config` Secret，按集群独立；明文只保留在 `.env`（不纳入版本管理） |
+| Azure Managed Redis | Access Key | 存于 `amr-clusters-config` Secret，按集群独立；本地 `.env` 和临时渲染文件均不纳入版本管理，渲染文件部署后立即删除 |
 | Azure Monitor（Log Analytics） | AKS Workload Identity | 所有 Pod 共用同一 UAMI，零密钥管理 |
 
 上报到 Log Analytics 要求 UAMI 在 DCR 上具有 `Monitoring Metrics Publisher` 角色。
