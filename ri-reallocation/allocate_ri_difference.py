@@ -99,6 +99,14 @@ def is_vm_reservation(row):
     )
 
 
+def is_vm_resource_id(resource_id):
+    normalized = resource_id.casefold()
+    return (
+        "/virtualmachines/" in normalized
+        or "/virtualmachinescalesets/" in normalized
+    )
+
+
 def reservation_order_id(row, actual=False):
     if actual:
         return row.get("reservationId", "").strip()
@@ -210,7 +218,7 @@ def collect_amortized_data(files, amount_field):
             resource_id = row.get("ResourceId", "").casefold()
             if (
                 row.get("chargeType", "").casefold() == "usage"
-                and "/virtualmachines/" in resource_id
+                and is_vm_resource_id(resource_id)
             ):
                 eligible_rows[order_id].append((file_index, row_index))
 
