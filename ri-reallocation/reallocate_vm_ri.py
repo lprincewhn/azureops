@@ -796,6 +796,63 @@ def download_price_sheet_by_invoice(
         retry_after = int(status_response.headers.get("Retry-After") or "10")
 
 
+def download_price_sheet_by_billing_profile(
+    billing_account_name: str,
+    billing_profile_id: str,
+    credential: Any,
+    timeout: int,
+) -> Any:
+    """Run the Billing Profile Price Sheet LRO through its Completed status."""
+    quote = lambda value: urllib.parse.quote(value, safe=":-_")
+    url = (
+        "https://management.azure.com/providers/Microsoft.Billing/"
+        f"billingAccounts/{quote(billing_account_name)}/"
+        f"billingProfiles/{quote(billing_profile_id)}/"
+        "providers/Microsoft.CostManagement/pricesheets/default/download"
+        "?api-version=2025-03-01"
+    )
+    response, payload = _authorized_json_request(url, credential, method="POST")
+    if getattr(response, "status", None) == 200:
+        return payload
+    if getattr(response, "status", None) != 202:
+        raise ValueError(
+            f"Azure Price Sheet API 返回非预期状态：{response.status}"
+        )
+
+    async_url = (
+        response.headers.get("Azure-Consumption-AsyncOperation")
+        or response.headers.get("Azure-AsyncOperation")
+    )
+    if not async_url:
+        raise ValueError("Azure Price Sheet API 的 202 响应缺少异步状态 URL")
+    retry_after = int(response.headers.get("Retry-After") or "10")
+    deadline = time.monotonic() + timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(
+                f"Azure Price Sheet 在 {timeout} 秒内未生成完成；"
+                "服务端任务可能仍在运行，请稍后重试"
+            )
+        time.sleep(min(retry_after, remaining))
+        status_response, status_payload = _authorized_json_request(
+            async_url, credential
+        )
+        status = str(status_payload.get("status") or "").strip().lower()
+        if status in {"completed", "succeeded"}:
+            return status_payload
+        if status in {"failed", "canceled", "cancelled"}:
+            raise ValueError(
+                f"Azure Price Sheet 生成失败，状态：{status_payload.get('status')}"
+            )
+        if getattr(status_response, "status", None) not in {200, 202}:
+            raise ValueError(
+                "Azure Price Sheet 状态查询返回非预期状态："
+                f"{status_response.status}"
+            )
+        retry_after = int(status_response.headers.get("Retry-After") or "10")
+
+
 def price_sheet_download_url(result: Any) -> str:
     """Extract a temporary download URL from direct and wrapped API results."""
     url = _model_value(result, "download_url", "downloadUrl")
@@ -908,11 +965,19 @@ def download_price_sheet(
                     "账单 invoiceId 不完整，正在通过 Billing Profile 生成 Azure "
                     f"Price Sheet，最长等待 {timeout} 秒..."
                 )
-                poller = client.price_sheet.begin_download_by_billing_profile(
-                    billing_account_name=account_name,
-                    billing_profile_name=billing_profile_id,
-                )
-                result = wait_for_price_sheet(poller, timeout)
+                if credential is not None:
+                    result = download_price_sheet_by_billing_profile(
+                        account_name,
+                        billing_profile_id,
+                        credential,
+                        timeout,
+                    )
+                else:
+                    poller = client.price_sheet.begin_download_by_billing_profile(
+                        billing_account_name=account_name,
+                        billing_profile_name=billing_profile_id,
+                    )
+                    result = wait_for_price_sheet(poller, timeout)
         else:
             year, month = next(iter(periods))
             poller = client.price_sheet.begin_download_by_billing_account(

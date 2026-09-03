@@ -401,6 +401,39 @@ class PriceSheetTests(unittest.TestCase):
             )
         self.assertEqual(result, wrapped)
 
+    def test_billing_profile_polling_accepts_completed_status(self):
+        initial = argparse.Namespace(
+            status=202,
+            headers={
+                "Azure-Consumption-AsyncOperation": (
+                    "https://example.test/status"
+                ),
+                "Retry-After": "0",
+            },
+        )
+        final = argparse.Namespace(status=200, headers={})
+        wrapped = {
+            "status": "Completed",
+            "properties": {
+                "downloadUrl": "https://example.test/prices"
+            },
+        }
+        with mock.patch.object(
+            MODULE,
+            "_authorized_json_request",
+            side_effect=[
+                (initial, {}),
+                (final, wrapped),
+            ],
+        ):
+            result = MODULE.download_price_sheet_by_billing_profile(
+                "account",
+                "profile",
+                argparse.Namespace(),
+                30,
+            )
+        self.assertEqual(result, wrapped)
+
 
 class ReservationsFileTests(unittest.TestCase):
     def _write(self, data):
