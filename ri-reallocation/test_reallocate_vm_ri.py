@@ -1,10 +1,12 @@
 import argparse
 import csv
 import importlib.util
+import io
 import json
 import sys
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from unittest import mock
 
@@ -178,6 +180,39 @@ class PriceSheetTests(unittest.TestCase):
             MODULE.Decimal("2.5"),
         )
 
+    def test_zip_price_sheet_with_ndjson_members(self):
+        output = io.BytesIO()
+        with zipfile.ZipFile(output, "w") as archive:
+            archive.writestr(
+                "prices-0.json",
+                json.dumps(
+                    {
+                        "MeterId": "meter-a",
+                        "PriceType": "Consumption",
+                        "TierMinimumUnits": 0,
+                        "UnitPrice": 2.5,
+                        "BillingCurrency": "USD",
+                    }
+                )
+                + "\n"
+                + json.dumps(
+                    {
+                        "MeterId": "meter-b",
+                        "PriceType": "Consumption",
+                        "TierMinimumUnits": 0,
+                        "UnitPrice": 3,
+                        "BillingCurrency": "USD",
+                    }
+                ),
+            )
+        rates = MODULE.parse_price_sheet(
+            output.getvalue(),
+            "prices.zip",
+            {"meter-a"},
+        )
+        self.assertEqual(set(rates), {"meter-a"})
+        self.assertEqual(rates["meter-a"][0].unit_price, MODULE.Decimal("2.5"))
+
     def test_missing_meter_price_raises(self):
         rates = MODULE.parse_price_sheet(
             b"meterId,priceType,tierMinimumUnits,unitPrice,billingCurrency\n"
@@ -258,6 +293,92 @@ class PriceSheetTests(unittest.TestCase):
         poller.wait.assert_called_once_with(timeout=30)
         poller.result.assert_called_once_with()
 
+    def test_incomplete_invoice_ids_fall_back_to_billing_profile(self):
+        rows = [
+            {
+                "billingAccountId": "short-account",
+                "billingProfileId": "profile",
+                "invoiceId": "invoice-a",
+                "date": "07/01/2026",
+            },
+            {
+                "billingAccountId": "short-account",
+                "billingProfileId": "profile",
+                "invoiceId": "",
+                "date": "07/02/2026",
+            },
+            {
+                "billingAccountId": "short-account",
+                "billingProfileId": "profile",
+                "date": "07/03/2026",
+            },
+        ]
+        result = argparse.Namespace(download_url="https://example.test/prices")
+        poller = mock.Mock()
+        poller.done.return_value = True
+        poller.result.return_value = result
+        client = mock.Mock()
+        client.price_sheet.begin_download_by_billing_profile.return_value = poller
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = b"price-sheet"
+        with mock.patch.object(
+            MODULE.urllib.request, "urlopen", return_value=response
+        ):
+            payload = MODULE.download_price_sheet(
+                rows,
+                billing_account_name="full-account",
+                timeout=30,
+                client=client,
+            )
+        self.assertEqual(payload, b"price-sheet")
+        client.price_sheet.begin_download_by_billing_profile.assert_called_once_with(
+            billing_account_name="full-account",
+            billing_profile_name="profile",
+        )
+        client.price_sheet.begin_download_by_invoice.assert_not_called()
+        poller.wait.assert_called_once_with(timeout=30)
+        poller.result.assert_called_once_with()
+
+    def test_complete_invoice_ids_still_use_invoice(self):
+        rows = [
+            {
+                "billingAccountId": "short-account",
+                "billingProfileId": "profile",
+                "invoiceId": "invoice-a",
+                "date": "07/01/2026",
+            },
+            {
+                "billingAccountId": "short-account",
+                "billingProfileId": "profile",
+                "invoiceId": "invoice-a",
+                "date": "07/02/2026",
+            },
+        ]
+        result = argparse.Namespace(download_url="https://example.test/prices")
+        poller = mock.Mock()
+        poller.done.return_value = True
+        poller.result.return_value = result
+        client = mock.Mock()
+        client.price_sheet.begin_download_by_invoice.return_value = poller
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = b"price-sheet"
+        with mock.patch.object(
+            MODULE.urllib.request, "urlopen", return_value=response
+        ):
+            payload = MODULE.download_price_sheet(
+                rows,
+                billing_account_name="full-account",
+                timeout=30,
+                client=client,
+            )
+        self.assertEqual(payload, b"price-sheet")
+        client.price_sheet.begin_download_by_invoice.assert_called_once_with(
+            billing_account_name="full-account",
+            billing_profile_name="profile",
+            invoice_name="invoice-a",
+        )
+        client.price_sheet.begin_download_by_billing_profile.assert_not_called()
+
     def test_price_sheet_timeout_is_explicit(self):
         poller = mock.Mock()
         poller.done.return_value = False
@@ -310,6 +431,39 @@ class PriceSheetTests(unittest.TestCase):
                 "account",
                 "profile",
                 "invoice",
+                argparse.Namespace(),
+                30,
+            )
+        self.assertEqual(result, wrapped)
+
+    def test_billing_profile_polling_accepts_completed_status(self):
+        initial = argparse.Namespace(
+            status=202,
+            headers={
+                "Azure-Consumption-AsyncOperation": (
+                    "https://example.test/status"
+                ),
+                "Retry-After": "0",
+            },
+        )
+        final = argparse.Namespace(status=200, headers={})
+        wrapped = {
+            "status": "Completed",
+            "properties": {
+                "downloadUrl": "https://example.test/prices"
+            },
+        }
+        with mock.patch.object(
+            MODULE,
+            "_authorized_json_request",
+            side_effect=[
+                (initial, {}),
+                (final, wrapped),
+            ],
+        ):
+            result = MODULE.download_price_sheet_by_billing_profile(
+                "account",
+                "profile",
                 argparse.Namespace(),
                 30,
             )
