@@ -1,10 +1,12 @@
 import argparse
 import csv
 import importlib.util
+import io
 import json
 import sys
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from unittest import mock
 
@@ -177,6 +179,39 @@ class PriceSheetTests(unittest.TestCase):
             ),
             MODULE.Decimal("2.5"),
         )
+
+    def test_zip_price_sheet_with_ndjson_members(self):
+        output = io.BytesIO()
+        with zipfile.ZipFile(output, "w") as archive:
+            archive.writestr(
+                "prices-0.json",
+                json.dumps(
+                    {
+                        "MeterId": "meter-a",
+                        "PriceType": "Consumption",
+                        "TierMinimumUnits": 0,
+                        "UnitPrice": 2.5,
+                        "BillingCurrency": "USD",
+                    }
+                )
+                + "\n"
+                + json.dumps(
+                    {
+                        "MeterId": "meter-b",
+                        "PriceType": "Consumption",
+                        "TierMinimumUnits": 0,
+                        "UnitPrice": 3,
+                        "BillingCurrency": "USD",
+                    }
+                ),
+            )
+        rates = MODULE.parse_price_sheet(
+            output.getvalue(),
+            "prices.zip",
+            {"meter-a"},
+        )
+        self.assertEqual(set(rates), {"meter-a"})
+        self.assertEqual(rates["meter-a"][0].unit_price, MODULE.Decimal("2.5"))
 
     def test_missing_meter_price_raises(self):
         rates = MODULE.parse_price_sheet(

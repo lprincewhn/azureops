@@ -180,6 +180,10 @@ work/02-economic-reallocated/
 --billing-account-name "<billing-account-name>"
 ```
 
+Billing Profile API 只返回当前月 Price Sheet。处理历史账期时，如果当前月价格表
+未覆盖账单日期，仍需通过 `--invoice-id` 下载对应发票价格表，或通过
+`--price-sheet-file` 提供该历史账期的 Price Sheet。
+
 ## 6. 步骤 3：生成 RI 项目分布报告
 
 执行：

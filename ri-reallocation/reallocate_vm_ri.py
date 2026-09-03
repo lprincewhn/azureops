@@ -22,6 +22,7 @@ import argparse
 import csv
 import glob
 import io
+import itertools
 import json
 import re
 import time
@@ -544,46 +545,24 @@ def _parse_date(value: str) -> date | None:
     raise ValueError(f"无法解析日期：{value!r}")
 
 
-def _csv_payloads(payload: bytes, source: str) -> list[tuple[str, bytes]]:
-    if payload.startswith(b"PK\x03\x04"):
-        with zipfile.ZipFile(io.BytesIO(payload)) as archive:
-            files = [
-                (name, archive.read(name))
-                for name in archive.namelist()
-                if name.lower().endswith(".csv") and not name.endswith("/")
-            ]
-        if not files:
-            raise ValueError(f"Azure Price Sheet ZIP 不包含 CSV：{source}")
-        return files
-    return [(source, payload)]
-
-
-def parse_price_sheet(payload: bytes, source: str) -> dict[str, list[PriceRate]]:
+def parse_price_sheet(
+    payload: bytes,
+    source: str,
+    meter_ids: set[str] | None = None,
+) -> dict[str, list[PriceRate]]:
     """Parse Consumption tier-zero rates from CSV, ZIP, or JSON Price Sheets."""
     rates: defaultdict[str, set[PriceRate]] = defaultdict(set)
-    stripped = payload.lstrip(b"\xef\xbb\xbf \t\r\n")
-    if stripped.startswith(b"["):
-        parsed = json.loads(payload.decode("utf-8-sig"))
-        if not isinstance(parsed, list) or not all(
-            isinstance(row, dict) for row in parsed
-        ):
-            raise ValueError("Azure Price Sheet JSON 顶层必须是对象数组")
-        sources: list[tuple[str, list[dict[str, Any]], list[str]]] = [
-            (
-                source,
-                parsed,
-                list(parsed[0]) if parsed else [],
-            )
-        ]
-    else:
-        sources = []
-        for name, content in _csv_payloads(payload, source):
-            reader = csv.DictReader(io.StringIO(content.decode("utf-8-sig")))
-            if reader.fieldnames is None:
-                raise ValueError(f"Azure Price Sheet CSV 没有表头：{name}")
-            sources.append((name, list(reader), list(reader.fieldnames)))
+    selected_meter_ids = (
+        {meter_id.strip().lower() for meter_id in meter_ids if meter_id.strip()}
+        if meter_ids is not None
+        else None
+    )
 
-    for name, rows, fieldnames in sources:
+    def collect(
+        name: str,
+        rows: Any,
+        fieldnames: list[str],
+    ) -> None:
         headers = {_canonical_header(field): field for field in fieldnames}
 
         def field(row: dict[str, Any], *aliases: str) -> str:
@@ -611,6 +590,11 @@ def parse_price_sheet(payload: bytes, source: str) -> dict[str, list[PriceRate]]
             raw_price = field(row, "unitPrice")
             if not meter_id or not raw_price:
                 continue
+            if (
+                selected_meter_ids is not None
+                and meter_id not in selected_meter_ids
+            ):
+                continue
             try:
                 unit_price = Decimal(raw_price)
             except InvalidOperation as exc:
@@ -628,6 +612,58 @@ def parse_price_sheet(payload: bytes, source: str) -> dict[str, list[PriceRate]]
                     effective_end=_parse_date(field(row, "effectiveEndDate")),
                 )
             )
+
+    if payload.startswith(b"PK\x03\x04"):
+        with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+            members = [
+                name
+                for name in archive.namelist()
+                if not name.endswith("/")
+                and name.lower().endswith((".csv", ".json"))
+            ]
+            if not members:
+                raise ValueError(
+                    f"Azure Price Sheet ZIP 不包含 CSV 或 JSON：{source}"
+                )
+            for name in members:
+                with archive.open(name) as member:
+                    text = io.TextIOWrapper(member, encoding="utf-8-sig")
+                    if name.lower().endswith(".csv"):
+                        reader = csv.DictReader(text)
+                        if reader.fieldnames is None:
+                            raise ValueError(
+                                f"Azure Price Sheet CSV 没有表头：{name}"
+                            )
+                        collect(name, reader, list(reader.fieldnames))
+                    else:
+                        rows = (
+                            json.loads(line)
+                            for line in text
+                            if line.strip()
+                        )
+                        first = next(rows, None)
+                        if first is None:
+                            continue
+                        if not isinstance(first, dict):
+                            raise ValueError(
+                                f"Azure Price Sheet JSON 行不是对象：{name}"
+                            )
+                        collect(name, itertools.chain([first], rows), list(first))
+    else:
+        stripped = payload.lstrip(b"\xef\xbb\xbf \t\r\n")
+        if stripped.startswith(b"["):
+            parsed = json.loads(payload.decode("utf-8-sig"))
+            if not isinstance(parsed, list) or not all(
+                isinstance(row, dict) for row in parsed
+            ):
+                raise ValueError("Azure Price Sheet JSON 顶层必须是对象数组")
+            collect(source, parsed, list(parsed[0]) if parsed else [])
+        else:
+            reader = csv.DictReader(io.StringIO(payload.decode("utf-8-sig")))
+            if reader.fieldnames is None:
+                raise ValueError(f"Azure Price Sheet CSV 没有表头：{source}")
+            collect(source, reader, list(reader.fieldnames))
+
     if not rates:
         raise ValueError("Azure Price Sheet 中没有可用的 Consumption tier-zero 价格")
     return {meter_id: sorted(values, key=repr) for meter_id, values in rates.items()}
@@ -1004,11 +1040,19 @@ def load_price_sheet(
     timeout: int = 1800,
     save_price_sheet_file: str | None = None,
 ) -> tuple[dict[str, list[PriceRate]], str]:
+    meter_ids = {
+        (row.get("meterId") or "").strip()
+        for row in rows
+        if (row.get("meterId") or "").strip()
+    }
     if price_sheet_file:
         path = Path(price_sheet_file)
         if not path.is_file():
             raise FileNotFoundError(f"找不到 Azure Price Sheet：{path}")
-        return parse_price_sheet(path.read_bytes(), str(path)), str(path)
+        return (
+            parse_price_sheet(path.read_bytes(), str(path), meter_ids),
+            str(path),
+        )
     payload = download_price_sheet(
         rows,
         invoice_id=invoice_id,
@@ -1019,7 +1063,10 @@ def load_price_sheet(
         target = Path(save_price_sheet_file)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(payload)
-    return parse_price_sheet(payload, "Azure Cost Management API"), "Azure Cost Management API"
+    return (
+        parse_price_sheet(payload, "Azure Cost Management API", meter_ids),
+        "Azure Cost Management API",
+    )
 
 
 def is_ri_usage(row: dict[str, str], reservation_ids: set[str]) -> bool:
