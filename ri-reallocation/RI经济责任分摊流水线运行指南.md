@@ -172,7 +172,8 @@ work/02-economic-reallocated/
 > `ri-allocation-details.csv`。
 
 如不提供 `--price-sheet-file`，脚本会使用当前 `az login` 身份自动下载。MCA/MPA
-历史账期可能还需要显式指定：
+账单在所有行都有相同 `invoiceId` 时按发票下载；未指定 `--invoice-id` 且账单行的
+`invoiceId` 不完整时，自动回退为按 Billing Profile 下载。需要强制使用指定发票时可传入：
 
 ```bash
 --invoice-id "<invoice-id>" \

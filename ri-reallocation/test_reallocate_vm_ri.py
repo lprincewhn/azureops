@@ -258,6 +258,92 @@ class PriceSheetTests(unittest.TestCase):
         poller.wait.assert_called_once_with(timeout=30)
         poller.result.assert_called_once_with()
 
+    def test_incomplete_invoice_ids_fall_back_to_billing_profile(self):
+        rows = [
+            {
+                "billingAccountId": "short-account",
+                "billingProfileId": "profile",
+                "invoiceId": "invoice-a",
+                "date": "07/01/2026",
+            },
+            {
+                "billingAccountId": "short-account",
+                "billingProfileId": "profile",
+                "invoiceId": "",
+                "date": "07/02/2026",
+            },
+            {
+                "billingAccountId": "short-account",
+                "billingProfileId": "profile",
+                "date": "07/03/2026",
+            },
+        ]
+        result = argparse.Namespace(download_url="https://example.test/prices")
+        poller = mock.Mock()
+        poller.done.return_value = True
+        poller.result.return_value = result
+        client = mock.Mock()
+        client.price_sheet.begin_download_by_billing_profile.return_value = poller
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = b"price-sheet"
+        with mock.patch.object(
+            MODULE.urllib.request, "urlopen", return_value=response
+        ):
+            payload = MODULE.download_price_sheet(
+                rows,
+                billing_account_name="full-account",
+                timeout=30,
+                client=client,
+            )
+        self.assertEqual(payload, b"price-sheet")
+        client.price_sheet.begin_download_by_billing_profile.assert_called_once_with(
+            billing_account_name="full-account",
+            billing_profile_name="profile",
+        )
+        client.price_sheet.begin_download_by_invoice.assert_not_called()
+        poller.wait.assert_called_once_with(timeout=30)
+        poller.result.assert_called_once_with()
+
+    def test_complete_invoice_ids_still_use_invoice(self):
+        rows = [
+            {
+                "billingAccountId": "short-account",
+                "billingProfileId": "profile",
+                "invoiceId": "invoice-a",
+                "date": "07/01/2026",
+            },
+            {
+                "billingAccountId": "short-account",
+                "billingProfileId": "profile",
+                "invoiceId": "invoice-a",
+                "date": "07/02/2026",
+            },
+        ]
+        result = argparse.Namespace(download_url="https://example.test/prices")
+        poller = mock.Mock()
+        poller.done.return_value = True
+        poller.result.return_value = result
+        client = mock.Mock()
+        client.price_sheet.begin_download_by_invoice.return_value = poller
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = b"price-sheet"
+        with mock.patch.object(
+            MODULE.urllib.request, "urlopen", return_value=response
+        ):
+            payload = MODULE.download_price_sheet(
+                rows,
+                billing_account_name="full-account",
+                timeout=30,
+                client=client,
+            )
+        self.assertEqual(payload, b"price-sheet")
+        client.price_sheet.begin_download_by_invoice.assert_called_once_with(
+            billing_account_name="full-account",
+            billing_profile_name="profile",
+            invoice_name="invoice-a",
+        )
+        client.price_sheet.begin_download_by_billing_profile.assert_not_called()
+
     def test_price_sheet_timeout_is_explicit(self):
         poller = mock.Mock()
         poller.done.return_value = False

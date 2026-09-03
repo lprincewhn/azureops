@@ -29,7 +29,7 @@ import urllib.request
 import urllib.parse
 import zipfile
 from collections import defaultdict
-from datetime import date, datetime, timezone
+from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -84,8 +84,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--invoice-id",
         help=(
-            "下载 MCA/MPA Price Sheet 时使用的发票 ID。账单包含多个 invoiceId "
-            "或历史 Usage 行缺少 invoiceId 时应显式指定"
+            "下载 MCA/MPA Price Sheet 时使用的发票 ID。未指定且账单行的 "
+            "invoiceId 不完整时，自动回退为按 Billing Profile 下载"
         ),
     )
     parser.add_argument(
@@ -837,7 +837,12 @@ def download_price_sheet(
     billing_profile_id = unique("billingProfileId", required=False)
     selected_invoice_id = (invoice_id or "").strip()
     if not selected_invoice_id:
-        selected_invoice_id = unique("invoiceId", required=False)
+        row_invoice_ids = [(row.get("invoiceId") or "").strip() for row in rows]
+        if row_invoice_ids and all(row_invoice_ids):
+            invoice_ids = set(row_invoice_ids)
+            if len(invoice_ids) > 1:
+                raise ValueError("输入账单包含多个 invoiceId，请分批处理")
+            selected_invoice_id = next(iter(invoice_ids))
     usage_dates = {
         parsed
         for row in rows
@@ -863,20 +868,22 @@ def download_price_sheet(
         credential = credential or AzureCliCredential()
         client = CostManagementClient(credential=credential)
 
+    def resolve_account_name() -> str:
+        account_name = (billing_account_name or "").strip()
+        if account_name:
+            return account_name
+        if credential is None:
+            raise ValueError(
+                "自动解析完整 Billing Account Name 需要 Azure credential；"
+                "传入自定义 client 时请同时传入 credential，或通过 "
+                "--billing-account-name 显式指定"
+            )
+        return resolve_billing_account_name(billing_account_id, credential)
+
     try:
         if billing_profile_id:
+            account_name = resolve_account_name()
             if selected_invoice_id:
-                account_name = (billing_account_name or "").strip()
-                if not account_name:
-                    if credential is None:
-                        raise ValueError(
-                            "自动解析完整 Billing Account Name 需要 Azure credential；"
-                            "传入自定义 client 时请同时传入 credential，或通过 "
-                            "--billing-account-name 显式指定"
-                        )
-                    account_name = resolve_billing_account_name(
-                        billing_account_id, credential
-                    )
                 print(
                     f"正在生成 invoiceId={selected_invoice_id} 的 Azure Price Sheet，"
                     f"最长等待 {timeout} 秒..."
@@ -897,15 +904,12 @@ def download_price_sheet(
                     )
                     result = wait_for_price_sheet(poller, timeout)
             else:
-                year_month = next(iter(periods))
-                current = datetime.now(timezone.utc)
-                if year_month != (current.year, current.month):
-                    raise ValueError(
-                        "历史 MCA/MPA 账单没有 invoiceId，无法自动取得对应历史 Price "
-                        "Sheet；请通过 --price-sheet-file 提供该账期价格表"
-                    )
+                print(
+                    "账单 invoiceId 不完整，正在通过 Billing Profile 生成 Azure "
+                    f"Price Sheet，最长等待 {timeout} 秒..."
+                )
                 poller = client.price_sheet.begin_download_by_billing_profile(
-                    billing_account_name=billing_account_id,
+                    billing_account_name=account_name,
                     billing_profile_name=billing_profile_id,
                 )
                 result = wait_for_price_sheet(poller, timeout)
