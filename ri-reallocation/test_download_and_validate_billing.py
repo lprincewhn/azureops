@@ -147,8 +147,11 @@ class DownloadTests(unittest.TestCase):
         self.assertEqual(row["costInBillingCurrency"], Decimal("10.00"))
         with self.assertRaises(ValueError):
             billing.normalize_usage([usage(kind="legacy")], "modern")
-        with self.assertRaises(ValueError):
-            rows(usage(), usage())
+        repeated = rows(usage(), usage(amount="2"), usage())
+        self.assertEqual(len(repeated), 3)
+        self.assertEqual(
+            sum(row["costInBillingCurrency"] for row in repeated), Decimal("22"),
+        )
         modern = usage()
         modern["properties"]["instanceName"] = modern["properties"].pop("resourceId")
         modern["properties"]["subscriptionGuid"] = "subscription"

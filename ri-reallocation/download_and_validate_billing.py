@@ -159,7 +159,6 @@ def build_urls(args: argparse.Namespace) -> tuple[str, dict[str, str], str]:
 
 def normalize_usage(records: list[dict], schema: str) -> list[dict]:
     rows = []
-    seen: set[str] = set()
     for index, record in enumerate(records, 1):
         kind = record.get("kind")
         if kind != schema:
@@ -169,10 +168,7 @@ def normalize_usage(records: list[dict], schema: str) -> list[dict]:
             raise ValueError(f"Usage row {index}: missing properties")
         row = dict(props)
         row_id = text(record.get("id") or record.get("name"))
-        if row_id and row_id in seen:
-            raise ValueError(f"Duplicate usage detail ID: {row_id}")
-        if row_id:
-            seen.add(row_id)
+        # Consumption can reuse an ID for distinct charges. Preserve every row.
         row["usageDetailId"] = row_id
         row["invoiceId"] = text(props.get("invoiceId"))
         amount_field = "costInBillingCurrency" if schema == "modern" else "cost"
