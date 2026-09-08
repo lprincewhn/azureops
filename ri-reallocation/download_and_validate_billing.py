@@ -85,8 +85,20 @@ class AzureAPI:
             except urllib.error.HTTPError as exc:
                 if exc.code not in {429, 500, 502, 503, 504} or attempt == 4:
                     raise
-                delay = exc.headers.get("Retry-After", "")
-                time.sleep(min(int(delay), 120) if delay.isdigit() else 2 ** attempt)
+                delays = [
+                    int(value) for name, value in exc.headers.items()
+                    if (
+                        name.lower() == "retry-after"
+                        or name.lower().startswith("x-ms-ratelimit-")
+                        and name.lower().endswith("-retry-after")
+                    ) and value.isdigit()
+                ]
+                delay = max(delays) if delays else 2 ** attempt
+                if delay > 600:
+                    raise RuntimeError(
+                        f"Azure requires a {delay}-second retry delay; retry the download later"
+                    ) from exc
+                time.sleep(delay)
         raise AssertionError("Unreachable retry state")
 
     def list(self, url: str) -> list[dict]:

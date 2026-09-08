@@ -224,6 +224,23 @@ class DownloadTests(unittest.TestCase):
             with self.assertRaises(FileExistsError):
                 billing.run(args, api)
 
+    def test_consumption_specific_retry_header_is_respected(self):
+        api = billing.AzureAPI(Mock())
+        api.credential.get_token.return_value = SimpleNamespace(token="test")
+        api.opener = Mock()
+        api.opener.open.side_effect = urllib.error.HTTPError(
+            billing.MANAGEMENT_URL, 429, "throttled",
+            {
+                "Retry-After": "2",
+                "x-ms-ratelimit-microsoft.consumption-commercial-retry-after": "60",
+            }, None,
+        )
+        with patch.object(billing.time, "sleep") as sleep, \
+                self.assertRaises(urllib.error.HTTPError):
+            api.request(billing.MANAGEMENT_URL)
+        self.assertEqual(sleep.call_count, 4)
+        self.assertTrue(all(call.args == (60,) for call in sleep.call_args_list))
+
     def test_download_invoice_polls_and_does_not_forward_token(self):
         api = Mock()
         api.request.side_effect = [
