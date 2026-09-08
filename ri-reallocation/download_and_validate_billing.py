@@ -13,9 +13,11 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections import defaultdict
+from collections.abc import Callable, Iterable, Iterator
 from datetime import date
 from decimal import Decimal, InvalidOperation, getcontext
 from pathlib import Path
+from tempfile import TemporaryFile
 from typing import Any
 
 
@@ -28,6 +30,10 @@ CSV_FIELDS = (
     "usageDetailId", "invoiceId", "costInBillingCurrency", "billingCurrency",
     "ResourceId", "subscriptionId", "date", "meterId", "meterCategory",
     "reservationId", "benefitId", "pricingModel", "chargeType", "quantity", "tags",
+)
+ISSUE_FIELDS = (
+    "csvRow", "usageDetailId", "invoiceId", "reason",
+    "billingCurrency", "costInBillingCurrency",
 )
 
 
@@ -102,7 +108,9 @@ class AzureAPI:
         raise AssertionError("Unreachable retry state")
 
     def list(self, url: str) -> list[dict]:
-        records: list[dict] = []
+        return list(self.iter_list(url))
+
+    def iter_list(self, url: str) -> Iterator[dict]:
         seen: set[str] = set()
         while url:
             if url in seen:
@@ -110,17 +118,17 @@ class AzureAPI:
             seen.add(url)
             status, payload, _ = self.request(url)
             if status == 204:
-                return records
+                return
             if status != 200 or not isinstance(payload.get("value"), list):
                 raise ValueError(f"Invalid Azure list response (HTTP {status})")
             if not all(isinstance(item, dict) for item in payload["value"]):
                 raise ValueError("Azure list contains a non-object record")
-            records.extend(payload["value"])
             next_link = payload.get("nextLink")
             if next_link is not None and not isinstance(next_link, str):
                 raise ValueError("Invalid Azure nextLink")
+            yield from payload["value"]
             url = urllib.parse.urljoin(url, next_link) if next_link else ""
-        return records
+            del payload
 
 
 def build_urls(args: argparse.Namespace) -> tuple[str, dict[str, str], str]:
@@ -158,7 +166,10 @@ def build_urls(args: argparse.Namespace) -> tuple[str, dict[str, str], str]:
 
 
 def normalize_usage(records: list[dict], schema: str) -> list[dict]:
-    rows = []
+    return list(iter_normalize_usage(records, schema))
+
+
+def iter_normalize_usage(records: Iterable[dict], schema: str) -> Iterator[dict]:
     for index, record in enumerate(records, 1):
         kind = record.get("kind")
         if kind != schema:
@@ -187,13 +198,13 @@ def normalize_usage(records: list[dict], schema: str) -> list[dict]:
             for key, value in details.items():
                 if row.get(key) in (None, ""):
                     row[key] = value
-        rows.append(row)
-    return rows
+        yield row
 
 
 def reconcile(
-    actual: list[dict], amortized: list[dict], invoices: list[dict],
+    actual: Iterable[dict], amortized: Iterable[dict], invoices: list[dict],
     amount_field: str = "subTotal", tolerance: Decimal = Decimal("0.01"),
+    *, issue_sink: Callable[[dict], Any] | None = None,
 ) -> tuple[dict, list[dict]]:
     if amount_field not in INVOICE_FIELDS:
         raise ValueError("Unsupported invoice amount field")
@@ -214,7 +225,10 @@ def reconcile(
     grouped: dict[str, dict[str, Decimal]] = {}
     counts: dict[str, int] = defaultdict(int)
     issues = []
+    emit_issue = issues.append if issue_sink is None else issue_sink
+    actual_count = amortized_count = missing_id_count = issue_count = 0
     for index, row in enumerate(actual, 2):
+        actual_count += 1
         code = row["billingCurrency"]
         amount = row["costInBillingCurrency"]
         actual_totals[code] += amount
@@ -227,12 +241,15 @@ def reconcile(
             else "unknown_invoice_id" if invoice_id not in invoice_map else ""
         )
         if reason:
-            issues.append({
+            issue_count += 1
+            missing_id_count += reason == "missing_invoice_id"
+            emit_issue({
                 "csvRow": index, "usageDetailId": row["usageDetailId"],
                 "invoiceId": invoice_id, "reason": reason,
                 "billingCurrency": code, "costInBillingCurrency": amount,
             })
     for row in amortized:
+        amortized_count += 1
         amortized_totals[row["billingCurrency"]] += row["costInBillingCurrency"]
 
     comparisons = []
@@ -261,7 +278,7 @@ def reconcile(
             "invoiceAmounts": {field: props.get(field) for field in INVOICE_FIELDS},
         })
     missing = [name for name in invoice_map if not counts[name]]
-    completeness = bool(actual and invoices) and not issues and not missing
+    completeness = bool(actual_count and invoices) and not issue_count and not missing
     totals = [{
         "billingCurrency": code,
         "actualAmount": actual_totals.get(code, Decimal(0)),
@@ -273,22 +290,22 @@ def reconcile(
         abs(actual_totals.get(code, Decimal(0)) - invoice_totals.get(code, Decimal(0))) <= tolerance
         for code in set(actual_totals) | set(invoice_totals)
     )
-    amounts_match = bool(actual and invoices) and totals_match and all(
+    amounts_match = bool(actual_count and invoices) and totals_match and all(
         item["status"] == "matched" for item in comparisons
     )
     report = {
-        "passed": bool(amortized) and completeness and amounts_match,
+        "passed": bool(amortized_count) and completeness and amounts_match,
         "invoiceAmountField": amount_field, "tolerance": tolerance,
-        "actualRowCount": len(actual), "amortizedRowCount": len(amortized),
+        "actualRowCount": actual_count, "amortizedRowCount": amortized_count,
         "invoiceCount": len(invoices), "invoiceIdsComplete": completeness,
         "invoiceAmountsMatch": amounts_match,
-        "missingInvoiceIdRows": sum(item["reason"] == "missing_invoice_id" for item in issues),
+        "missingInvoiceIdRows": missing_id_count,
         "unknownInvoiceIds": sorted(set(grouped) - set(invoice_map)),
         "invoicesWithoutActualRows": missing,
         "emptyDatasets": [
-            name for name, rows in (
-                ("actual", actual), ("amortized", amortized), ("invoices", invoices)
-            ) if not rows
+            name for name, count in (
+                ("actual", actual_count), ("amortized", amortized_count), ("invoices", len(invoices))
+            ) if not count
         ],
         "totalsByCurrency": totals, "invoices": comparisons,
     }
@@ -296,7 +313,17 @@ def reconcile(
 
 
 def write_json(path: Path, value: Any) -> None:
-    path.write_text(json.dumps(value, ensure_ascii=False, indent=2, default=str) + "\n", encoding="utf-8")
+    with path.open("w", encoding="utf-8") as target:
+        json.dump(value, target, ensure_ascii=False, indent=2, default=str)
+        target.write("\n")
+
+
+def csv_row(row: dict) -> dict:
+    return {
+        key: json.dumps(value, ensure_ascii=False, default=str)
+        if isinstance(value, (dict, list)) else value
+        for key, value in row.items()
+    }
 
 
 def write_csv(path: Path, rows: list[dict], fields: tuple[str, ...]) -> None:
@@ -305,11 +332,40 @@ def write_csv(path: Path, rows: list[dict], fields: tuple[str, ...]) -> None:
         writer = csv.DictWriter(target, fieldnames=columns)
         writer.writeheader()
         for row in rows:
-            writer.writerow({
-                key: json.dumps(value, ensure_ascii=False, default=str)
-                if isinstance(value, (dict, list)) else value
-                for key, value in row.items()
-            })
+            writer.writerow(csv_row(row))
+
+
+def export_usage(
+    records: Iterable[dict], schema: str, raw_path: Path, csv_path: Path,
+) -> Iterator[dict]:
+    # Later pages can add columns. Spool CSV cells to disk instead of retaining rows.
+    with raw_path.open("w", encoding="utf-8") as raw, TemporaryFile(
+        mode="w+", encoding="utf-8", dir=csv_path.parent,
+    ) as spool:
+        raw.write("[")
+
+        def save_records() -> Iterator[dict]:
+            separator = ""
+            for record in records:
+                raw.write(separator + "\n")
+                json.dump(record, raw, ensure_ascii=False, indent=2, default=str)
+                separator = ","
+                yield record
+
+        columns = set(CSV_FIELDS)
+        for row in iter_normalize_usage(save_records(), schema):
+            columns.update(row)
+            spool.write(json.dumps(csv_row(row), ensure_ascii=False, default=str) + "\n")
+            yield row
+        raw.write("\n]\n")
+        spool.seek(0)
+        with csv_path.open("w", encoding="utf-8-sig", newline="") as target:
+            writer = csv.DictWriter(
+                target, fieldnames=list(CSV_FIELDS) + sorted(columns - set(CSV_FIELDS)),
+            )
+            writer.writeheader()
+            for line in spool:
+                writer.writerow(json.loads(line))
 
 
 def download_invoice(api: AzureAPI, account_url: str, name: str, output: Path, timeout: int) -> Path:
@@ -400,25 +456,27 @@ def run(args: argparse.Namespace, api: AzureAPI) -> dict:
         "usageSchema": args.usage_schema, "invoiceAmountField": args.invoice_amount_field,
         "tolerance": args.tolerance,
     })
-    datasets = {}
-    for metric, prefix in (("ActualCost", "Actual"), ("AmortizedCost", "Amortized")):
-        records = api.list(usage_urls[metric])
-        write_json(root / f"{prefix}.json", records)
-        rows = normalize_usage(records, args.usage_schema)
-        folder = root / prefix.lower()
-        folder.mkdir()
-        write_csv(folder / f"{prefix}_{args.start_date}_{args.end_date}.csv", rows, CSV_FIELDS)
-        datasets[metric] = rows
     invoices = api.list(invoice_url)
     write_json(root / "invoices.json", invoices)
-    report, issues = reconcile(
-        datasets["ActualCost"], datasets["AmortizedCost"], invoices,
-        args.invoice_amount_field, args.tolerance,
-    )
-    write_csv(root / "invoice-id-issues.csv", issues, (
-        "csvRow", "usageDetailId", "invoiceId", "reason",
-        "billingCurrency", "costInBillingCurrency",
-    ))
+    datasets = {}
+    for metric, prefix in (("ActualCost", "Actual"), ("AmortizedCost", "Amortized")):
+        folder = root / prefix.lower()
+        folder.mkdir()
+        datasets[metric] = export_usage(
+            api.iter_list(usage_urls[metric]), args.usage_schema, root / f"{prefix}.json",
+            folder / f"{prefix}_{args.start_date}_{args.end_date}.csv",
+        )
+    try:
+        with (root / "invoice-id-issues.csv").open("w", encoding="utf-8-sig", newline="") as target:
+            writer = csv.DictWriter(target, fieldnames=ISSUE_FIELDS)
+            writer.writeheader()
+            report, _ = reconcile(
+                datasets["ActualCost"], datasets["AmortizedCost"], invoices,
+                args.invoice_amount_field, args.tolerance, issue_sink=writer.writerow,
+            )
+    finally:
+        for dataset in datasets.values():
+            dataset.close()
     write_csv(root / "invoice-reconciliation.csv", report["invoices"], (
         "invoiceId", "billingCurrency", "invoiceAmount", "actualAmount", "difference", "status",
     ))

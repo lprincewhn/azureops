@@ -3,6 +3,7 @@ import io
 import json
 import sys
 import tempfile
+import tracemalloc
 import unittest
 import urllib.error
 from decimal import Decimal
@@ -43,6 +44,21 @@ def rows(*records):
 
 
 class ReconciliationTests(unittest.TestCase):
+    def test_single_pass_iterators_and_streamed_issues_match_list_results(self):
+        actual = rows(usage(), usage("r2", "", "0"), usage("r3", "unknown", "-2"))
+        amortized = rows(usage(amount="6"))
+        expected, expected_issues = billing.reconcile(actual, amortized, [invoice()])
+        emitted = []
+        report, retained = billing.reconcile(
+            iter(actual), iter(amortized), [invoice()], issue_sink=emitted.append,
+        )
+        self.assertEqual(report, expected)
+        self.assertEqual(emitted, expected_issues)
+        self.assertEqual(retained, [])
+        empty, _ = billing.reconcile(iter([]), iter([]), [])
+        self.assertEqual(empty["emptyDatasets"], ["actual", "amortized", "invoices"])
+        self.assertFalse(empty["passed"])
+
     def test_uses_pretax_not_amount_due_or_amortized(self):
         report, issues = billing.reconcile(rows(usage()), rows(usage(amount="6")), [invoice()])
         self.assertTrue(report["passed"])
@@ -180,6 +196,21 @@ class DownloadTests(unittest.TestCase):
         api.request = Mock(return_value=(204, {}, {}))
         self.assertEqual(api.list(first), [])
 
+    def test_pagination_iterator_fetches_only_when_consumed(self):
+        api = billing.AzureAPI(Mock())
+        api.request = Mock(side_effect=[
+            (200, {"value": [usage(), usage("r2")], "nextLink": "/second"}, {}),
+            (200, {"value": [usage("r3")]}, {}),
+        ])
+        records = api.iter_list(billing.MANAGEMENT_URL + "/first")
+        api.request.assert_not_called()
+        self.assertEqual(next(records)["id"], "row1")
+        self.assertEqual(next(records)["id"], "r2")
+        self.assertEqual(api.request.call_count, 1)
+        self.assertEqual(next(records)["id"], "r3")
+        self.assertEqual(list(records), [])
+        self.assertEqual(api.request.call_count, 2)
+
     def test_request_protects_tokens_and_parses_exact_decimals(self):
         credential = Mock()
         credential.get_token.return_value = SimpleNamespace(token="test-token")
@@ -213,7 +244,8 @@ class DownloadTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             args = self.args("--output-dir", str(Path(tmp) / "output"))
             api = Mock()
-            api.list.side_effect = [[usage(invoice="")], [usage(amount="3")], [invoice()]]
+            api.list.return_value = [invoice()]
+            api.iter_list.side_effect = [iter([usage(invoice="")]), iter([usage(amount="3")])]
             report = billing.run(args, api)
             self.assertFalse(report["passed"])
             saved = json.loads((args.output_dir / "validation-summary.json").read_text())
@@ -306,7 +338,8 @@ class DownloadTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             args = self.args("--output-dir", str(Path(tmp) / "output"))
             api = Mock()
-            api.list.side_effect = [[purchase], [amortized], [invoice()]]
+            api.list.return_value = [invoice()]
+            api.iter_list.side_effect = [iter([purchase]), iter([amortized])]
             self.assertTrue(billing.run(args, api)["passed"])
             actual_files = allocation.read_csv_files(
                 list((args.output_dir / "actual").glob("*.csv")), "costInBillingCurrency",
@@ -318,6 +351,83 @@ class DownloadTests(unittest.TestCase):
             amortized_costs = allocation.collect_amortized_data(amortized_files, "costInBillingCurrency")[0]
             self.assertEqual(actual_costs["reservation"], Decimal("10"))
             self.assertEqual(amortized_costs["reservation"], Decimal("6"))
+
+    def test_streamed_exports_preserve_late_columns_raw_records_and_duplicate_ids(self):
+        first = usage()
+        last = usage(amount="0.1234567890123456789")
+        last["properties"]["lateColumn"] = {"nested": ["value", None]}
+        last["properties"]["nullable"] = None
+        with tempfile.TemporaryDirectory() as tmp:
+            raw_path, csv_path = Path(tmp) / "raw.json", Path(tmp) / "rows.csv"
+            exported = list(billing.export_usage(iter([first, last]), "modern", raw_path, csv_path))
+            self.assertEqual(exported, rows(first, last))
+            self.assertEqual(json.loads(raw_path.read_text()), [first, last])
+            expected = Path(tmp) / "expected.csv"
+            billing.write_csv(expected, rows(first, last), billing.CSV_FIELDS)
+            self.assertEqual(csv_path.read_bytes(), expected.read_bytes())
+            self.assertEqual({path.name for path in Path(tmp).iterdir()},
+                             {"raw.json", "rows.csv", "expected.csv"})
+
+    def test_empty_stream_exports_valid_json_and_csv_header(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            raw_path, csv_path = Path(tmp) / "raw.json", Path(tmp) / "rows.csv"
+            self.assertEqual(list(billing.export_usage(iter([]), "modern", raw_path, csv_path)), [])
+            self.assertEqual(json.loads(raw_path.read_text()), [])
+            with csv_path.open(encoding="utf-8-sig") as source:
+                self.assertEqual(list(csv.reader(source)), [list(billing.CSV_FIELDS)])
+
+    def test_late_page_failure_cannot_produce_success_report_or_leave_spool(self):
+        def records():
+            yield usage()
+            raise ValueError("Invalid later page")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            args = self.args("--output-dir", str(Path(tmp) / "output"))
+            api = Mock()
+            api.list.return_value = [invoice()]
+            api.iter_list.side_effect = [records(), iter([usage()])]
+            with self.assertRaisesRegex(ValueError, "Invalid later page"):
+                billing.run(args, api)
+            self.assertFalse((args.output_dir / "validation-summary.json").exists())
+            self.assertEqual(list((args.output_dir / "actual").iterdir()), [])
+
+    def test_download_memory_does_not_scale_with_usage_or_issue_row_count(self):
+        class PagedAPI(billing.AzureAPI):
+            def __init__(self, count):
+                self.count = count
+
+            def request(self, url, method="GET"):
+                if "/invoices?" in url:
+                    return 200, {"value": [invoice()]}, {}
+                query = parse_qs(urlsplit(url).query)
+                start = int(query.get("offset", ["0"])[0])
+                end = min(start + 25, self.count)
+                values = []
+                for index in range(start, end):
+                    record = usage(str(index), invoice="", amount="0.000000000000000001")
+                    record["properties"]["additionalInfo"] = str(index) + "x" * 2048
+                    values.append(record)
+                payload = {"value": values}
+                if end < self.count:
+                    payload["nextLink"] = billing.MANAGEMENT_URL + f"/usage?offset={end}"
+                return 200, payload, {}
+
+        peaks = []
+        for count in (100, 5000):
+            with tempfile.TemporaryDirectory() as tmp:
+                args = self.args("--output-dir", str(Path(tmp) / "output"))
+                tracemalloc.start()
+                try:
+                    report = billing.run(args, PagedAPI(count))
+                    peaks.append(tracemalloc.get_traced_memory()[1])
+                finally:
+                    tracemalloc.stop()
+                self.assertEqual(report["actualRowCount"], count)
+                self.assertEqual(report["amortizedRowCount"], count)
+                self.assertEqual(report["missingInvoiceIdRows"], count)
+                with (args.output_dir / "invoice-id-issues.csv").open(encoding="utf-8-sig") as source:
+                    self.assertEqual(sum(1 for _ in csv.DictReader(source)), count)
+        self.assertLess(peaks[1], peaks[0] + 2 * 1024 * 1024)
 
     def test_invalid_arguments_rejected(self):
         for extra in (
