@@ -6,6 +6,7 @@ import tempfile
 import tracemalloc
 import unittest
 import urllib.error
+from datetime import date
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -134,6 +135,7 @@ class DownloadTests(unittest.TestCase):
         return billing.parse_args([
             "--billing-account-name", "example:account",
             "--billing-profile-name", "profile",
+            "--usage-source", "consumption",
             "--start-date", "2026-08-01", "--end-date", "2026-08-31", *extra,
         ])
 
@@ -435,6 +437,392 @@ class DownloadTests(unittest.TestCase):
             ("--end-date", "2026-07-31"), ("--invoice-download-timeout", "0"),
             ("--billing-account-name", "/providers/example"),
         ):
+            with self.subTest(extra=extra), patch("sys.stderr", new=io.StringIO()), self.assertRaises(SystemExit):
+                self.args(*extra)
+
+
+def cost_csv(*records):
+    source = io.StringIO(newline="")
+    fields = list(dict.fromkeys(key for record in records for key in record))
+    writer = csv.DictWriter(source, fieldnames=fields)
+    writer.writeheader()
+    writer.writerows(records)
+    return source.getvalue().encode("utf-8-sig")
+
+
+def cost_row(amount="10.00", **extra):
+    return {
+        "InvoiceId": "G123456789", "CostInBillingCurrency": amount, "BillingCurrency": "USD",
+        "ResourceId": "/subscriptions/example/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/vm",
+        "MeterCategory": "Virtual Machines", "MeterName": "D2 v5",
+        "PricingModel": "Reservation", "ChargeType": "Usage", "ReservationId": "reservation",
+        "BenefitId": "/providers/Microsoft.Capacity/reservationOrders/reservation/reservations/ri",
+        "Tags": '"project":"demo"', "Date": "2026-08-01", **extra,
+    }
+
+
+def cost_result(*sizes):
+    return {
+        "status": "Completed", "validTill": "2026-10-01T00:00:00Z",
+        "manifest": {
+            "dataFormat": "Csv", "compressData": False, "blobCount": len(sizes),
+            "byteCount": sum(sizes),
+            "blobs": [
+                {"blobLink": f"https://reports.blob.core.windows.net/files/{index}?sig=secret",
+                 "byteCount": size}
+                for index, size in enumerate(sizes, 1)
+            ],
+        },
+    }
+
+
+class CostDetailsTests(unittest.TestCase):
+    def args(self, *extra):
+        return billing.parse_args([
+            "--billing-account-name", "example:account",
+            "--billing-profile-name", "profile",
+            "--start-date", "2026-08-01", "--end-date", "2026-08-31", *extra,
+        ])
+
+    def test_cost_details_is_default_and_uses_billing_profile_scope(self):
+        args = self.args()
+        self.assertEqual(args.usage_source, "cost-details")
+        account, urls, invoice_url = billing.build_urls(args)
+        self.assertEqual(urls["ActualCost"], urls["AmortizedCost"])
+        self.assertIn("/billingProfiles/profile/providers/Microsoft.CostManagement/generateCostDetailsReport?", urls["ActualCost"])
+        self.assertNotIn("Microsoft.Consumption", urls["ActualCost"])
+        self.assertNotIn("/billingProfiles/", account)
+        self.assertIn("/billingProfiles/profile/invoices?", invoice_url)
+        args.billing_profile_name = None
+        self.assertNotIn("/billingProfiles/", billing.build_urls(args)[1]["ActualCost"])
+
+    def test_periods_split_month_boundaries_without_gaps_or_overlap(self):
+        self.assertEqual(list(billing.report_periods(date(2024, 2, 28), date(2024, 3, 2))), [
+            (date(2024, 2, 28), date(2024, 2, 29)),
+            (date(2024, 3, 1), date(2024, 3, 2)),
+        ])
+        self.assertEqual(list(billing.report_periods(date(2025, 12, 31), date(2026, 1, 1))), [
+            (date(2025, 12, 31), date(2025, 12, 31)),
+            (date(2026, 1, 1), date(2026, 1, 1)),
+        ])
+
+    def test_request_serializes_json_body_and_sets_content_type(self):
+        api = billing.AzureAPI(Mock())
+        api.credential.get_token.return_value = SimpleNamespace(token="test-token")
+        response = Mock(status=202, headers={})
+        response.read.return_value = b""
+        api.opener = Mock()
+        api.opener.open.return_value.__enter__ = Mock(return_value=response)
+        api.opener.open.return_value.__exit__ = Mock(return_value=False)
+        body = {"metric": "AmortizedCost", "timePeriod": {"start": "2026-08-01", "end": "2026-08-31"}}
+        api.request(billing.MANAGEMENT_URL + "/report", "POST", body=body)
+        request = api.opener.open.call_args.args[0]
+        self.assertEqual(json.loads(request.data), body)
+        self.assertEqual(request.get_header("Content-type"), "application/json")
+        self.assertEqual(request.get_method(), "POST")
+
+    def test_report_polls_location_and_reuses_poll_url_without_posting_again(self):
+        api = Mock()
+        result = cost_result(123)
+        api.request.side_effect = [
+            (202, {}, {"Location": "/poll?token=a%2Bb", "Retry-After": "2"}),
+            (202, {}, {"Retry-After": "3"}),
+            (200, result, {}),
+        ]
+        body = {"metric": "ActualCost"}
+        with patch.object(billing.time, "sleep") as sleep:
+            self.assertEqual(billing.generate_cost_report(
+                api, billing.MANAGEMENT_URL + "/report", body, 60,
+            ), result)
+        self.assertEqual([call.args for call in sleep.call_args_list], [(2,), (3,)])
+        calls = api.request.call_args_list
+        self.assertEqual(calls[0].kwargs["body"], body)
+        self.assertEqual(calls[0].args[1], "POST")
+        self.assertEqual(calls[1].args, (billing.MANAGEMENT_URL + "/poll?token=a%2Bb",))
+        self.assertEqual(calls[2].args, calls[1].args)
+        self.assertEqual(calls[0].kwargs["deadline"], calls[2].kwargs["deadline"])
+
+    def test_report_immediate_completion_no_data_failure_and_timeout(self):
+        api = Mock()
+        for status, payload in ((204, {}), (200, {"status": "NoDataFound"}), (200, cost_result(1))):
+            api.request.return_value = (status, payload, {})
+            result = billing.generate_cost_report(api, billing.MANAGEMENT_URL, {}, 60)
+            self.assertEqual(result["status"], "NoDataFound" if status == 204 else payload["status"])
+        cases = [
+            (200, {"status": "Failed", "error": {"code": "InvalidScope"}}, {}, ValueError),
+            (200, {}, {}, ValueError),
+            (202, {}, {}, ValueError),
+            (202, {}, {"Location": "/poll", "Retry-After": "invalid"}, ValueError),
+            (202, {}, {"Location": "/poll", "Retry-After": "60"}, TimeoutError),
+            (206, {}, {}, ValueError),
+        ]
+        for status, payload, headers, error in cases:
+            api.request.return_value = (status, payload, headers)
+            with self.subTest(status=status, payload=payload, headers=headers), self.assertRaises(error):
+                billing.generate_cost_report(api, billing.MANAGEMENT_URL, {}, 10)
+
+    def test_report_retry_respects_deadline(self):
+        api = billing.AzureAPI(Mock())
+        api.credential.get_token.return_value = SimpleNamespace(token="test")
+        api.opener = Mock()
+        api.opener.open.side_effect = urllib.error.HTTPError(
+            billing.MANAGEMENT_URL, 429, "throttled", {"Retry-After": "20"}, None,
+        )
+        with patch.object(billing.time, "monotonic", return_value=100), \
+                patch.object(billing.time, "sleep") as sleep:
+            with self.assertRaises(TimeoutError):
+                api.request(billing.MANAGEMENT_URL, "POST", body={}, deadline=110)
+            sleep.assert_not_called()
+            self.assertEqual(api.opener.open.call_args.kwargs["timeout"], 10)
+
+    def test_manifest_rejects_missing_partitions_compression_and_invalid_links(self):
+        self.assertEqual(len(billing.cost_report_blobs(cost_result(10, 20))), 2)
+        self.assertEqual(billing.cost_report_blobs({"status": "NoDataFound"}), [])
+        invalid = [
+            {"status": "Completed"}, cost_result(),
+            {**cost_result(10), "manifest": {**cost_result(10)["manifest"], "compressData": True}},
+            {**cost_result(10), "manifest": {**cost_result(10)["manifest"], "blobCount": 2}},
+            {**cost_result(10), "manifest": {**cost_result(10)["manifest"], "byteCount": 11}},
+            {**cost_result(10), "manifest": {**cost_result(10)["manifest"], "dataFormat": "Parquet"}},
+        ]
+        for url in ("http://reports.blob.core.windows.net/x", "https://evil.test/x",
+                    "https://user@reports.blob.core.windows.net/x"):
+            result = cost_result(10)
+            result["manifest"]["blobs"][0]["blobLink"] = url
+            invalid.append(result)
+        duplicate = cost_result(10, 10)
+        duplicate["manifest"]["blobs"][1]["blobLink"] = duplicate["manifest"]["blobs"][0]["blobLink"]
+        invalid.append(duplicate)
+        for result in invalid:
+            with self.subTest(result=result), self.assertRaises(ValueError):
+                billing.cost_report_blobs(result)
+
+    def test_blob_download_streams_without_token_and_cleans_partial_on_failure(self):
+        class ChunkedResponse(io.BytesIO):
+            status = 200
+
+            def read(self, size=-1):
+                if size <= 0 or size > 1024 * 1024:
+                    raise AssertionError("Unbounded blob read")
+                return super().read(size)
+
+        payload = b"x" * (2 * 1024 * 1024 + 1)
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(billing.urllib.request, "build_opener") as build:
+            output = Path(tmp) / "part.csv"
+            url = "https://reports.blob.core.windows.net/files/1?sig=secret"
+            build.return_value.open.return_value = ChunkedResponse(payload)
+            billing.download_cost_blob(url, output, len(payload))
+            self.assertEqual(output.read_bytes(), payload)
+            self.assertEqual(build.return_value.open.call_args.args, (url,))
+            self.assertIsInstance(build.call_args.args[0], billing.NoRedirect)
+            output.unlink()
+            for expected in (len(payload) - 1, len(payload) + 1):
+                build.return_value.open.return_value = ChunkedResponse(payload)
+                with self.assertRaises(ValueError):
+                    billing.download_cost_blob(url, output, expected)
+                self.assertFalse(output.exists())
+                self.assertFalse(output.with_suffix(".part").exists())
+
+    def test_csv_aliases_tags_and_exact_amounts(self):
+        record = {
+            "Invoice Id": "", "Cost": "-0.1234567890123456789", "Currency": "usd",
+            "InstanceId": "/resource", "SubscriptionGuid": "subscription",
+            "ResourceGroup": "rg", "UsageDateTime": "2026-08-01", "Tags": '{"project":"demo"}',
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "part.csv"
+            path.write_bytes(cost_csv(record))
+            row = next(billing.read_cost_csv(path))
+            self.assertEqual(row["costInBillingCurrency"], Decimal(record["Cost"]))
+            self.assertEqual(row["invoiceId"], "")
+            self.assertEqual(row["billingCurrency"], "USD")
+            self.assertEqual(row["ResourceId"], "/resource")
+            self.assertEqual(row["resourceGroupName"], "rg")
+            self.assertEqual(row["subscriptionId"], "subscription")
+            self.assertEqual(row["tags"], {"project": "demo"})
+            self.assertEqual(row["date"], "2026-08-01")
+            self.assertTrue(row["usageDetailId"].endswith("/part.csv:2"))
+            self.assertEqual(row["Cost"], record["Cost"])
+
+    def test_csv_rejects_bad_headers_rows_amounts_and_tags(self):
+        bad = [
+            b"", b"<html>Error</html>", b"Cost,BillingCurrency,Cost\n1,USD,1\n",
+            b"Cost,Billing Currency,BillingCurrency\n1,USD,USD\n",
+            b"Cost,BillingCurrency\n1\n", b"Cost,BillingCurrency\n1,USD,extra\n",
+            cost_csv(cost_row("NaN")), cost_csv(cost_row(BillingCurrency="")),
+            cost_csv(cost_row(Tags="[]")), cost_csv(cost_row(Tags="not JSON")),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "part.csv"
+            for payload in bad:
+                path.write_bytes(payload)
+                with self.subTest(payload=payload), self.assertRaises((ValueError, csv.Error)):
+                    list(billing.read_cost_csv(path))
+
+    def test_default_run_downloads_all_parts_preserves_pipeline_and_redacts_sas(self):
+        import allocate_ri_difference as allocation
+        import reallocate_vm_ri as reallocation
+
+        parts = [
+            cost_csv(cost_row("12", ChargeType="Purchase")),
+            cost_csv(cost_row("-2", ChargeType="Purchase", LateColumn="kept")),
+            cost_csv(cost_row("6")),
+        ]
+        api = Mock()
+        api.list.return_value = [invoice()]
+        api.request.side_effect = [
+            (200, cost_result(len(parts[0]), len(parts[1])), {}),
+            (200, cost_result(len(parts[2])), {}),
+        ]
+        responses = [io.BytesIO(part) for part in parts]
+        for response in responses:
+            response.status = 200
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(billing.urllib.request, "build_opener") as build:
+            build.return_value.open.side_effect = responses
+            args = self.args("--output-dir", str(Path(tmp) / "output"))
+            report = billing.run(args, api)
+            self.assertTrue(report["passed"])
+            self.assertEqual(report["actualRowCount"], 2)
+            self.assertEqual(report["amortizedRowCount"], 1)
+            self.assertEqual(build.return_value.open.call_count, 3)
+            self.assertEqual(
+                [call.kwargs["body"]["metric"] for call in api.request.call_args_list],
+                ["ActualCost", "AmortizedCost"],
+            )
+            self.assertNotIn("Microsoft.Consumption", json.dumps(json.loads(
+                (args.output_dir / "request.json").read_text(),
+            )))
+            for manifest in (args.output_dir / "cost-details").rglob("manifest.json"):
+                self.assertNotIn("sig=", manifest.read_text())
+                self.assertNotIn("blobLink", manifest.read_text())
+            self.assertFalse((args.output_dir / "Actual.json").exists())
+            actual_paths = list((args.output_dir / "actual").glob("*.csv"))
+            amortized_paths = list((args.output_dir / "amortized").glob("*.csv"))
+            with actual_paths[0].open(encoding="utf-8-sig") as source:
+                actual_rows = list(csv.DictReader(source))
+            self.assertEqual(actual_rows[0]["LateColumn"], "")
+            self.assertEqual(actual_rows[1]["LateColumn"], "kept")
+            self.assertEqual(reallocation.parse_tags(actual_rows[0]["tags"]), {"project": "demo"})
+            actual_data = allocation.read_csv_files(actual_paths, "costInBillingCurrency")
+            amortized_data = allocation.read_csv_files(amortized_paths, "costInBillingCurrency")
+            self.assertEqual(allocation.collect_actual_costs(actual_data, "costInBillingCurrency")[0]["reservation"],
+                             Decimal("10"))
+            self.assertEqual(allocation.collect_amortized_data(amortized_data, "costInBillingCurrency")[0]["reservation"],
+                             Decimal("6"))
+            self.assertEqual(len(list((args.output_dir / "cost-details").rglob("part-*.csv"))), 3)
+            self.assertEqual(list(args.output_dir.rglob("*.part")), [])
+
+    def test_multiple_months_and_no_data_cannot_pass(self):
+        api = Mock()
+        api.list.return_value = [invoice()]
+        api.request.return_value = (200, {"status": "NoDataFound"}, {})
+        with tempfile.TemporaryDirectory() as tmp:
+            args = self.args("--start-date", "2026-07-31", "--output-dir", str(Path(tmp) / "output"))
+            report = billing.run(args, api)
+            self.assertFalse(report["passed"])
+            self.assertEqual(report["emptyDatasets"], ["actual", "amortized"])
+            self.assertEqual(api.request.call_count, 4)
+            self.assertEqual(api.request.call_args_list[0].kwargs["body"]["timePeriod"],
+                             {"start": "2026-07-31", "end": "2026-07-31"})
+            self.assertEqual(api.request.call_args_list[1].kwargs["body"]["timePeriod"],
+                             {"start": "2026-08-01", "end": "2026-08-31"})
+
+    def test_missing_invoice_ids_are_streamed_with_final_csv_row_numbers(self):
+        parts = [
+            cost_csv(cost_row("10")),
+            cost_csv(cost_row("0", InvoiceId=""), cost_row("-1", InvoiceId="unknown")),
+            cost_csv(cost_row("6")),
+        ]
+        api = Mock()
+        api.list.return_value = [invoice()]
+        api.request.side_effect = [
+            (200, cost_result(len(parts[0]), len(parts[1])), {}),
+            (200, cost_result(len(parts[2])), {}),
+        ]
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(billing.urllib.request, "build_opener") as build:
+            responses = [io.BytesIO(part) for part in parts]
+            for response in responses:
+                response.status = 200
+            build.return_value.open.side_effect = responses
+            args = self.args("--output-dir", str(Path(tmp) / "output"))
+            report = billing.run(args, api)
+            self.assertFalse(report["passed"])
+            self.assertEqual(report["missingInvoiceIdRows"], 1)
+            self.assertEqual(report["unknownInvoiceIds"], ["unknown"])
+            with (args.output_dir / "invoice-id-issues.csv").open(encoding="utf-8-sig") as source:
+                issues = list(csv.DictReader(source))
+            self.assertEqual([issue["csvRow"] for issue in issues], ["3", "4"])
+            self.assertTrue(issues[0]["usageDetailId"].endswith("part-0002.csv:2"))
+
+    def test_cost_report_pipeline_memory_does_not_scale_with_file_size(self):
+        class BoundedResponse:
+            status = 200
+
+            def __init__(self, path):
+                self.handle = path.open("rb")
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                self.handle.close()
+
+            def read(self, size=-1):
+                if size <= 0 or size > 1024 * 1024:
+                    raise AssertionError("Unbounded report download")
+                return self.handle.read(size)
+
+        peaks = []
+        for count in (100, 5000):
+            with tempfile.TemporaryDirectory() as tmp, \
+                    patch.object(billing.urllib.request, "build_opener") as build:
+                fixture = Path(tmp) / "fixture.csv"
+                record = cost_row("0.000000000000000001", InvoiceId="", Extra="x" * 2048)
+                with fixture.open("w", newline="", encoding="utf-8") as target:
+                    writer = csv.DictWriter(target, fieldnames=list(record))
+                    writer.writeheader()
+                    for _ in range(count):
+                        writer.writerow(record)
+                api = Mock()
+                api.list.return_value = [invoice()]
+                api.request.return_value = (200, cost_result(fixture.stat().st_size), {})
+                build.return_value.open.side_effect = lambda url, timeout: BoundedResponse(fixture)
+                args = self.args("--output-dir", str(Path(tmp) / "output"))
+                tracemalloc.start()
+                try:
+                    report = billing.run(args, api)
+                    peaks.append(tracemalloc.get_traced_memory()[1])
+                finally:
+                    tracemalloc.stop()
+                self.assertEqual(report["actualRowCount"], count)
+                self.assertEqual(report["amortizedRowCount"], count)
+                self.assertEqual(report["missingInvoiceIdRows"], count)
+                self.assertEqual(report["totalsByCurrency"][0]["actualAmount"],
+                                 count * Decimal("0.000000000000000001"))
+        self.assertLess(peaks[1], peaks[0] + 3 * 1024 * 1024)
+
+    def test_partial_report_failure_does_not_write_final_summary(self):
+        api = Mock()
+        api.list.return_value = [invoice()]
+        api.request.side_effect = [
+            (200, cost_result(10), {}),
+            (200, {"status": "Failed"}, {}),
+        ]
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(billing, "download_cost_blob") as download:
+            def write_bad_csv(url, path, expected):
+                path.write_bytes(b"invalid\n")
+            download.side_effect = write_bad_csv
+            args = self.args("--output-dir", str(Path(tmp) / "output"))
+            with self.assertRaises(ValueError):
+                billing.run(args, api)
+            self.assertFalse((args.output_dir / "validation-summary.json").exists())
+
+    def test_invalid_source_options_rejected(self):
+        for extra in (("--cost-details-timeout", "0"), ("--usage-schema", "legacy")):
             with self.subTest(extra=extra), patch("sys.stderr", new=io.StringIO()), self.assertRaises(SystemExit):
                 self.args(*extra)
 

@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Download Consumption cost details and reconcile ActualCost with invoices."""
+"""Download Cost Details reports and reconcile ActualCost with invoices."""
 
 from __future__ import annotations
 
 import argparse
+import calendar
 import csv
 import json
 import re
@@ -14,7 +15,7 @@ import urllib.parse
 import urllib.request
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal, InvalidOperation, getcontext
 from pathlib import Path
 from tempfile import TemporaryFile
@@ -24,6 +25,7 @@ from typing import Any
 MANAGEMENT_URL = "https://management.azure.com"
 getcontext().prec = 40
 USAGE_API_VERSION = "2024-08-01"
+COST_DETAILS_API_VERSION = "2025-03-01"
 BILLING_API_VERSION = "2024-04-01"
 INVOICE_FIELDS = ("subTotal", "taxAmount", "totalAmount", "billedAmount", "amountDue")
 CSV_FIELDS = (
@@ -60,7 +62,7 @@ def currency(value: Any, label: str) -> str:
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        raise ValueError("Unexpected redirect from Azure management API")
+        raise ValueError("Unexpected HTTP redirect")
 
 
 class AzureAPI:
@@ -68,7 +70,10 @@ class AzureAPI:
         self.credential = credential
         self.opener = urllib.request.build_opener(NoRedirect())
 
-    def request(self, url: str, method: str = "GET") -> tuple[int, dict, Any]:
+    def request(
+        self, url: str, method: str = "GET", *, body: dict | None = None,
+        deadline: float | None = None,
+    ) -> tuple[int, dict, Any]:
         parsed = urllib.parse.urlsplit(url)
         if (
             parsed.scheme != "https" or parsed.netloc != "management.azure.com"
@@ -76,15 +81,24 @@ class AzureAPI:
         ):
             raise ValueError("Refusing a non-Azure-management API URL")
         for attempt in range(5):
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError("Cost Details report generation timed out")
             token = self.credential.get_token(MANAGEMENT_URL + "/.default").token
             request = urllib.request.Request(
-                url, data=b"" if method == "POST" else None, method=method,
-                headers={"Authorization": "Bearer " + token, "Accept": "application/json"},
+                url, data=json.dumps(body).encode("utf-8") if body is not None
+                else b"" if method == "POST" else None, method=method,
+                headers={
+                    "Authorization": "Bearer " + token, "Accept": "application/json",
+                    **({"Content-Type": "application/json"} if body is not None else {}),
+                },
             )
             try:
-                with self.opener.open(request, timeout=120) as response:
-                    body = response.read()
-                    payload = json.loads(body, parse_float=Decimal) if body else {}
+                timeout = 120 if deadline is None else min(120, deadline - time.monotonic())
+                if timeout <= 0:
+                    raise TimeoutError("Cost Details report generation timed out")
+                with self.opener.open(request, timeout=timeout) as response:
+                    response_body = response.read()
+                    payload = json.loads(response_body, parse_float=Decimal) if response_body else {}
                     if not isinstance(payload, dict):
                         raise ValueError("Azure API response must be a JSON object")
                     return response.status, payload, response.headers
@@ -104,6 +118,9 @@ class AzureAPI:
                     raise RuntimeError(
                         f"Azure requires a {delay}-second retry delay; retry the download later"
                     ) from exc
+                if deadline is not None and time.monotonic() + delay >= deadline:
+                    raise TimeoutError("Cost Details report retry exceeds timeout") from exc
+                exc.close()
                 time.sleep(delay)
         raise AssertionError("Unreachable retry state")
 
@@ -157,6 +174,12 @@ def build_urls(args: argparse.Namespace) -> tuple[str, dict[str, str], str]:
         + urllib.parse.urlencode({**params, "metric": metric})
         for metric in ("ActualCost", "AmortizedCost")
     }
+    if args.usage_source == "cost-details":
+        usage_urls = {
+            metric: scope + "/providers/Microsoft.CostManagement/generateCostDetailsReport?"
+            + urllib.parse.urlencode({"api-version": COST_DETAILS_API_VERSION})
+            for metric in ("ActualCost", "AmortizedCost")
+        }
     invoice_url = scope + "/invoices?" + urllib.parse.urlencode({
         "api-version": BILLING_API_VERSION,
         "periodStartDate": args.invoice_start_date.isoformat(),
@@ -338,10 +361,7 @@ def write_csv(path: Path, rows: list[dict], fields: tuple[str, ...]) -> None:
 def export_usage(
     records: Iterable[dict], schema: str, raw_path: Path, csv_path: Path,
 ) -> Iterator[dict]:
-    # Later pages can add columns. Spool CSV cells to disk instead of retaining rows.
-    with raw_path.open("w", encoding="utf-8") as raw, TemporaryFile(
-        mode="w+", encoding="utf-8", dir=csv_path.parent,
-    ) as spool:
+    with raw_path.open("w", encoding="utf-8") as raw:
         raw.write("[")
 
         def save_records() -> Iterator[dict]:
@@ -352,12 +372,18 @@ def export_usage(
                 separator = ","
                 yield record
 
+        yield from export_rows(iter_normalize_usage(save_records(), schema), csv_path)
+        raw.write("\n]\n")
+
+
+def export_rows(rows: Iterable[dict], csv_path: Path) -> Iterator[dict]:
+    # Later partitions can add columns. Spool cells to disk instead of retaining rows.
+    with TemporaryFile(mode="w+", encoding="utf-8", dir=csv_path.parent) as spool:
         columns = set(CSV_FIELDS)
-        for row in iter_normalize_usage(save_records(), schema):
+        for row in rows:
             columns.update(row)
             spool.write(json.dumps(csv_row(row), ensure_ascii=False, default=str) + "\n")
             yield row
-        raw.write("\n]\n")
         spool.seek(0)
         with csv_path.open("w", encoding="utf-8-sig", newline="") as target:
             writer = csv.DictWriter(
@@ -366,6 +392,180 @@ def export_usage(
             writer.writeheader()
             for line in spool:
                 writer.writerow(json.loads(line))
+
+
+def report_periods(start: date, end: date) -> Iterator[tuple[date, date]]:
+    while start <= end:
+        last = min(end, start.replace(day=calendar.monthrange(start.year, start.month)[1]))
+        yield start, last
+        if last == end:
+            break
+        start = last + timedelta(days=1)
+
+
+def generate_cost_report(
+    api: AzureAPI, url: str, body: dict, timeout: int,
+) -> dict:
+    deadline = time.monotonic() + timeout
+    status, payload, headers = api.request(url, "POST", body=body, deadline=deadline)
+    polling = False
+    while status == 202:
+        location = headers.get("Location")
+        if location:
+            url = urllib.parse.urljoin(url, location)
+        elif not polling:
+            raise ValueError("Cost Details response has no polling Location")
+        delay = str(headers.get("Retry-After", "5"))
+        if not delay.isdigit():
+            raise ValueError("Invalid Cost Details Retry-After (expected seconds)")
+        wait = int(delay)
+        if time.monotonic() + wait >= deadline:
+            raise TimeoutError("Cost Details report was not ready before timeout")
+        time.sleep(wait)
+        status, payload, headers = api.request(url, deadline=deadline)
+        polling = True
+    if time.monotonic() >= deadline:
+        raise TimeoutError("Cost Details report generation timed out")
+    if status == 204:
+        return {"status": "NoDataFound"}
+    if status != 200:
+        raise ValueError(f"Invalid Cost Details response (HTTP {status})")
+    if payload.get("status") == "Failed":
+        raise ValueError(f"Cost Details report failed: {payload.get('error')}")
+    if payload.get("status") not in {"Completed", "NoDataFound"}:
+        raise ValueError(f"Unexpected Cost Details status: {payload.get('status')!r}")
+    return payload
+
+
+def cost_report_blobs(result: dict) -> list[dict]:
+    if result["status"] == "NoDataFound":
+        return []
+    manifest = result.get("manifest")
+    if not isinstance(manifest, dict):
+        raise ValueError("Cost Details report has no manifest")
+    if manifest.get("dataFormat") != "Csv" or manifest.get("compressData") is not False:
+        raise ValueError("Cost Details report must contain uncompressed CSV files")
+    blobs = manifest.get("blobs")
+    if not isinstance(blobs, list) or not blobs:
+        raise ValueError("Completed Cost Details report has no blobs")
+    if type(manifest.get("blobCount")) is not int or manifest["blobCount"] != len(blobs):
+        raise ValueError("Cost Details manifest blobCount mismatch")
+    links = set()
+    total = 0
+    for blob in blobs:
+        if not isinstance(blob, dict) or not isinstance(blob.get("blobLink"), str):
+            raise ValueError("Invalid Cost Details blob")
+        link = blob["blobLink"]
+        parsed = urllib.parse.urlsplit(link)
+        if (
+            parsed.scheme != "https" or not parsed.netloc.endswith(".blob.core.windows.net")
+            or parsed.username or parsed.password or parsed.fragment
+        ):
+            raise ValueError("Cost Details blob must use an Azure public Blob HTTPS URL")
+        if link in links:
+            raise ValueError("Cost Details manifest contains duplicate blob links")
+        links.add(link)
+        size = blob.get("byteCount")
+        if type(size) is not int or size < 0:
+            raise ValueError("Invalid Cost Details blob byteCount")
+        total += size
+    if type(manifest.get("byteCount")) is not int or manifest["byteCount"] != total:
+        raise ValueError("Cost Details manifest byteCount mismatch")
+    return blobs
+
+
+def download_cost_blob(url: str, output: Path, expected_bytes: int) -> None:
+    partial = output.with_suffix(".part")
+    try:
+        # Signed Blob URLs must never receive an ARM token or follow a redirect.
+        opener = urllib.request.build_opener(NoRedirect())
+        with opener.open(url, timeout=120) as response, partial.open("wb") as target:
+            if response.status != 200:
+                raise ValueError(f"Invalid Cost Details blob response (HTTP {response.status})")
+            count = 0
+            while chunk := response.read(1024 * 1024):
+                count += len(chunk)
+                if count > expected_bytes:
+                    raise ValueError("Cost Details blob exceeds manifest byteCount")
+                target.write(chunk)
+            if count != expected_bytes:
+                raise ValueError("Incomplete Cost Details blob: byteCount mismatch")
+        partial.replace(output)
+    finally:
+        partial.unlink(missing_ok=True)
+
+
+def read_cost_csv(path: Path) -> Iterator[dict]:
+    aliases = {
+        name: (name,) for name in CSV_FIELDS + (
+            "costInUsd", "meterName", "meterSubCategory", "meterRegion", "resourceLocation",
+            "location", "additionalInfo", "reservationName", "subscriptionName",
+            "unitOfMeasure", "effectivePrice", "unitPrice", "payGPrice",
+        )
+    }
+    aliases.update({
+        "costInBillingCurrency": ("costInBillingCurrency", "cost"),
+        "billingCurrency": ("billingCurrency", "billingCurrencyCode", "currency"),
+        "ResourceId": ("ResourceId", "instanceId", "instanceName"),
+        "subscriptionId": ("subscriptionId", "subscriptionGuid"),
+        "resourceGroupName": ("resourceGroupName", "resourceGroup"),
+        "date": ("date", "usageDateTime"),
+    })
+    with path.open(encoding="utf-8-sig", newline="") as source:
+        reader = csv.DictReader(source, strict=True)
+        fields = reader.fieldnames or []
+        headers = {field.replace(" ", "").lower(): field for field in fields}
+        if not fields or "" in headers or len(headers) != len(fields):
+            raise ValueError(f"{path.name}: missing or duplicate CSV headers")
+        for required in ("costInBillingCurrency", "billingCurrency"):
+            if not any(alias.lower() in headers for alias in aliases[required]):
+                raise ValueError(f"{path.name}: missing {required} CSV column")
+        for index, record in enumerate(reader, 2):
+            label = f"{path.parent.parent.name}/{path.parent.name}/{path.name}:{index}"
+            if None in record or any(value is None for value in record.values()):
+                raise ValueError(f"{label}: CSV row width does not match header")
+            row = dict(record)
+            for name, options in aliases.items():
+                row[name] = next(
+                    (record[headers[option.lower()]] for option in options
+                     if option.lower() in headers), "",
+                )
+            row["usageDetailId"] = text(row["usageDetailId"]) or label
+            row["invoiceId"] = text(row["invoiceId"])
+            row["costInBillingCurrency"] = money(row["costInBillingCurrency"], label)
+            row["billingCurrency"] = currency(row["billingCurrency"], label)
+            tags = text(row["tags"])
+            if tags.startswith('"'):
+                tags = "{" + tags + "}"
+            row["tags"] = json.loads(tags) if tags else {}
+            if not isinstance(row["tags"], dict):
+                raise ValueError(f"{label}: tags must be a JSON object")
+            yield row
+
+
+def iter_cost_details(
+    args: argparse.Namespace, api: AzureAPI, url: str, metric: str,
+) -> Iterator[dict]:
+    for start, end in report_periods(args.start_date, args.end_date):
+        body = {"metric": metric, "timePeriod": {"start": str(start), "end": str(end)}}
+        result = generate_cost_report(api, url, body, args.cost_details_timeout)
+        blobs = cost_report_blobs(result)
+        folder = args.output_dir / "cost-details" / metric / f"{start}_{end}"
+        folder.mkdir(parents=True)
+        # Persist provenance without persisting the SAS credentials in blobLink.
+        manifest = dict(result.get("manifest") or {})
+        manifest["blobs"] = [
+            {"file": f"part-{index:04d}.csv", "byteCount": blob["byteCount"]}
+            for index, blob in enumerate(blobs, 1)
+        ]
+        write_json(folder / "manifest.json", {
+            "status": result["status"], "validTill": result.get("validTill"),
+            "request": body, "manifest": manifest,
+        })
+        for index, blob in enumerate(blobs, 1):
+            path = folder / f"part-{index:04d}.csv"
+            download_cost_blob(blob["blobLink"], path, blob["byteCount"])
+            yield from read_cost_csv(path)
 
 
 def download_invoice(api: AzureAPI, account_url: str, name: str, output: Path, timeout: int) -> Path:
@@ -422,6 +622,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--invoice-start-date", type=date.fromisoformat)
     parser.add_argument("--invoice-end-date", type=date.fromisoformat)
     parser.add_argument("--usage-schema", choices=("modern", "legacy"), default="modern")
+    parser.add_argument(
+        "--usage-source", choices=("cost-details", "consumption"), default="cost-details",
+        help="Cost Details reports by default; Consumption only for explicit compatibility",
+    )
+    parser.add_argument("--cost-details-timeout", type=int, default=1800,
+                        help="Report generation/polling timeout in seconds per metric/month")
     parser.add_argument("--invoice-amount-field", choices=("subTotal", "totalAmount", "billedAmount"), default="subTotal")
     parser.add_argument("--tolerance", default="0.01")
     parser.add_argument("--output-dir", type=Path, default=Path("billing-download"))
@@ -434,6 +640,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("Start dates must not be after end dates")
     if args.invoice_download_timeout <= 0:
         parser.error("--invoice-download-timeout must be positive")
+    if args.cost_details_timeout <= 0:
+        parser.error("--cost-details-timeout must be positive")
+    if args.usage_source != "consumption" and args.usage_schema != "modern":
+        parser.error("--usage-schema legacy requires --usage-source consumption")
     try:
         args.tolerance = money(args.tolerance, "--tolerance")
     except ValueError as exc:
@@ -452,9 +662,10 @@ def run(args: argparse.Namespace, api: AzureAPI) -> dict:
     root.mkdir(parents=True, exist_ok=False)
     account_url, usage_urls, invoice_url = build_urls(args)
     write_json(root / "request.json", {
-        "usageUrls": usage_urls, "invoiceUrl": invoice_url,
+        "usageSource": args.usage_source, "usageUrls": usage_urls, "invoiceUrl": invoice_url,
         "usageSchema": args.usage_schema, "invoiceAmountField": args.invoice_amount_field,
         "tolerance": args.tolerance,
+        "startDate": str(args.start_date), "endDate": str(args.end_date),
     })
     invoices = api.list(invoice_url)
     write_json(root / "invoices.json", invoices)
@@ -462,10 +673,16 @@ def run(args: argparse.Namespace, api: AzureAPI) -> dict:
     for metric, prefix in (("ActualCost", "Actual"), ("AmortizedCost", "Amortized")):
         folder = root / prefix.lower()
         folder.mkdir()
-        datasets[metric] = export_usage(
-            api.iter_list(usage_urls[metric]), args.usage_schema, root / f"{prefix}.json",
-            folder / f"{prefix}_{args.start_date}_{args.end_date}.csv",
-        )
+        csv_path = folder / f"{prefix}_{args.start_date}_{args.end_date}.csv"
+        if args.usage_source == "cost-details":
+            datasets[metric] = export_rows(
+                iter_cost_details(args, api, usage_urls[metric], metric), csv_path,
+            )
+        else:
+            datasets[metric] = export_usage(
+                api.iter_list(usage_urls[metric]), args.usage_schema, root / f"{prefix}.json",
+                csv_path,
+            )
     try:
         with (root / "invoice-id-issues.csv").open("w", encoding="utf-8-sig", newline="") as target:
             writer = csv.DictWriter(target, fieldnames=ISSUE_FIELDS)
