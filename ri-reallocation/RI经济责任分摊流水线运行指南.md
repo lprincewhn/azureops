@@ -46,6 +46,11 @@ az login
 
 ### 2.2 准备输入
 
+尚未下载账单时，可先运行 `download_and_validate_billing.py`，通过 Consumption
+Usage Details API 获取 Actual/Amortized，并核对发票金额及 Actual 的发票 ID
+完整性。参数、金额口径、发票文档下载和输出说明见
+[账单获取与发票校验](账单获取与发票校验.md)。仅在校验通过后进入分摊流水线。
+
 建议把同一账期的输入整理为：
 
 ```text
