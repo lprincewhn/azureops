@@ -172,12 +172,17 @@ work/02-economic-reallocated/
 > `ri-allocation-details.csv`。
 
 如不提供 `--price-sheet-file`，脚本会使用当前 `az login` 身份自动下载。MCA/MPA
-历史账期可能还需要显式指定：
+账单在所有行都有相同 `invoiceId` 时按发票下载；未指定 `--invoice-id` 且账单行的
+`invoiceId` 不完整时，自动回退为按 Billing Profile 下载。需要强制使用指定发票时可传入：
 
 ```bash
 --invoice-id "<invoice-id>" \
 --billing-account-name "<billing-account-name>"
 ```
+
+Billing Profile API 只返回当前月 Price Sheet。处理历史账期时，如果当前月价格表
+未覆盖账单日期，仍需通过 `--invoice-id` 下载对应发票价格表，或通过
+`--price-sheet-file` 提供该历史账期的 Price Sheet。
 
 ## 6. 步骤 3：生成 RI 项目分布报告
 

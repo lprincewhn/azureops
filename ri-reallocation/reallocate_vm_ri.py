@@ -22,6 +22,7 @@ import argparse
 import csv
 import glob
 import io
+import itertools
 import json
 import re
 import time
@@ -29,7 +30,7 @@ import urllib.request
 import urllib.parse
 import zipfile
 from collections import defaultdict
-from datetime import date, datetime, timezone
+from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -84,8 +85,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--invoice-id",
         help=(
-            "下载 MCA/MPA Price Sheet 时使用的发票 ID。账单包含多个 invoiceId "
-            "或历史 Usage 行缺少 invoiceId 时应显式指定"
+            "下载 MCA/MPA Price Sheet 时使用的发票 ID。未指定且账单行的 "
+            "invoiceId 不完整时，自动回退为按 Billing Profile 下载"
         ),
     )
     parser.add_argument(
@@ -544,46 +545,24 @@ def _parse_date(value: str) -> date | None:
     raise ValueError(f"无法解析日期：{value!r}")
 
 
-def _csv_payloads(payload: bytes, source: str) -> list[tuple[str, bytes]]:
-    if payload.startswith(b"PK\x03\x04"):
-        with zipfile.ZipFile(io.BytesIO(payload)) as archive:
-            files = [
-                (name, archive.read(name))
-                for name in archive.namelist()
-                if name.lower().endswith(".csv") and not name.endswith("/")
-            ]
-        if not files:
-            raise ValueError(f"Azure Price Sheet ZIP 不包含 CSV：{source}")
-        return files
-    return [(source, payload)]
-
-
-def parse_price_sheet(payload: bytes, source: str) -> dict[str, list[PriceRate]]:
+def parse_price_sheet(
+    payload: bytes,
+    source: str,
+    meter_ids: set[str] | None = None,
+) -> dict[str, list[PriceRate]]:
     """Parse Consumption tier-zero rates from CSV, ZIP, or JSON Price Sheets."""
     rates: defaultdict[str, set[PriceRate]] = defaultdict(set)
-    stripped = payload.lstrip(b"\xef\xbb\xbf \t\r\n")
-    if stripped.startswith(b"["):
-        parsed = json.loads(payload.decode("utf-8-sig"))
-        if not isinstance(parsed, list) or not all(
-            isinstance(row, dict) for row in parsed
-        ):
-            raise ValueError("Azure Price Sheet JSON 顶层必须是对象数组")
-        sources: list[tuple[str, list[dict[str, Any]], list[str]]] = [
-            (
-                source,
-                parsed,
-                list(parsed[0]) if parsed else [],
-            )
-        ]
-    else:
-        sources = []
-        for name, content in _csv_payloads(payload, source):
-            reader = csv.DictReader(io.StringIO(content.decode("utf-8-sig")))
-            if reader.fieldnames is None:
-                raise ValueError(f"Azure Price Sheet CSV 没有表头：{name}")
-            sources.append((name, list(reader), list(reader.fieldnames)))
+    selected_meter_ids = (
+        {meter_id.strip().lower() for meter_id in meter_ids if meter_id.strip()}
+        if meter_ids is not None
+        else None
+    )
 
-    for name, rows, fieldnames in sources:
+    def collect(
+        name: str,
+        rows: Any,
+        fieldnames: list[str],
+    ) -> None:
         headers = {_canonical_header(field): field for field in fieldnames}
 
         def field(row: dict[str, Any], *aliases: str) -> str:
@@ -611,6 +590,11 @@ def parse_price_sheet(payload: bytes, source: str) -> dict[str, list[PriceRate]]
             raw_price = field(row, "unitPrice")
             if not meter_id or not raw_price:
                 continue
+            if (
+                selected_meter_ids is not None
+                and meter_id not in selected_meter_ids
+            ):
+                continue
             try:
                 unit_price = Decimal(raw_price)
             except InvalidOperation as exc:
@@ -628,6 +612,58 @@ def parse_price_sheet(payload: bytes, source: str) -> dict[str, list[PriceRate]]
                     effective_end=_parse_date(field(row, "effectiveEndDate")),
                 )
             )
+
+    if payload.startswith(b"PK\x03\x04"):
+        with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+            members = [
+                name
+                for name in archive.namelist()
+                if not name.endswith("/")
+                and name.lower().endswith((".csv", ".json"))
+            ]
+            if not members:
+                raise ValueError(
+                    f"Azure Price Sheet ZIP 不包含 CSV 或 JSON：{source}"
+                )
+            for name in members:
+                with archive.open(name) as member:
+                    text = io.TextIOWrapper(member, encoding="utf-8-sig")
+                    if name.lower().endswith(".csv"):
+                        reader = csv.DictReader(text)
+                        if reader.fieldnames is None:
+                            raise ValueError(
+                                f"Azure Price Sheet CSV 没有表头：{name}"
+                            )
+                        collect(name, reader, list(reader.fieldnames))
+                    else:
+                        rows = (
+                            json.loads(line)
+                            for line in text
+                            if line.strip()
+                        )
+                        first = next(rows, None)
+                        if first is None:
+                            continue
+                        if not isinstance(first, dict):
+                            raise ValueError(
+                                f"Azure Price Sheet JSON 行不是对象：{name}"
+                            )
+                        collect(name, itertools.chain([first], rows), list(first))
+    else:
+        stripped = payload.lstrip(b"\xef\xbb\xbf \t\r\n")
+        if stripped.startswith(b"["):
+            parsed = json.loads(payload.decode("utf-8-sig"))
+            if not isinstance(parsed, list) or not all(
+                isinstance(row, dict) for row in parsed
+            ):
+                raise ValueError("Azure Price Sheet JSON 顶层必须是对象数组")
+            collect(source, parsed, list(parsed[0]) if parsed else [])
+        else:
+            reader = csv.DictReader(io.StringIO(payload.decode("utf-8-sig")))
+            if reader.fieldnames is None:
+                raise ValueError(f"Azure Price Sheet CSV 没有表头：{source}")
+            collect(source, reader, list(reader.fieldnames))
+
     if not rates:
         raise ValueError("Azure Price Sheet 中没有可用的 Consumption tier-zero 价格")
     return {meter_id: sorted(values, key=repr) for meter_id, values in rates.items()}
@@ -796,6 +832,63 @@ def download_price_sheet_by_invoice(
         retry_after = int(status_response.headers.get("Retry-After") or "10")
 
 
+def download_price_sheet_by_billing_profile(
+    billing_account_name: str,
+    billing_profile_id: str,
+    credential: Any,
+    timeout: int,
+) -> Any:
+    """Run the Billing Profile Price Sheet LRO through its Completed status."""
+    quote = lambda value: urllib.parse.quote(value, safe=":-_")
+    url = (
+        "https://management.azure.com/providers/Microsoft.Billing/"
+        f"billingAccounts/{quote(billing_account_name)}/"
+        f"billingProfiles/{quote(billing_profile_id)}/"
+        "providers/Microsoft.CostManagement/pricesheets/default/download"
+        "?api-version=2025-03-01"
+    )
+    response, payload = _authorized_json_request(url, credential, method="POST")
+    if getattr(response, "status", None) == 200:
+        return payload
+    if getattr(response, "status", None) != 202:
+        raise ValueError(
+            f"Azure Price Sheet API 返回非预期状态：{response.status}"
+        )
+
+    async_url = (
+        response.headers.get("Azure-Consumption-AsyncOperation")
+        or response.headers.get("Azure-AsyncOperation")
+    )
+    if not async_url:
+        raise ValueError("Azure Price Sheet API 的 202 响应缺少异步状态 URL")
+    retry_after = int(response.headers.get("Retry-After") or "10")
+    deadline = time.monotonic() + timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(
+                f"Azure Price Sheet 在 {timeout} 秒内未生成完成；"
+                "服务端任务可能仍在运行，请稍后重试"
+            )
+        time.sleep(min(retry_after, remaining))
+        status_response, status_payload = _authorized_json_request(
+            async_url, credential
+        )
+        status = str(status_payload.get("status") or "").strip().lower()
+        if status in {"completed", "succeeded"}:
+            return status_payload
+        if status in {"failed", "canceled", "cancelled"}:
+            raise ValueError(
+                f"Azure Price Sheet 生成失败，状态：{status_payload.get('status')}"
+            )
+        if getattr(status_response, "status", None) not in {200, 202}:
+            raise ValueError(
+                "Azure Price Sheet 状态查询返回非预期状态："
+                f"{status_response.status}"
+            )
+        retry_after = int(status_response.headers.get("Retry-After") or "10")
+
+
 def price_sheet_download_url(result: Any) -> str:
     """Extract a temporary download URL from direct and wrapped API results."""
     url = _model_value(result, "download_url", "downloadUrl")
@@ -837,7 +930,12 @@ def download_price_sheet(
     billing_profile_id = unique("billingProfileId", required=False)
     selected_invoice_id = (invoice_id or "").strip()
     if not selected_invoice_id:
-        selected_invoice_id = unique("invoiceId", required=False)
+        row_invoice_ids = [(row.get("invoiceId") or "").strip() for row in rows]
+        if row_invoice_ids and all(row_invoice_ids):
+            invoice_ids = set(row_invoice_ids)
+            if len(invoice_ids) > 1:
+                raise ValueError("输入账单包含多个 invoiceId，请分批处理")
+            selected_invoice_id = next(iter(invoice_ids))
     usage_dates = {
         parsed
         for row in rows
@@ -863,20 +961,22 @@ def download_price_sheet(
         credential = credential or AzureCliCredential()
         client = CostManagementClient(credential=credential)
 
+    def resolve_account_name() -> str:
+        account_name = (billing_account_name or "").strip()
+        if account_name:
+            return account_name
+        if credential is None:
+            raise ValueError(
+                "自动解析完整 Billing Account Name 需要 Azure credential；"
+                "传入自定义 client 时请同时传入 credential，或通过 "
+                "--billing-account-name 显式指定"
+            )
+        return resolve_billing_account_name(billing_account_id, credential)
+
     try:
         if billing_profile_id:
+            account_name = resolve_account_name()
             if selected_invoice_id:
-                account_name = (billing_account_name or "").strip()
-                if not account_name:
-                    if credential is None:
-                        raise ValueError(
-                            "自动解析完整 Billing Account Name 需要 Azure credential；"
-                            "传入自定义 client 时请同时传入 credential，或通过 "
-                            "--billing-account-name 显式指定"
-                        )
-                    account_name = resolve_billing_account_name(
-                        billing_account_id, credential
-                    )
                 print(
                     f"正在生成 invoiceId={selected_invoice_id} 的 Azure Price Sheet，"
                     f"最长等待 {timeout} 秒..."
@@ -897,18 +997,23 @@ def download_price_sheet(
                     )
                     result = wait_for_price_sheet(poller, timeout)
             else:
-                year_month = next(iter(periods))
-                current = datetime.now(timezone.utc)
-                if year_month != (current.year, current.month):
-                    raise ValueError(
-                        "历史 MCA/MPA 账单没有 invoiceId，无法自动取得对应历史 Price "
-                        "Sheet；请通过 --price-sheet-file 提供该账期价格表"
-                    )
-                poller = client.price_sheet.begin_download_by_billing_profile(
-                    billing_account_name=billing_account_id,
-                    billing_profile_name=billing_profile_id,
+                print(
+                    "账单 invoiceId 不完整，正在通过 Billing Profile 生成 Azure "
+                    f"Price Sheet，最长等待 {timeout} 秒..."
                 )
-                result = wait_for_price_sheet(poller, timeout)
+                if credential is not None:
+                    result = download_price_sheet_by_billing_profile(
+                        account_name,
+                        billing_profile_id,
+                        credential,
+                        timeout,
+                    )
+                else:
+                    poller = client.price_sheet.begin_download_by_billing_profile(
+                        billing_account_name=account_name,
+                        billing_profile_name=billing_profile_id,
+                    )
+                    result = wait_for_price_sheet(poller, timeout)
         else:
             year, month = next(iter(periods))
             poller = client.price_sheet.begin_download_by_billing_account(
@@ -935,11 +1040,19 @@ def load_price_sheet(
     timeout: int = 1800,
     save_price_sheet_file: str | None = None,
 ) -> tuple[dict[str, list[PriceRate]], str]:
+    meter_ids = {
+        (row.get("meterId") or "").strip()
+        for row in rows
+        if (row.get("meterId") or "").strip()
+    }
     if price_sheet_file:
         path = Path(price_sheet_file)
         if not path.is_file():
             raise FileNotFoundError(f"找不到 Azure Price Sheet：{path}")
-        return parse_price_sheet(path.read_bytes(), str(path)), str(path)
+        return (
+            parse_price_sheet(path.read_bytes(), str(path), meter_ids),
+            str(path),
+        )
     payload = download_price_sheet(
         rows,
         invoice_id=invoice_id,
@@ -950,7 +1063,10 @@ def load_price_sheet(
         target = Path(save_price_sheet_file)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(payload)
-    return parse_price_sheet(payload, "Azure Cost Management API"), "Azure Cost Management API"
+    return (
+        parse_price_sheet(payload, "Azure Cost Management API", meter_ids),
+        "Azure Cost Management API",
+    )
 
 
 def is_ri_usage(row: dict[str, str], reservation_ids: set[str]) -> bool:
