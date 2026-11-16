@@ -36,9 +36,8 @@ flowchart LR
 python3 -m pip install -r requirements.txt
 ```
 
-只有显式提供本地 Price Sheet，且 `reservations.json` 不包含
-`ManagementGroup` scope 时，运行过程才不需要访问 Azure API。自动下载 Price Sheet
-或解析管理组 scope 前，应先登录：
+第二步必须提供本地 Price Sheet。只有 `reservations.json` 包含
+`ManagementGroup` scope 时，运行过程才需要访问 Azure API；解析该 scope 前应先登录：
 
 ```bash
 az login
@@ -126,7 +125,7 @@ Actual 与 Amortized 差额被完整承接。
 
 ## 5. 步骤 2：重新分配 RI 经济责任
 
-推荐显式提供同账期 Price Sheet：
+必须提供覆盖输入账期的本地 Price Sheet：
 
 ```bash
 python3 reallocate_vm_ri.py \
@@ -171,13 +170,7 @@ work/02-economic-reallocated/
 > 不要在流水线中使用 `--summary-only`。最终报告同时依赖分摊后账单副本和
 > `ri-allocation-details.csv`。
 
-如不提供 `--price-sheet-file`，脚本会使用当前 `az login` 身份自动下载。MCA/MPA
-历史账期可能还需要显式指定：
-
-```bash
---invoice-id "<invoice-id>" \
---billing-account-name "<billing-account-name>"
-```
+脚本不再自动下载 Price Sheet；未指定 `--price-sheet-file` 会直接报参数错误。
 
 ## 6. 步骤 3：生成 RI 项目分布报告
 
