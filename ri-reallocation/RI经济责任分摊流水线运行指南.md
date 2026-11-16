@@ -336,6 +336,6 @@ RI 净收益或损失
 ## 11. 相关文档
 
 - [RI 实际与摊销账单差额分摊说明](RI实际与摊销差额分摊说明.md)
-- [RI(VM) 经济责任重新分摊说明](RI%28VM%29%20经济责任重新分摊说明.md)
-- [RI(MySQL) 经济责任重新分摊说明](RI%28MySQL%29%20经济责任重新分摊说明.md)
-- [RI(AMR) 经济责任重新分摊说明](RI%28AMR%29%20经济责任重新分摊说明.md)
+- [RI(VM) 经济责任重新分摊说明](RI%28VM%29%20经济责任重新分摊说明.md)（[飞书文档](https://my.feishu.cn/docx/EEQndRbM1occsPxh621c1miSn6b)）
+- [RI(MySQL) 经济责任重新分摊说明](RI%28MySQL%29%20经济责任重新分摊说明.md)（[飞书文档](https://my.feishu.cn/docx/XSZ2dztoboFWaNxCueecV79cnmg)）
+- [RI(AMR) 经济责任重新分摊说明](RI%28AMR%29%20经济责任重新分摊说明.md)（[飞书文档](https://my.feishu.cn/docx/GcDQdwlRLotxkxx3axpcaj3WnDe)）
