@@ -4,12 +4,11 @@
 
 本流水线依次运行两个分摊脚本和一个报告脚本：
 
-1. `allocate_ri_difference.py`：把 Actual 与 Amortized 的 VM RI 差额分配回对应
-   Amortized VM Usage 行，使 Amortized RI 成本与 Actual 账单对齐。
-2. `reallocate_vm_ri.py`：以对齐后的 RI 成本为基准，计算相对 PAYG 的净收益或
-   超额成本，并按 `reservations.json` 中的项目绑定重新分配经济责任。
-3. `report_ri_project_distribution.py`：按每个 RI 展示分摊前后的项目经济责任分布，
-   输出 CSV 和 HTML 报告。
+1. `allocate_ri_difference.py`：按订单、资源类型将 VM、MySQL Compute 和 AMR
+   Balanced 的 Actual 与 Amortized 差额分摊到对应的 Usage 行。
+2. `reallocate_all_ri.py`：分别运行三类资源的收益分摊，再按原始账单行合并调整、
+   逐 RI 明细和汇总；单类脚本也可独立运行。
+3. `report_ri_project_distribution.py`：按每个 RI 展示三类资源分摊前后的项目经济责任。
 
 ```mermaid
 flowchart LR
@@ -112,12 +111,12 @@ python3 allocate_ri_difference.py \
 ```text
 work/01-actual-reconciled/
 ├── Amortized_*.csv
-├── changed-amortized-vm-rows.csv
+├── changed-amortized-ri-rows.csv
 └── ri-allocation-summary.csv
 ```
 
 - `Amortized_*.csv`：下一步骤的输入。
-- `changed-amortized-vm-rows.csv`：所有发生调整的 VM Usage 行。
+- `changed-amortized-ri-rows.csv`：所有发生调整的 VM、MySQL 和 AMR Usage 行。
 - `ri-allocation-summary.csv`：每个 Reservation Order 的 Actual、Amortized 和差额。
 
 如果某个非零差额没有对应 VM Usage 行，脚本会停止。不要绕过该错误，否则无法证明
@@ -199,8 +198,28 @@ python3 reallocate_amr_ri.py "input/amortized/Amortized_*.csv" \
 若没有绑定、订单无法匹配或没有对应 RI Usage，脚本会报错，不会生成
 “成功但没有实际分摊”的报告。输入和输出必须分开，避免将另一个脚本的
 `allocatedCostInBillingCurrency` 当作本脚本的基准；当前第一步
-`allocate_ri_difference.py` **只对齐 VM**，MySQL/AMR 使用原始 Amortized
-时的金额是摊销口径，不代表已对齐 Actual 购买费用。
+`allocate_ri_difference.py` 现已对齐三类资源；在统一流水线中应将其输出作为
+共同成本基准，并统一指定 `--amount-field
+costInBillingCurrencyAfterActualReconciliation`。
+
+三类资源合并运行（与上面的独立运行二选一）：
+
+```bash
+python3 reallocate_all_ri.py \
+  --input-dir work/01-actual-reconciled --output-dir work/02-economic-reallocated \
+  --reservations-file reservations.json --project-tag-key projname \
+  --price-sheet-file azure-price-sheet.json
+python3 report_ri_project_distribution.py work/02-economic-reallocated \
+  --project-tag-key projname --reservations-file reservations.json \
+  --price-sheet-file azure-price-sheet.json \
+  --output-dir work/03-ri-project-distribution
+```
+
+合并程序以同一份对齐后的账单作为三分支输入，验证每行原始数据一致、
+三类调整没有重叠、全账单调整金额守恒，生成单份账单副本和单套汇总/报告。
+三个分支按 VM → MySQL → AMR 顺序执行；任一分支报错便停止，绝不会将
+另一分支的分摊输出当作下一分支的输入。必须为三类资源准备有效绑定；
+未使用 RI 只计入摘要，不承接差额收益。
 
 用例 `realtests/8` 的 11 月数据包含 MySQL 与 AMR RI Usage 和匹配的 11 月
 Price Sheet，但所提供的两类 RI **都没有项目 bindings**；原样运行会因

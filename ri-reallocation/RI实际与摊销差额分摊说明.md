@@ -33,14 +33,21 @@ Azure Actual 成本导出与 Amortized 成本导出采用不同的 RI 记账方�
 
 ### 2.1 当前支持范围
 
-当前脚本只处理虚拟机 RI：
+当前脚本按 `(资源类型, Reservation Order ID)` 隔离汇总和分摊，处理：
 
 ```text
 pricingModel = Reservation
-meterCategory = Virtual Machines
+VM: meterCategory = Virtual Machines
+MySQL: meterCategory = Azure Database for MySQL，meterSubCategory 含 Compute
+AMR: meterCategory = Redis Cache，meterSubCategory = Azure Managed Redis - Balanced
 ```
 
-SQL Database、Cosmos DB、Synapse、App Service 等其他服务的预留不会参与本脚本的差额计算和分摊。
+下文 VM 示意同样适用于 MySQL 和 AMR：各自的 Usage 行需分别有
+`Microsoft.DBforMySQL/flexibleServers` 和 `Microsoft.Cache/redisEnterprise`
+资源 ID；无对应 Usage 的非零差额仍会报错停止，不能凭空分摊。
+输出 `ri-allocation-summary.csv` 和 `changed-amortized-ri-rows.csv`
+增加 `resourceType`，以便核对三类资源。SQL Database、Cosmos DB、
+Synapse、App Service 等其他服务不参与计算。
 
 ### 2.2 Actual 账单中的 RI 金额
 

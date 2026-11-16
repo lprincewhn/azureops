@@ -93,10 +93,21 @@ def decimal_text(value):
 
 
 def is_vm_reservation(row):
-    return (
-        row.get("pricingModel", "").casefold() == "reservation"
-        and row.get("meterCategory", "").casefold() == "virtual machines"
-    )
+    return reservation_service(row) == "vm"
+
+
+def reservation_service(row):
+    if row.get("pricingModel", "").casefold() != "reservation":
+        return ""
+    category = row.get("meterCategory", "").casefold()
+    subcategory = row.get("meterSubCategory", "").casefold()
+    if category == "virtual machines":
+        return "vm"
+    if category == "azure database for mysql" and "compute" in subcategory:
+        return "mysql"
+    if category == "redis cache" and subcategory == "azure managed redis - balanced":
+        return "amr"
+    return ""
 
 
 def is_vm_resource_id(resource_id):
@@ -105,6 +116,20 @@ def is_vm_resource_id(resource_id):
         "/virtualmachines/" in normalized
         or "/virtualmachinescalesets/" in normalized
     )
+
+
+def is_eligible_usage(row, service):
+    resource_id = row.get("ResourceId", "").casefold()
+    if service == "vm":
+        return is_vm_resource_id(resource_id)
+    if service == "mysql":
+        return "/providers/microsoft.dbformysql/flexibleservers/" in resource_id
+    if service == "amr":
+        return (
+            "/providers/microsoft.cache/redisenterprise/" in resource_id
+            or "/providers/microsoft.cache/redis/" in resource_id
+        )
+    return False
 
 
 def reservation_order_id(row, actual=False):
@@ -157,7 +182,8 @@ def collect_actual_costs(files, amount_field):
 
     for file_data in files:
         for row in file_data["rows"]:
-            if not is_vm_reservation(row):
+            service = reservation_service(row)
+            if not service:
                 continue
             if row.get("chargeType", "").casefold() != "purchase":
                 continue
@@ -167,8 +193,9 @@ def collect_actual_costs(files, amount_field):
                 raise ValueError(
                     f"VM RI Purchase row has no reservationId in {file_data['path']}"
                 )
-            actual_costs[order_id] += decimal_value(row, amount_field)
-            names[order_id] = row.get("reservationName", "")
+            key = (service, order_id)
+            actual_costs[key] += decimal_value(row, amount_field)
+            names[key] = row.get("reservationName", "")
 
     return actual_costs, names
 
@@ -189,7 +216,8 @@ def collect_amortized_data(files, amount_field):
 
     for file_index, file_data in enumerate(files):
         for row_index, row in enumerate(file_data["rows"]):
-            if not is_vm_reservation(row):
+            service = reservation_service(row)
+            if not service:
                 continue
 
             order_id = reservation_order_id(row)
@@ -199,13 +227,14 @@ def collect_amortized_data(files, amount_field):
                     f"{file_data['path']} row {row_index + 2}"
                 )
 
-            amortized_costs[order_id] += decimal_value(
+            key = (service, order_id)
+            amortized_costs[key] += decimal_value(
                 row, amount_field
             )
-            names[order_id] = row.get("reservationName", "")
+            names[key] = row.get("reservationName", "")
 
             if row.get("chargeType", "").casefold() == "unusedreservation":
-                unused = unused_reservations[order_id]
+                unused = unused_reservations[key]
                 unused["name"] = row.get("reservationName", "")
                 unused["row_count"] += 1
                 if row.get("date"):
@@ -215,12 +244,11 @@ def collect_amortized_data(files, amount_field):
                     row, amount_field
                 )
 
-            resource_id = row.get("ResourceId", "").casefold()
             if (
                 row.get("chargeType", "").casefold() == "usage"
-                and is_vm_resource_id(resource_id)
+                and is_eligible_usage(row, service)
             ):
-                eligible_rows[order_id].append((file_index, row_index))
+                eligible_rows[key].append((file_index, row_index))
 
     return amortized_costs, eligible_rows, unused_reservations, names
 
@@ -236,20 +264,21 @@ def allocate_differences(
     summary = []
 
     order_ids = sorted(set(actual_costs) | set(amortized_costs))
-    for order_id in order_ids:
-        actual_cost = actual_costs.get(order_id, Decimal(0))
-        amortized_cost = amortized_costs.get(order_id, Decimal(0))
+    for service, order_id in order_ids:
+        key = (service, order_id)
+        actual_cost = actual_costs.get(key, Decimal(0))
+        amortized_cost = amortized_costs.get(key, Decimal(0))
         difference = actual_cost - amortized_cost
-        targets = eligible_rows.get(order_id, [])
+        targets = eligible_rows.get(key, [])
 
         if difference == 0:
-            summary.append((order_id, actual_cost, amortized_cost, difference))
+            summary.append((service, order_id, actual_cost, amortized_cost, difference))
             continue
 
         if not targets:
             raise ValueError(
-                f"RI order {order_id} has a difference of {difference}, "
-                "but no corresponding VM Usage rows were found"
+                f"{service} RI order {order_id} has a difference of {difference}, "
+                "but no corresponding eligible Usage rows were found"
             )
 
         weights = []
@@ -268,7 +297,7 @@ def allocate_differences(
             total_weight = sum(weights, Decimal(0))
             print(
                 "WARNING: RI order "
-                f"{order_id} has VM Usage rows but their {amount_field} "
+                f"{service} {order_id} has Usage rows but their {amount_field} "
                 "total is zero; falling back to quantity-based allocation "
                 f"(rows={len(targets)}, quantityTotal={decimal_text(total_weight)})",
                 file=sys.stderr,
@@ -293,7 +322,7 @@ def allocate_differences(
                 allocated += amount
             allocations[(file_index, row_index)] = amount
 
-        summary.append((order_id, actual_cost, amortized_cost, difference))
+        summary.append((service, order_id, actual_cost, amortized_cost, difference))
 
     return allocations, summary
 
@@ -333,38 +362,34 @@ def write_outputs(files, output_dir, allocations, amount_field):
 
 
 def write_changed_rows(output_dir, files, allocations, amount_field):
-    output_path = output_dir / "changed-amortized-vm-rows.csv"
-    with output_path.open("w", encoding="utf-8-sig", newline="") as handle:
+    output_path = output_dir / "changed-amortized-ri-rows.csv"
+    vm_path = output_dir / "changed-amortized-vm-rows.csv"
+    with output_path.open("w", encoding="utf-8-sig", newline="") as handle, (
+        vm_path.open("w", encoding="utf-8-sig", newline="")
+    ) as vm_handle:
         writer = csv.writer(handle, lineterminator="\n")
-        writer.writerow(
-            [
-                "reservationOrderId",
-                "date",
-                "subscriptionName",
-                "resourceGroupName",
-                "ResourceId",
-                "originalCost",
-                ALLOCATION_COLUMN,
-                reconciled_cost_column(amount_field),
-            ]
-        )
+        vm_writer = csv.writer(vm_handle, lineterminator="\n")
+        header = [
+            "reservationOrderId", "date", "subscriptionName",
+            "resourceGroupName", "ResourceId", "originalCost",
+            ALLOCATION_COLUMN, reconciled_cost_column(amount_field),
+        ]
+        writer.writerow(["resourceType", *header])
+        vm_writer.writerow(header)
         for (file_index, row_index), allocation in sorted(allocations.items()):
             if allocation == 0:
                 continue
             row = files[file_index]["rows"][row_index]
             original_cost = decimal_value(row, amount_field)
-            writer.writerow(
-                [
-                    reservation_order_id(row),
-                    row.get("date", ""),
-                    row.get("subscriptionName", ""),
-                    row.get("resourceGroupName", ""),
-                    row.get("ResourceId", ""),
-                    decimal_text(original_cost),
-                    decimal_text(allocation),
-                    decimal_text(original_cost + allocation),
-                ]
-            )
+            values = [
+                reservation_order_id(row), row.get("date", ""),
+                row.get("subscriptionName", ""), row.get("resourceGroupName", ""),
+                row.get("ResourceId", ""), decimal_text(original_cost),
+                decimal_text(allocation), decimal_text(original_cost + allocation),
+            ]
+            writer.writerow([reservation_service(row), *values])
+            if reservation_service(row) == "vm":
+                vm_writer.writerow(values)
     return output_path
 
 
@@ -380,6 +405,7 @@ def write_allocation_summary(
         writer = csv.writer(handle, lineterminator="\n")
         writer.writerow(
             [
+                "resourceType",
                 "reservationOrderId",
                 f"actual[{actual_amount_field}]",
                 f"amortized[{amortized_amount_field}]",
@@ -387,9 +413,10 @@ def write_allocation_summary(
                 "reservationName",
             ]
         )
-        for order_id, actual, amortized, difference in summary:
+        for service, order_id, actual, amortized, difference in summary:
             writer.writerow(
                 [
+                    service,
                     order_id,
                     decimal_text(actual),
                     decimal_text(amortized),
@@ -400,9 +427,10 @@ def write_allocation_summary(
         writer.writerow(
             [
                 "TOTAL",
-                decimal_text(sum((item[1] for item in summary), Decimal(0))),
+                "TOTAL",
                 decimal_text(sum((item[2] for item in summary), Decimal(0))),
                 decimal_text(sum((item[3] for item in summary), Decimal(0))),
+                decimal_text(sum((item[4] for item in summary), Decimal(0))),
                 "",
             ]
         )
@@ -415,12 +443,13 @@ def print_unused_reservation_warnings(unused_reservations, amount_field):
         return
 
     print(
-        "WARNING: Unused VM RI records detected in the amortized bill",
+        "WARNING: Unused RI records detected in the amortized bill",
         file=sys.stderr,
     )
     writer = csv.writer(sys.stderr, lineterminator="\n")
     writer.writerow(
         [
+            "resourceType",
             "reservationOrderId",
             "reservationName",
             "unusedRecordCount",
@@ -431,7 +460,7 @@ def print_unused_reservation_warnings(unused_reservations, amount_field):
             "note",
         ]
     )
-    for order_id, unused in sorted(unused_reservations.items()):
+    for (service, order_id), unused in sorted(unused_reservations.items()):
         dates = sorted(unused["dates"])
         quantity = unused["quantity"]
         cost = unused["cost"]
@@ -443,6 +472,7 @@ def print_unused_reservation_warnings(unused_reservations, amount_field):
             )
         writer.writerow(
             [
+                service,
                 order_id,
                 unused["name"],
                 unused["row_count"],

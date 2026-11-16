@@ -400,7 +400,9 @@ def load_reservations_config(
     for item in items:
         if not isinstance(item, dict):
             raise ValueError("reservation 条目必须是对象")
-        if profile != VM and item.get("productType") != profile.product_type:
+        if (profile == VM and item.get("productType") not in (None, "vm")) or (
+            profile != VM and item.get("productType") != profile.product_type
+        ):
             continue
 
         weights: dict[str, Decimal] = {}
