@@ -152,8 +152,45 @@ def reservation_id_from_config(item: dict[str, object]) -> str:
     return value
 
 
+def resource_type_from_row(row: dict[str, str]) -> str:
+    category = (row.get("meterCategory") or "").strip()
+    if category == "Virtual Machines":
+        return "VM"
+    if category == "Azure Database for MySQL":
+        return "MySQL"
+    if category == "Redis Cache":
+        return "AMR"
+    return ""
+
+
+def reservation_orders_from_bills(paths: list[Path]) -> dict[str, set[str]]:
+    orders: defaultdict[str, set[str]] = defaultdict(set)
+    for path in paths:
+        with path.open(encoding="utf-8-sig", newline="") as source:
+            for row in csv.DictReader(source):
+                reservation_id = (row.get("reservationId") or "").strip()
+                if (
+                    not reservation_id
+                    or row.get("chargeType") != "Usage"
+                    or row.get("pricingModel") != "Reservation"
+                ):
+                    continue
+                try:
+                    info = json.loads(row.get("additionalInfo") or "{}")
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(info, dict):
+                    continue
+                order_id = str(info.get("ReservationOrderId") or "").strip().lower()
+                if order_id:
+                    orders[order_id].add(reservation_id)
+    return dict(orders)
+
+
 def load_reservations_config(
-    input_dir: Path, configured_path: Path | None
+    input_dir: Path,
+    configured_path: Path | None,
+    order_reservations: dict[str, set[str]] | None = None,
 ) -> tuple[set[str], set[str]]:
     candidates = (
         [configured_path]
@@ -174,12 +211,17 @@ def load_reservations_config(
     for item in items:
         if not isinstance(item, dict):
             raise ValueError("reservations 条目必须是对象")
-        reservation_id = reservation_id_from_config(item)
-        if not reservation_id:
+        configured_id = reservation_id_from_config(item)
+        if not configured_id:
             raise ValueError("reservations 条目缺少 reservationId")
-        if reservation_id in all_ids:
-            raise ValueError(f"reservations 文件存在重复 RI：{reservation_id}")
-        all_ids.add(reservation_id)
+        if configured_id.lower().startswith("order:"):
+            order_id = configured_id.split(":", 1)[1].strip().lower()
+            if not order_id:
+                raise ValueError("reservations 条目缺少预留订单 ID")
+            reservation_ids = (order_reservations or {}).get(order_id, set())
+        else:
+            reservation_ids = {configured_id}
+        has_binding = False
         for binding in item.get("bindings") or []:
             if not isinstance(binding, dict):
                 continue
@@ -188,8 +230,14 @@ def load_reservations_config(
                 str(binding.get("boundQuantity") or "0"), "boundQuantity"
             )
             if project and quantity > ZERO:
-                valid_binding_ids.add(reservation_id)
+                has_binding = True
                 break
+        for reservation_id in reservation_ids:
+            if reservation_id in all_ids:
+                raise ValueError(f"reservations 文件存在重复 RI：{reservation_id}")
+            all_ids.add(reservation_id)
+            if has_binding:
+                valid_binding_ids.add(reservation_id)
     return all_ids, valid_binding_ids
 
 
@@ -210,10 +258,10 @@ def build_distribution(
         summary_gross_by_reservation,
         summary_price_sheet_source,
     ) = load_summary(input_dir)
-    all_reservation_ids, valid_binding_ids = load_reservations_config(
-        input_dir, reservations_file
-    )
     allocated_paths = discover_allocated_csvs(input_dir)
+    all_reservation_ids, valid_binding_ids = load_reservations_config(
+        input_dir, reservations_file, reservation_orders_from_bills(allocated_paths)
+    )
 
     row_projects: dict[tuple[str, int], str] = {}
     before: defaultdict[tuple[str, str], Decimal] = defaultdict(Decimal)
@@ -224,6 +272,7 @@ def build_distribution(
     )
     amortized_by_reservation: defaultdict[str, Decimal] = defaultdict(Decimal)
     reservation_names: dict[str, str] = {}
+    reservation_types: dict[str, str] = {}
     price_rates = None
 
     for path in allocated_paths:
@@ -244,6 +293,15 @@ def build_distribution(
                     reservation_name = (row.get("reservationName") or "").strip()
                     if reservation_name:
                         reservation_names.setdefault(reservation_id, reservation_name)
+                    resource_type = resource_type_from_row(row)
+                    if resource_type:
+                        previous_type = reservation_types.setdefault(
+                            reservation_id, resource_type
+                        )
+                        if previous_type != resource_type:
+                            raise ValueError(
+                                f"RI {reservation_id} 同时用于 {previous_type} 和 {resource_type}"
+                            )
                 if not is_ri_usage and not has_calculated_savings:
                     continue
                 if not reservation_id:
@@ -439,6 +497,7 @@ def build_distribution(
                 {
                     "reservationId": reservation_id,
                     "reservationName": reservation_names.get(reservation_id, ""),
+                    "resourceType": reservation_types.get(reservation_id, ""),
                     "classification": (
                         "VALID_BINDING_WITH_USAGE"
                         if reservation_id in valid_binding_ids
@@ -466,6 +525,7 @@ def build_distribution(
     fieldnames = [
         "reservationId",
         "reservationName",
+        "resourceType",
         "classification",
         "allocationStatus",
         "project",
@@ -532,6 +592,7 @@ def write_html_report(
         if not ri_rows:
             continue
         name = ri_rows[0]["reservationName"]
+        resource_type = ri_rows[0]["resourceType"]
         total = Decimal(ri_rows[0]["netBenefitOrLoss"])
         payg_cost = Decimal(ri_rows[0]["paygEquivalentCost"])
         amortized_cost_before = Decimal(
@@ -544,6 +605,8 @@ def write_html_report(
         title = html.escape(reservation_id)
         if name:
             title += f" · {html.escape(name)}"
+        if resource_type:
+            title += f" · {html.escape(resource_type)}"
         table_rows = []
         distribution_rows = [row for row in ri_rows if row["project"]]
         for row in sorted(

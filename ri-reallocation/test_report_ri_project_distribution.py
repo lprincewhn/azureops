@@ -51,6 +51,8 @@ class DistributionReportTests(unittest.TestCase):
         bill_fields = [
             "reservationId",
             "reservationName",
+            "meterCategory",
+            "additionalInfo",
             "chargeType",
             "pricingModel",
             "tags",
@@ -160,6 +162,174 @@ class DistributionReportTests(unittest.TestCase):
             )
             self.assertEqual(result.gross_savings, MODULE.Decimal("30"))
             self.assertTrue(result.html_path.is_file())
+
+    def test_combined_vm_mysql_amr_with_order_bindings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_result(
+                root,
+                [
+                    {
+                        "reservationId": "ri-vm",
+                        "meterCategory": "Virtual Machines",
+                        "tags": '{"projname":"vm-source"}',
+                        "riBenefitOrLoss": "30",
+                    },
+                    {
+                        "reservationId": "ri-mysql",
+                        "meterCategory": "Azure Database for MySQL",
+                        "chargeType": "Usage",
+                        "pricingModel": "Reservation",
+                        "additionalInfo": '{"ReservationOrderId":"MYSQL-ORDER"}',
+                        "tags": '{"projname":"db-source"}',
+                        "riBenefitOrLoss": "30",
+                    },
+                    {
+                        "reservationId": "ri-amr",
+                        "meterCategory": "Redis Cache",
+                        "chargeType": "Usage",
+                        "pricingModel": "Reservation",
+                        "additionalInfo": '{"ReservationOrderId":"redis-order"}',
+                        "tags": '{"projname":"redis-source"}',
+                        "riBenefitOrLoss": "30",
+                    },
+                ],
+                [
+                    {
+                        "sourceFile": "bill.csv",
+                        "sourceRowNumber": "3",
+                        "allocationType": "RI_USAGE_COST_REASSIGNED",
+                        "riAllocationReservationIds": "ri-mysql",
+                        "allocationAmount": "20",
+                    },
+                    {
+                        "sourceFile": "bill.csv",
+                        "sourceRowNumber": "3",
+                        "allocationType": "RI_BENEFIT_ASSIGNED",
+                        "allocationTarget": "db-target",
+                        "riAllocationReservationIds": "ri-mysql",
+                        "allocationAmount": "-20",
+                    },
+                ],
+            )
+            (root / "ri-summary.json").write_text(
+                json.dumps({
+                    "reservationIds": ["ri-vm", "ri-mysql", "ri-amr"],
+                    "riSavingsByReservation": {
+                        ri: {"netBenefitOrLoss": "30"}
+                        for ri in ("ri-vm", "ri-mysql", "ri-amr")
+                    },
+                }),
+                encoding="utf-8",
+            )
+            (root / "reservations.json").write_text(
+                json.dumps([
+                    {
+                        "externalReservationId": "/reservations/ri-vm",
+                        "bindings": [{"project": "vm-target", "boundQuantity": 1}],
+                    },
+                    {
+                        "externalReservationId": "order:mysql-order",
+                        "productType": "mysql",
+                        "bindings": [{"project": "db-target", "boundQuantity": 1}],
+                    },
+                    {
+                        "externalReservationId": "order:REDIS-ORDER",
+                        "productType": "redis",
+                        "bindings": [],
+                    },
+                ]),
+                encoding="utf-8",
+            )
+            result = MODULE.build_distribution(root, root / "report", "projname")
+            with result.csv_path.open(encoding="utf-8-sig", newline="") as source:
+                rows = {
+                    (row["reservationId"], row["project"]): row
+                    for row in csv.DictReader(source)
+                }
+            self.assertEqual(result.configured_reservation_count, 3)
+            self.assertEqual(result.reservation_count, 3)
+            self.assertEqual(result.gross_savings, MODULE.Decimal("90"))
+            self.assertEqual(rows["ri-vm", "vm-source"]["resourceType"], "VM")
+            self.assertEqual(rows["ri-mysql", "db-source"]["resourceType"], "MySQL")
+            self.assertEqual(rows["ri-amr", "redis-source"]["resourceType"], "AMR")
+            self.assertEqual(rows["ri-mysql", "db-source"]["afterBenefit"], "10")
+            self.assertEqual(rows["ri-mysql", "db-target"]["afterBenefit"], "20")
+            self.assertEqual(
+                rows["ri-amr", "redis-source"]["classification"],
+                "NO_VALID_BINDING_WITH_USAGE",
+            )
+            html_report = result.html_path.read_text(encoding="utf-8")
+            self.assertIn("ri-mysql · MySQL", html_report)
+            self.assertIn("ri-amr · AMR", html_report)
+
+    def test_order_mapping_only_uses_ri_usage_and_does_not_invent_ids(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_result(
+                root,
+                [
+                    {
+                        "reservationId": "ri-1",
+                        "chargeType": "Usage",
+                        "pricingModel": "Reservation",
+                        "additionalInfo": '{"ReservationOrderId":"ORDER-1"}',
+                        "tags": '{"projname":"source"}',
+                        "riBenefitOrLoss": "30",
+                    },
+                    {
+                        "reservationId": "ri-not-used",
+                        "chargeType": "Purchase",
+                        "pricingModel": "Reservation",
+                        "additionalInfo": '{"ReservationOrderId":"ORDER-1"}',
+                        "tags": '{"projname":"source"}',
+                    },
+                ],
+                [],
+            )
+            (root / "reservations.json").write_text(
+                json.dumps([
+                    {
+                        "externalReservationId": "order:order-1",
+                        "bindings": [{"project": "target", "boundQuantity": 1}],
+                    },
+                    {
+                        "externalReservationId": "order:no-usage",
+                        "bindings": [{"project": "target", "boundQuantity": 1}],
+                    },
+                ]),
+                encoding="utf-8",
+            )
+            result = MODULE.build_distribution(root, root / "report", "projname")
+            self.assertEqual(result.configured_reservation_count, 1)
+            self.assertEqual(result.reservation_count, 1)
+
+    def test_rejects_unknown_ri_even_with_order_configuration(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_result(
+                root,
+                [
+                    {
+                        "reservationId": "ri-1",
+                        "chargeType": "Usage",
+                        "pricingModel": "Reservation",
+                        "additionalInfo": '{"ReservationOrderId":"other-order"}',
+                        "tags": '{"projname":"source"}',
+                        "riBenefitOrLoss": "30",
+                    }
+                ],
+                [],
+            )
+            (root / "reservations.json").write_text(
+                json.dumps([{
+                    "externalReservationId": "order:configured-order",
+                    "bindings": [{"project": "target", "boundQuantity": 1}],
+                }]),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "未定义的 RI：ri-1"):
+                MODULE.build_distribution(root, root / "report", "projname")
 
     def test_reports_amortized_cost_before_and_after_actual_reconciliation(self):
         with tempfile.TemporaryDirectory() as tmp:
