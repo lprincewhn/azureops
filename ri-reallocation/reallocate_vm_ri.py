@@ -33,10 +33,32 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 
-def parse_args() -> argparse.Namespace:
+class ResourceProfile(NamedTuple):
+    name: str
+    category: str
+    product_type: str
+
+
+VM = ResourceProfile("VM", "Virtual Machines", "vm")
+MYSQL = ResourceProfile("MySQL", "Azure Database for MySQL", "mysql")
+AMR = ResourceProfile("AMR", "Redis Cache", "redis")
+
+
+def matches_resource(row: dict[str, str], profile: ResourceProfile) -> bool:
+    if row.get("meterCategory") != profile.category:
+        return False
+    subcategory = row.get("meterSubCategory") or ""
+    if profile == MYSQL:
+        return "Compute" in subcategory and row.get("meterName") == "vCore"
+    if profile == AMR:
+        return subcategory == "Azure Managed Redis - Balanced"
+    return True
+
+
+def parse_args(profile: ResourceProfile = VM) -> argparse.Namespace:
     """解析命令行参数。"""
     parser = argparse.ArgumentParser(
-        description="生成 RI 费用重新分摊后的 CSV 明细副本。"
+        description=f"生成 {profile.name} RI 费用重新分摊后的 CSV 明细副本。"
     )
     parser.add_argument("inputs", nargs="+", help="源 CSV 文件或 glob")
     parser.add_argument(
@@ -336,7 +358,9 @@ def row_matches_ri_scope(
 
 
 def load_reservations_config(
-    path: Path, project_tag_key: str
+    path: Path, project_tag_key: str,
+    profile: ResourceProfile = VM,
+    order_reservations: dict[str, set[str]] | None = None,
 ) -> tuple[RiTargets, RiModes, RiDenominators, RiScopes]:
     """读取 reservations.json，构建 reservationId → [(目标, 权重)] 映射、匹配模式及权重分母。
 
@@ -376,13 +400,8 @@ def load_reservations_config(
     for item in items:
         if not isinstance(item, dict):
             raise ValueError("reservation 条目必须是对象")
-        reservation_id = _reservation_id_from_external(
-            item.get("externalReservationId")
-        )
-        if not reservation_id:
-            reservation_id = str(item.get("reservationId") or "").strip()
-        if not reservation_id:
-            raise ValueError("reservation 条目缺少 reservationId/externalReservationId")
+        if profile != VM and item.get("productType") != profile.product_type:
+            continue
 
         weights: dict[str, Decimal] = {}
         for binding in item.get("bindings") or []:
@@ -401,17 +420,22 @@ def load_reservations_config(
         if not weights:
             # 没有有效 binding（未绑定项目）的预留无法分摊，跳过。
             continue
-        if reservation_id in result:
-            raise ValueError(
-                f"reservations 文件存在重复 reservationId：{reservation_id!r}"
-            )
-        result[reservation_id] = [
-            ((key, code), weight) for code, weight in weights.items()
-        ]
-        modes[reservation_id] = _match_mode_from_flexibility(
-            item.get("flexibility")
-        )
-        scopes[reservation_id] = _normalize_ri_scope(item)
+        external_id = str(item.get("externalReservationId") or "").strip()
+        if external_id.lower().startswith("order:"):
+            order_id = external_id.split(":", 1)[1].strip().lower()
+            reservation_ids = (order_reservations or {}).get(order_id, set())
+            if not reservation_ids:
+                raise ValueError(
+                    f"{profile.name} 预留订单 {order_id!r} 在输入 RI Usage 中"
+                    "找不到 reservationId"
+                )
+        else:
+            reservation_id = _reservation_id_from_external(external_id)
+            if not reservation_id:
+                reservation_id = str(item.get("reservationId") or "").strip()
+            if not reservation_id:
+                raise ValueError("reservation 条目缺少 reservationId/externalReservationId")
+            reservation_ids = {reservation_id}
         bound_sum = sum(weights.values(), Decimal("0"))
         try:
             bound_total = Decimal(str(item.get("boundTotal")))
@@ -420,10 +444,23 @@ def load_reservations_config(
         # boundTotal 缺失/非正/小于已绑定权重之和时，回退为全额分摊（无其他项目剩余）。
         if bound_total is None or bound_total < bound_sum:
             bound_total = bound_sum
-        denominators[reservation_id] = bound_total
+        for reservation_id in reservation_ids:
+            if reservation_id in result:
+                raise ValueError(
+                    f"reservations 文件存在重复 reservationId：{reservation_id!r}"
+                )
+            result[reservation_id] = [
+                ((key, code), weight) for code, weight in weights.items()
+            ]
+            modes[reservation_id] = _match_mode_from_flexibility(
+                item.get("flexibility")
+            )
+            scopes[reservation_id] = _normalize_ri_scope(item)
+            denominators[reservation_id] = bound_total
     if not result:
         raise ValueError(
-            "reservations 文件没有可用的 RI 分摊定义（缺少有效 bindings）"
+            f"reservations 文件没有可用的 {profile.name} RI 分摊定义"
+            "（缺少有效 bindings）"
         )
     return result, modes, denominators, scopes
 
@@ -764,11 +801,73 @@ def project_of(row: dict[str, str], project_tag_key: str) -> str:
     return str(parse_tags(row.get("tags", "")).get(project_tag_key) or "<missing>")
 
 
-def main() -> None:
+def resource_key(
+    row: dict[str, str], match_mode: str, profile: ResourceProfile
+) -> tuple[str, str]:
+    if profile == VM:
+        return allocation_key(row, match_mode)
+    subcategory = row.get("meterSubCategory") or ""
+    region = vm_region(row)
+    if profile == MYSQL:
+        sku = str(additional_info(row).get("ServerSku") or "").strip()
+        if not sku:
+            raise ValueError("MySQL Compute 明细缺少 additionalInfo.ServerSku")
+        model = flexibility_group(sku) if match_mode == "flex-group" else sku
+        return f"{subcategory}:{model}", region
+    if match_mode == "flex-group":
+        return subcategory, region
+    return f"{subcategory}:{row.get('meterName') or ''}", region
+
+
+def main(profile: ResourceProfile = VM) -> None:
     """读取账单、计算分摊并生成明细副本和汇总报告。"""
-    args = parse_args()
+    args = parse_args(profile)
+    input_paths = expand_inputs(args.inputs)
+    output_dir = Path(args.output_dir)
+    if not args.summary_only and any(
+        (output_dir / path.name).resolve() == path for path in input_paths
+    ):
+        raise ValueError("输出目录不能与输入账单目录相同，以免覆盖源文件")
+
+    # Read the bill first: MySQL/AMR reservation exports may identify an order
+    # rather than the individual reservation IDs carried by Usage rows.
+    rows: list[dict[str, str]] = []
+    fieldnames: list[str] | None = None
+    source_files: list[str] = []
+    for input_path in input_paths:
+        source_files.append(str(input_path))
+        with input_path.open("r", encoding="utf-8-sig", newline="") as source:
+            reader = csv.DictReader(source)
+            if reader.fieldnames is None:
+                raise ValueError(f"{input_path} 没有 CSV 表头")
+            if fieldnames is None:
+                fieldnames = list(reader.fieldnames)
+            elif fieldnames != list(reader.fieldnames):
+                raise ValueError(f"{input_path} 的 CSV 表头与其他输入文件不一致")
+            if args.amount_field not in reader.fieldnames:
+                raise ValueError(
+                    f"{input_path} 缺少成本基准字段 {args.amount_field!r}"
+                )
+            for source_row_number, row in enumerate(reader, start=2):
+                row["_source_file"] = str(input_path)
+                row["_source_row_number"] = str(source_row_number)
+                rows.append(row)
+
+    order_reservations: defaultdict[str, set[str]] = defaultdict(set)
+    if profile != VM:
+        for row in rows:
+            reservation_id = row.get("reservationId", "").strip()
+            if (
+                not reservation_id
+                or not matches_resource(row, profile)
+                or not is_ri_usage(row, {reservation_id})
+            ):
+                continue
+            order_id = str(additional_info(row).get("ReservationOrderId") or "").lower()
+            if order_id:
+                order_reservations[order_id].add(reservation_id)
     ri_targets, ri_modes, ri_denominators, ri_scopes = load_reservations_config(
-        Path(args.reservations_file), args.project_tag_key
+        Path(args.reservations_file), args.project_tag_key, profile, order_reservations
     )
     management_group_subscriptions = resolve_management_group_scopes(ri_scopes)
     reservation_ids = set(ri_targets)
@@ -793,15 +892,7 @@ def main() -> None:
                 )
             target_modes[target] = mode
             target_profiles[target].add((scope, mode))
-    input_paths = expand_inputs(args.inputs)
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    # 先将明细加载到内存，第二遍处理时可以按目标项目的总费用计算比例。
-    rows: list[dict[str, str]] = []
-    fieldnames: list[str] | None = None
-    source_files: list[str] = []
-    total_rows = 0
+    total_rows = len(rows)
     ri_usage_rows = 0
     ri_reallocated_rows = 0
     ri_size_flexible_rows = 0
@@ -829,29 +920,6 @@ def main() -> None:
     ri_label_by_index: dict[int, str] = {}
     receiver_basis_by_index: dict[int, Decimal] = {}
 
-    # First load all source rows. Real RI savings require reservation-level totals
-    # (including UnusedReservation), so allocation starts only after the full scan.
-    for input_path in input_paths:
-        source_files.append(str(input_path))
-        with input_path.open("r", encoding="utf-8-sig", newline="") as source:
-            reader = csv.DictReader(source)
-            if reader.fieldnames is None:
-                raise ValueError(f"{input_path} 没有 CSV 表头")
-            if fieldnames is None:
-                fieldnames = list(reader.fieldnames)
-            elif fieldnames != list(reader.fieldnames):
-                raise ValueError(f"{input_path} 的 CSV 表头与其他输入文件不一致")
-            if args.amount_field not in reader.fieldnames:
-                raise ValueError(
-                    f"{input_path} 缺少成本基准字段 {args.amount_field!r}"
-                )
-
-            for source_row_number, row in enumerate(reader, start=2):
-                total_rows += 1
-                row["_source_file"] = str(input_path)
-                row["_source_row_number"] = str(source_row_number)
-                rows.append(row)
-
     price_rates, price_sheet_source = load_price_sheet(args.price_sheet_file)
     gross_by_index: dict[int, Decimal] = {}
     payg_by_index: dict[int, Decimal] = {}
@@ -862,7 +930,7 @@ def main() -> None:
 
     for row_index, row in enumerate(rows):
         reservation_id = row.get("reservationId", "").strip()
-        if is_ri_usage(row, reservation_ids):
+        if matches_resource(row, profile) and is_ri_usage(row, reservation_ids):
             quantity = decimal_from_row(row, "quantity")
             if quantity < 0:
                 raise ValueError("RI Usage quantity 不能为负数")
@@ -877,7 +945,8 @@ def main() -> None:
             elif gross_savings < 0:
                 excess_cost_by_reservation[reservation_id] -= gross_savings
         elif (
-            reservation_id in reservation_ids
+            matches_resource(row, profile)
+            and reservation_id in reservation_ids
             and row.get("chargeType") == "UnusedReservation"
             and row.get("pricingModel") == "Reservation"
         ):
@@ -890,7 +959,9 @@ def main() -> None:
     ri_unused_cost_total = sum(unused_by_reservation.values(), Decimal("0"))
 
     for row_index, row in enumerate(rows):
-        if row.get("meterCategory") != "Virtual Machines":
+        if not matches_resource(row, profile) or (
+            profile != VM and row.get("chargeType") != "Usage"
+        ):
             continue
 
         project = project_of(row, args.project_tag_key)
@@ -901,7 +972,7 @@ def main() -> None:
             reservation_id = row.get("reservationId", "").strip()
             targets_list = ri_targets[reservation_id]
             ri_usage_rows += 1
-            ri_service_types[reservation_id].add(vm_model(row))
+            ri_service_types[reservation_id].add(resource_key(row, "model", profile)[0])
             if is_size_flexible(row):
                 ri_size_flexible_rows += 1
             gross_savings = gross_by_index[row_index]
@@ -915,7 +986,7 @@ def main() -> None:
             ri_usage_indexes.add(row_index)
             ri_add_back_by_index[row_index] = add_back
             ri_label_by_index[row_index] = label
-            alloc_key = allocation_key(row, ri_modes[reservation_id])
+            alloc_key = resource_key(row, ri_modes[reservation_id], profile)
             for target, contribution in contributions:
                 pool_key = (ri_scopes[reservation_id], target, alloc_key)
                 ri_amount_by_key[pool_key] += contribution
@@ -927,7 +998,7 @@ def main() -> None:
             if len(matched) > 1:
                 labels = "、".join("=".join(t) for t in matched)
                 raise ValueError(
-                    f"虚拟机明细同时匹配多个分摊目标（{labels}）；"
+                    f"{profile.name} 明细同时匹配多个分摊目标（{labels}）；"
                     "一条明细只能归属一个分摊目标。"
                 )
             if matched:
@@ -941,7 +1012,7 @@ def main() -> None:
                     pool_key = (
                         scope,
                         matched[0],
-                        allocation_key(row, mode),
+                        resource_key(row, mode, profile),
                     )
                     target_non_ri_indexes[pool_key].append(row_index)
                     target_non_ri_total_by_key[pool_key] += full_price
@@ -950,7 +1021,7 @@ def main() -> None:
             if len(matched) > 1:
                 labels = "、".join("=".join(t) for t in matched)
                 raise ValueError(
-                    f"虚拟机明细同时匹配多个分摊目标（{labels}）；"
+                    f"{profile.name} 明细同时匹配多个分摊目标（{labels}）；"
                     "一条明细只能归属一个分摊目标。"
                 )
             if matched:
@@ -963,7 +1034,7 @@ def main() -> None:
                     pool_key = (
                         scope,
                         matched[0],
-                        allocation_key(row, mode),
+                        resource_key(row, mode, profile),
                     )
                     target_non_ri_indexes[pool_key].append(row_index)
                     target_non_ri_total_by_key[pool_key] += amount
@@ -971,6 +1042,8 @@ def main() -> None:
     target_non_ri_total = sum(
         target_non_ri_total_by_key.values(), Decimal("0")
     )
+    if profile != VM and not ri_usage_rows:
+        raise ValueError(f"输入账单中没有已绑定的 {profile.name} RI Usage 明细")
 
     for pool_key, key_ri_amount in ri_amount_by_key.items():
         scope, target, alloc_key = pool_key
@@ -982,13 +1055,13 @@ def main() -> None:
         if key_target_total == 0:
             raise ValueError(
                 f"找不到分摊目标 {target_label!r} 与 RI 机型和区域 {alloc_key!r} "
-                f"且符合 RI scope {scope!r} 的虚拟机明细"
+                f"且符合 RI scope {scope!r} 的 {profile.name} 明细"
                 "（含加回后的 RI 使用记录）。"
             )
         if key_ri_amount > 0 and key_target_total < key_ri_amount:
             raise ValueError(
                 f"分摊目标 {target_label!r} 的匹配机型和区域 {alloc_key!r} "
-                f"虚拟机全价费用 {key_target_total} 小于待分摊 RI 净收益 "
+                f"{profile.name} 全价费用 {key_target_total} 小于待分摊 RI 净收益 "
                 f"{key_ri_amount}，无法按比例分摊后保持非负费用。"
             )
 
@@ -1051,6 +1124,7 @@ def main() -> None:
 
     output_paths: list[str] = []
     allocated_field = allocated_field_name(args.amount_field)
+    output_dir.mkdir(parents=True, exist_ok=True)
     if not args.summary_only:
         if fieldnames is None:
             raise ValueError("没有读取到 CSV 表头")
@@ -1242,7 +1316,10 @@ def main() -> None:
             reservation_id: ri_modes[reservation_id]
             for reservation_id in sorted(ri_modes)
         },
-        "costScope": "meterCategory == Virtual Machines",
+        "costScope": (
+            "meterCategory == Virtual Machines" if profile == VM
+            else f"{profile.name} eligible compute Usage ({profile.category})"
+        ),
         "riSelection": {
             "pricingModel": "Reservation",
             "chargeType": "Usage",
@@ -1324,7 +1401,7 @@ def main() -> None:
     print(f"RI 未使用成本：{ri_unused_cost_total}")
     print(f"RI 组合净收益（仅汇总）：{ri_gross_savings_total - ri_unused_cost_total}")
     print(f"按 binding 待分摊使用收益：{ri_amount}")
-    print(f"目标项目虚拟机接收费用：{target_non_ri_total}")
+    print(f"目标项目 {profile.name} 接收费用：{target_non_ri_total}")
     print(f"输出目录：{output_dir}")
     print(f"汇总文件：{summary_path}")
 

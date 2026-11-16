@@ -172,6 +172,41 @@ work/02-economic-reallocated/
 
 脚本不再自动下载 Price Sheet；未指定 `--price-sheet-file` 会直接报参数错误。
 
+### MySQL 与 Azure Managed Redis 独立分摊
+
+`reallocate_mysql_ri.py` 与 `reallocate_amr_ri.py` 复用 VM 的价格匹配、
+`boundQuantity / boundTotal` 权重、RI scope、金额守恒及非负费用校验，但分别
+只修改 MySQL Compute vCore 与 Azure Managed Redis Balanced Cache Instance
+的 Usage 明细；存储、备份、Extended Support、其他 Redis 系列与 VM 行不会承接
+收益。MySQL 按 Compute 子类别、`additionalInfo.ServerSku`（开启 flexibility 时
+按规格系列）和区域分池；AMR 开启 flexibility 时按 Balanced 系列与区域分池，
+关闭时再按 `meterName` 的精确规格分池。未使用预留量仅汇总，不搬给接收项目。
+
+两个脚本使用与 VM 相同的命令行参数，但应分别指定**独立输出目录**：
+
+```bash
+python3 reallocate_mysql_ri.py "input/amortized/Amortized_*.csv" \
+  --reservations-file reservations.json --project-tag-key projname \
+  --price-sheet-file azure-price-sheet.json --output-dir work/02-mysql
+python3 reallocate_amr_ri.py "input/amortized/Amortized_*.csv" \
+  --reservations-file reservations.json --project-tag-key projname \
+  --price-sheet-file azure-price-sheet.json --output-dir work/02-amr
+```
+
+配置分别只选取 `productType=mysql`、`productType=redis` 且有有效
+`bindings` 的预留；对于 `externalReservationId=order:<订单 GUID>`，
+通过 Usage 行 `additionalInfo.ReservationOrderId` 找到账单 `reservationId`。
+若没有绑定、订单无法匹配或没有对应 RI Usage，脚本会报错，不会生成
+“成功但没有实际分摊”的报告。输入和输出必须分开，避免将另一个脚本的
+`allocatedCostInBillingCurrency` 当作本脚本的基准；当前第一步
+`allocate_ri_difference.py` **只对齐 VM**，MySQL/AMR 使用原始 Amortized
+时的金额是摊销口径，不代表已对齐 Actual 购买费用。
+
+用例 `realtests/8` 的 11 月数据包含 MySQL 与 AMR RI Usage 和匹配的 11 月
+Price Sheet，但所提供的两类 RI **都没有项目 bindings**；原样运行会因
+缺少有效绑定停止。须由业务方明确项目绑定后才能完成真实项目分摊，
+不应将临时测试绑定当作正式配置。
+
 ## 6. 步骤 3：生成 RI 项目分布报告
 
 执行：
