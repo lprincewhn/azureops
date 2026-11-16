@@ -37,6 +37,31 @@ class VmResourceIdTests(unittest.TestCase):
 
 
 class MultiServiceReconciliationTests(unittest.TestCase):
+    def test_usage_selection_does_not_depend_on_meter_subcategory(self):
+        for category, service, resource in (
+            ("Azure Database for MySQL", "mysql",
+             "/providers/Microsoft.DBforMySQL/flexibleServers/db"),
+            ("Redis Cache", "amr",
+             "/providers/Microsoft.Cache/redisEnterprise/cache"),
+        ):
+            with self.subTest(service=service):
+                row = {
+                    "meterCategory": category,
+                    "meterSubCategory": "Other Reservation Subcategory",
+                    "pricingModel": "Reservation", "chargeType": "Usage",
+                    "benefitId": "/reservationOrders/order-a/reservations/ri-a",
+                    "reservationId": "ri-a", "ResourceId": resource,
+                    "costInBillingCurrency": "10", "quantity": "1",
+                    "reservationName": "reservation",
+                }
+                data = [{"path": Path("bill.csv"), "rows": [row]}]
+                self.assertEqual(MODULE.reservation_service(row), service)
+                costs, eligible, _, _ = MODULE.collect_amortized_data(
+                    data, "costInBillingCurrency"
+                )
+                self.assertEqual(costs[(service, "order-a")], Decimal("10"))
+                self.assertEqual(eligible[(service, "order-a")], [(0, 0)])
+
     def test_purchase_and_usage_are_reconciled_per_service_and_order(self):
         order = "same-order"
         def row(category, subcategory, charge, cost, resource="", benefit=""):

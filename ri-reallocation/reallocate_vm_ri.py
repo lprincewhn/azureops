@@ -47,12 +47,13 @@ AMR = ResourceProfile("AMR", "Redis Cache", "redis")
 def matches_resource(row: dict[str, str], profile: ResourceProfile) -> bool:
     if row.get("meterCategory") != profile.category:
         return False
-    subcategory = row.get("meterSubCategory") or ""
     if profile == MYSQL:
-        return "Compute" in subcategory and row.get("meterName") == "vCore"
-    if profile == AMR:
-        return subcategory == "Azure Managed Redis - Balanced"
+        return bool(additional_info(row).get("ServerSku"))
     return True
+
+
+def matches_ri_usage_resource(row: dict[str, str], profile: ResourceProfile) -> bool:
+    return row.get("meterCategory") == profile.category
 
 
 def parse_args(profile: ResourceProfile = VM) -> argparse.Namespace:
@@ -861,7 +862,7 @@ def main(profile: ResourceProfile = VM) -> None:
             reservation_id = row.get("reservationId", "").strip()
             if (
                 not reservation_id
-                or not matches_resource(row, profile)
+                or not matches_ri_usage_resource(row, profile)
                 or not is_ri_usage(row, {reservation_id})
             ):
                 continue
@@ -932,7 +933,7 @@ def main(profile: ResourceProfile = VM) -> None:
 
     for row_index, row in enumerate(rows):
         reservation_id = row.get("reservationId", "").strip()
-        if matches_resource(row, profile) and is_ri_usage(row, reservation_ids):
+        if matches_ri_usage_resource(row, profile) and is_ri_usage(row, reservation_ids):
             quantity = decimal_from_row(row, "quantity")
             if quantity < 0:
                 raise ValueError("RI Usage quantity 不能为负数")
@@ -947,7 +948,7 @@ def main(profile: ResourceProfile = VM) -> None:
             elif gross_savings < 0:
                 excess_cost_by_reservation[reservation_id] -= gross_savings
         elif (
-            matches_resource(row, profile)
+            matches_ri_usage_resource(row, profile)
             and reservation_id in reservation_ids
             and row.get("chargeType") == "UnusedReservation"
             and row.get("pricingModel") == "Reservation"
@@ -961,16 +962,20 @@ def main(profile: ResourceProfile = VM) -> None:
     ri_unused_cost_total = sum(unused_by_reservation.values(), Decimal("0"))
 
     for row_index, row in enumerate(rows):
-        if not matches_resource(row, profile) or (
-            profile != VM and row.get("chargeType") != "Usage"
-        ):
+        selected_ri_usage = (
+            matches_ri_usage_resource(row, profile)
+            and is_ri_usage(row, reservation_ids)
+        )
+        if not selected_ri_usage and not matches_resource(row, profile):
+            continue
+        if profile != VM and row.get("chargeType") != "Usage":
             continue
 
         project = project_of(row, args.project_tag_key)
         amount = decimal_from_row(row, args.amount_field)
         project_before[project] += amount
 
-        if is_ri_usage(row, reservation_ids):
+        if selected_ri_usage:
             reservation_id = row.get("reservationId", "").strip()
             targets_list = ri_targets[reservation_id]
             ri_usage_rows += 1

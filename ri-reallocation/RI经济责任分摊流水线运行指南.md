@@ -4,8 +4,8 @@
 
 本流水线依次运行两个分摊脚本和一个报告脚本：
 
-1. `allocate_ri_difference.py`：按订单、资源类型将 VM、MySQL Compute 和 AMR
-   Balanced 的 Actual 与 Amortized 差额分摊到对应的 Usage 行。
+1. `allocate_ri_difference.py`：按订单、资源类别将 VM、MySQL 和 Redis Cache
+   的 Actual 与 Amortized 差额分摊到对应的 RI Usage 行。
 2. `reallocate_all_ri.py`：分别运行三类资源的收益分摊，再按原始账单行合并调整、
    逐 RI 明细和汇总；单类脚本也可独立运行。
 3. `report_ri_project_distribution.py`：按每个 RI 展示三类资源分摊前后的项目经济责任。
@@ -174,12 +174,14 @@ work/02-economic-reallocated/
 ### MySQL 与 Azure Managed Redis 独立分摊
 
 `reallocate_mysql_ri.py` 与 `reallocate_amr_ri.py` 复用 VM 的价格匹配、
-`boundQuantity / boundTotal` 权重、RI scope、金额守恒及非负费用校验，但分别
-只修改 MySQL Compute vCore 与 Azure Managed Redis Balanced Cache Instance
-的 Usage 明细；存储、备份、Extended Support、其他 Redis 系列与 VM 行不会承接
-收益。MySQL 按 Compute 子类别、`additionalInfo.ServerSku`（开启 flexibility 时
-按规格系列）和区域分池；AMR 开启 flexibility 时按 Balanced 系列与区域分池，
-关闭时再按 `meterName` 的精确规格分池。未使用预留量仅汇总，不搬给接收项目。
+`boundQuantity / boundTotal` 权重、RI scope、金额守恒及非负费用校验。
+RI Usage 仅按各自的 `meterCategory`、`pricingModel=Reservation`、
+`chargeType=Usage` 及已绑定 `reservationId` 选择，**不按
+`meterSubCategory` 筛选**。MySQL 还需 `additionalInfo.ServerSku` 来匹配
+同子类别、同机型（开启 flexibility 时为同规格系列）和区域的接收行；
+AMR 开启 flexibility 时按相同子类别与区域分池，关闭时还需相同
+`meterName`。其他资源类别不参与接收；没有匹配接收行时会明确报错，
+而非把收益转给不同子类别。未使用预留量仅汇总，不搬给接收项目。
 
 两个脚本使用与 VM 相同的命令行参数，但应分别指定**独立输出目录**：
 

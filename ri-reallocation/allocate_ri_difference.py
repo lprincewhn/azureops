@@ -100,12 +100,11 @@ def reservation_service(row):
     if row.get("pricingModel", "").casefold() != "reservation":
         return ""
     category = row.get("meterCategory", "").casefold()
-    subcategory = row.get("meterSubCategory", "").casefold()
     if category == "virtual machines":
         return "vm"
-    if category == "azure database for mysql" and "compute" in subcategory:
+    if category == "azure database for mysql":
         return "mysql"
-    if category == "redis cache" and subcategory == "azure managed redis - balanced":
+    if category == "redis cache":
         return "amr"
     return ""
 

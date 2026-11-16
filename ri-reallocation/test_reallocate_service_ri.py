@@ -126,6 +126,32 @@ class ServiceAllocationTests(unittest.TestCase):
             allocation.resource_key(other, "model", allocation.AMR),
         )
 
+    def test_ri_usage_selection_ignores_subcategory_for_mysql_and_amr(self):
+        for profile, category, subcategory, meter_name, sku in (
+            (allocation.MYSQL, "Azure Database for MySQL",
+             "Other MySQL Compute", "vCore", "Standard_D2ds_v4"),
+            (allocation.AMR, "Redis Cache",
+             "Azure Managed Redis - Memory Optimized", "M10 Cache Instance", ""),
+        ):
+            with self.subTest(profile=profile.name):
+                rows = [
+                    self.row(category, subcategory, meter_name, sku, "origin", 10,
+                             "Reservation", "ri-new"),
+                    self.row(category, subcategory, meter_name, sku, "target", 40),
+                ]
+                config = {
+                    "productType": profile.product_type,
+                    "externalReservationId": "order:order-a",
+                    "flexibility": "off", "appliedScopeType": "Shared",
+                    "bindings": [{"project": "target", "boundQuantity": 1}],
+                }
+                result, summary = self.run_allocation(profile, rows, config, 20)
+                self.assertEqual(summary["riUsageRows"], 1)
+                self.assertEqual(
+                    [Decimal(row["riAllocationAmount"]) for row in result],
+                    [Decimal("10"), Decimal("-10")],
+                )
+
     def test_missing_order_usage_fails_explicitly(self):
         with tempfile.TemporaryDirectory() as root:
             config = Path(root) / "reservations.json"
