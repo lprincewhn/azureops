@@ -391,8 +391,8 @@ reallocate_vm_ri.py
 经济差额分摊，确保该项目按 binding 权重完整承担经济责任；
 其净额 `riAllocationAmount = 加回金额 − 应摊份额`，可正可负。金额守恒不变。
 
-多个输入 CSV 的表头必须完全一致。自动下载 Price Sheet 时，输入还必须属于同一
-`billingAccountId` 和同一自然月；出现多个账期或计费账户时应分批运行。
+多个输入 CSV 的表头必须完全一致。须事先准备覆盖输入账期的本地 Azure Price
+Sheet，并通过 `--price-sheet-file` 指定；跨账期数据应按价格表覆盖范围分批处理。
 
 在包含源 CSV 的目录执行：
 
@@ -404,6 +404,7 @@ python3 reallocate_vm_ri.py \
   part_1_0001.csv \
   --reservations-file reservations.json \
   --project-tag-key projname \
+  --price-sheet-file azure-price-sheet.json \
   --output-dir ri-reallocated
 ```
 
@@ -442,27 +443,8 @@ RI净收益/损失 = PAYG等价成本 - 调整后RI成本
 `riAllocationAmount` 为负数，目标项目接收行的 `riAllocationAmount` 为正数，
 表示将 RI 超额成本从实际消费项目转移给绑定项目。
 
-默认通过 `AzureCliCredential` 使用当前 `az login` 身份下载 Azure Price Sheet。
-MCA/MPA 已出账数据按 `invoiceId` 下载；账单包含多个 `invoiceId` 或历史 Usage 行缺少
-`invoiceId` 时，通过 `--invoice-id` 显式指定。脚本会把成本导出中的短
-`billingAccountId` 自动映射为完整 MCA Billing Account Name，也可用
-`--billing-account-name` 显式传入。未出账数据按 billing profile 下载当前月价格表；
-EA 按 billing account 和账期下载。Price Sheet 默认最长等待 1800 秒，可通过
-`--price-sheet-timeout` 调整：
-
-```bash
-python3 reallocate_vm_ri.py \
-  "part_*_0001.csv" \
-  --reservations-file reservations.json \
-  --project-tag-key projname \
-  --invoice-id "<invoice-id>" \
-  --price-sheet-timeout 1800 \
-  --save-price-sheet-file azure-price-sheet.zip \
-  --output-dir ri-reallocated
-```
-
-也可以显式提供该账期已下载的 Azure Price Sheet（CSV、包含 CSV 的 ZIP，或顶层为
-对象数组的 JSON）：
+Price Sheet 应在运行前单独取得。脚本只读取本地 Azure Price Sheet（CSV、包含 CSV
+的 ZIP，或顶层为对象数组的 JSON），不再自动下载：
 
 ```bash
 python3 reallocate_vm_ri.py \
@@ -480,6 +462,7 @@ python3 reallocate_vm_ri.py \
   "part_*_0001.csv" \
   --reservations-file reservations.json \
   --project-tag-key projname \
+  --price-sheet-file pricesheet.zip \
   --output-dir ri-reallocated
 ```
 
@@ -490,6 +473,7 @@ python3 reallocate_vm_ri.py \
   "part_*_0001.csv" \
   --reservations-file reservations.json \
   --project-tag-key app \
+  --price-sheet-file pricesheet.zip \
   --output-dir ri-reallocated
 ```
 
@@ -500,6 +484,7 @@ python3 reallocate_vm_ri.py \
   "part_*_0001.csv" \
   --reservations-file reservations.json \
   --project-tag-key projname \
+  --price-sheet-file pricesheet.zip \
   --summary-only \
   --output-dir ri-reallocation-summary
 ```

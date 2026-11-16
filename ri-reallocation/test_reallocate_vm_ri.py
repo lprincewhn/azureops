@@ -194,126 +194,22 @@ class PriceSheetTests(unittest.TestCase):
                 rates,
             )
 
-    def test_resolve_short_billing_account_name(self):
-        class Credential:
-            def get_token(self, _scope):
-                return argparse.Namespace(token="token")
-
-        response = mock.MagicMock()
-        response.__enter__.return_value.read.return_value = json.dumps(
-            {
-                "value": [
-                    {"name": "other:tenant_2020-01-01"},
-                    {"name": "account:tenant_2019-05-31"},
-                ]
-            }
-        ).encode()
+    def test_price_sheet_file_is_required(self):
         with mock.patch.object(
-            MODULE.urllib.request, "urlopen", return_value=response
-        ):
-            self.assertEqual(
-                MODULE.resolve_billing_account_name("account", Credential()),
-                "account:tenant_2019-05-31",
-            )
-
-    def test_explicit_invoice_ignores_other_invoice_ids(self):
-        rows = [
-            {
-                "billingAccountId": "short-account",
-                "billingProfileId": "profile",
-                "invoiceId": "invoice-a",
-                "date": "07/01/2026",
-            },
-            {
-                "billingAccountId": "short-account",
-                "billingProfileId": "profile",
-                "invoiceId": "invoice-b",
-                "date": "07/02/2026",
-            },
-        ]
-        result = argparse.Namespace(download_url="https://example.test/prices")
-        poller = mock.Mock()
-        poller.done.return_value = True
-        poller.result.return_value = result
-        client = mock.Mock()
-        client.price_sheet.begin_download_by_invoice.return_value = poller
-        response = mock.MagicMock()
-        response.__enter__.return_value.read.return_value = b"price-sheet"
-        with mock.patch.object(
-            MODULE.urllib.request, "urlopen", return_value=response
-        ):
-            payload = MODULE.download_price_sheet(
-                rows,
-                invoice_id="selected-invoice",
-                billing_account_name="full-account",
-                timeout=30,
-                client=client,
-            )
-        self.assertEqual(payload, b"price-sheet")
-        client.price_sheet.begin_download_by_invoice.assert_called_once_with(
-            billing_account_name="full-account",
-            billing_profile_name="profile",
-            invoice_name="selected-invoice",
-        )
-        poller.wait.assert_called_once_with(timeout=30)
-        poller.result.assert_called_once_with()
-
-    def test_price_sheet_timeout_is_explicit(self):
-        poller = mock.Mock()
-        poller.done.return_value = False
-        with self.assertRaisesRegex(TimeoutError, "30 秒内未生成完成"):
-            MODULE.wait_for_price_sheet(poller, 30)
-        poller.wait.assert_called_once_with(timeout=30)
-        poller.result.assert_not_called()
-
-    def test_wrapped_price_sheet_download_url(self):
-        result = {
-            "publishedEntity": {
-                "properties": {
-                    "downloadUrl": "https://example.test/prices"
-                }
-            }
-        }
-        self.assertEqual(
-            MODULE.price_sheet_download_url(result),
-            "https://example.test/prices",
-        )
-
-    def test_invoice_polling_accepts_completed_status(self):
-        initial = argparse.Namespace(
-            status=202,
-            headers={
-                "Azure-AsyncOperation": "https://example.test/status",
-                "Location": "https://example.test/result",
-                "Retry-After": "0",
-            },
-        )
-        processing = argparse.Namespace(status=200, headers={})
-        final = argparse.Namespace(status=200, headers={})
-        wrapped = {
-            "publishedEntity": {
-                "properties": {
-                    "downloadUrl": "https://example.test/prices"
-                }
-            }
-        }
-        with mock.patch.object(
-            MODULE,
-            "_authorized_json_request",
-            side_effect=[
-                (initial, {}),
-                (processing, {"status": "Completed"}),
-                (final, wrapped),
+            sys, "argv",
+            [
+                "prog", "bill.csv", "--reservations-file", "reservations.json",
+                "--project-tag-key", "projname",
             ],
-        ):
-            result = MODULE.download_price_sheet_by_invoice(
-                "account",
-                "profile",
-                "invoice",
-                argparse.Namespace(),
-                30,
-            )
-        self.assertEqual(result, wrapped)
+        ), mock.patch.object(sys, "stderr"):
+            with self.assertRaises(SystemExit) as exc:
+                MODULE.parse_args()
+        self.assertEqual(exc.exception.code, 2)
+
+    def test_load_price_sheet_requires_existing_file(self):
+        with tempfile.TemporaryDirectory() as root:
+            with self.assertRaises(FileNotFoundError):
+                MODULE.load_price_sheet(str(Path(root) / "missing.csv"))
 
 
 class ReservationsFileTests(unittest.TestCase):

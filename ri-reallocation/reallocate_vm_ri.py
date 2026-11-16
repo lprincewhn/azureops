@@ -24,12 +24,10 @@ import glob
 import io
 import json
 import re
-import time
 import urllib.request
-import urllib.parse
 import zipfile
 from collections import defaultdict
-from datetime import date, datetime, timezone
+from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -76,34 +74,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--price-sheet-file",
-        help=(
-            "Azure Price Sheet CSV/ZIP/JSON。未指定时通过 Azure Cost Management SDK "
-            "按账单中的 billingAccountId/billingProfileId/invoiceId 自动下载"
-        ),
-    )
-    parser.add_argument(
-        "--invoice-id",
-        help=(
-            "下载 MCA/MPA Price Sheet 时使用的发票 ID。账单包含多个 invoiceId "
-            "或历史 Usage 行缺少 invoiceId 时应显式指定"
-        ),
-    )
-    parser.add_argument(
-        "--billing-account-name",
-        help=(
-            "完整 MCA/MPA Billing Account Name。未指定时根据账单中的短 "
-            "billingAccountId 通过 Microsoft.Billing API 自动解析"
-        ),
-    )
-    parser.add_argument(
-        "--price-sheet-timeout",
-        type=int,
-        default=1800,
-        help="等待 Azure 生成 Price Sheet 的最长秒数，默认：1800",
-    )
-    parser.add_argument(
-        "--save-price-sheet-file",
-        help="将自动下载的 Azure Price Sheet 原始 CSV/ZIP/JSON 保存到指定路径",
+        required=True,
+        help="本地 Azure Price Sheet CSV/ZIP/JSON 文件（必填）",
     )
     parser.add_argument(
         "--summary-only",
@@ -665,292 +637,13 @@ def price_for_row(row: dict[str, str], rates: dict[str, list[PriceRate]]) -> Dec
     return next(iter(prices))
 
 
-def _model_value(value: Any, *names: str) -> Any:
-    for name in names:
-        if isinstance(value, dict) and name in value:
-            return value[name]
-        result = getattr(value, name, None)
-        if result is not None:
-            return result
-    return None
-
-
-def wait_for_price_sheet(poller: Any, timeout: int) -> Any:
-    """Wait for a Price Sheet LRO and fail clearly when the deadline expires."""
-    poller.wait(timeout=timeout)
-    if not poller.done():
-        raise TimeoutError(
-            f"Azure Price Sheet 在 {timeout} 秒内未生成完成；"
-            "服务端任务可能仍在运行，请稍后重试或使用已取得的 downloadUrl"
-        )
-    return poller.result()
-
-
-def resolve_billing_account_name(
-    billing_account_id: str, credential: Any
-) -> str:
-    """Resolve a Cost Export MCA account ID to its full Billing account name."""
-    if ":" in billing_account_id:
-        return billing_account_id
-    token = credential.get_token("https://management.azure.com/.default").token
-    request = urllib.request.Request(
-        "https://management.azure.com/providers/Microsoft.Billing/"
-        "billingAccounts?api-version=2020-05-01",
-        headers={"Authorization": f"Bearer {token}"},
-    )
-    with urllib.request.urlopen(request, timeout=120) as response:
-        payload = json.load(response)
-    names = [
-        str(item.get("name") or "")
-        for item in payload.get("value", [])
-        if isinstance(item, dict)
-    ]
-    matches = [
-        name
-        for name in names
-        if name == billing_account_id or name.startswith(f"{billing_account_id}:")
-    ]
-    if len(matches) != 1:
-        raise ValueError(
-            f"无法将 billingAccountId={billing_account_id!r} 唯一映射为完整 "
-            f"Billing Account Name（匹配数：{len(matches)}）；"
-            "请通过 --billing-account-name 显式指定"
-        )
-    return matches[0]
-
-
-def _authorized_json_request(
-    url: str, credential: Any, method: str = "GET"
-) -> tuple[Any, Any]:
-    token = credential.get_token("https://management.azure.com/.default").token
-    request = urllib.request.Request(
-        url,
-        data=b"" if method == "POST" else None,
-        headers={"Authorization": f"Bearer {token}"},
-        method=method,
-    )
-    with urllib.request.urlopen(request, timeout=120) as response:
-        body = response.read()
-        return response, json.loads(body) if body else {}
-
-
-def download_price_sheet_by_invoice(
-    billing_account_name: str,
-    billing_profile_id: str,
-    invoice_id: str,
-    credential: Any,
-    timeout: int,
-) -> Any:
-    """Run the invoice Price Sheet LRO using its Completed terminal status."""
-    quote = lambda value: urllib.parse.quote(value, safe=":-_")
-    url = (
-        "https://management.azure.com/providers/Microsoft.Billing/"
-        f"billingAccounts/{quote(billing_account_name)}/"
-        f"billingProfiles/{quote(billing_profile_id)}/"
-        f"invoices/{quote(invoice_id)}/providers/Microsoft.CostManagement/"
-        "pricesheets/default/download?api-version=2025-03-01"
-    )
-    response, payload = _authorized_json_request(url, credential, method="POST")
-    if getattr(response, "status", None) == 200:
-        return payload
-    if getattr(response, "status", None) != 202:
-        raise ValueError(
-            f"Azure Price Sheet API 返回非预期状态：{response.status}"
-        )
-
-    async_url = response.headers.get("Azure-AsyncOperation")
-    location_url = response.headers.get("Location")
-    if not async_url or not location_url:
-        raise ValueError(
-            "Azure Price Sheet API 的 202 响应缺少 "
-            "Azure-AsyncOperation 或 Location"
-        )
-    retry_after = int(response.headers.get("Retry-After") or "10")
-    deadline = time.monotonic() + timeout
-    while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise TimeoutError(
-                f"Azure Price Sheet 在 {timeout} 秒内未生成完成；"
-                "服务端任务可能仍在运行，请稍后重试"
-            )
-        time.sleep(min(retry_after, remaining))
-        status_response, status_payload = _authorized_json_request(
-            async_url, credential
-        )
-        status = str(status_payload.get("status") or "").strip().lower()
-        if status in {"completed", "succeeded"}:
-            _final_response, final_payload = _authorized_json_request(
-                location_url, credential
-            )
-            return final_payload
-        if status in {"failed", "canceled", "cancelled"}:
-            raise ValueError(
-                f"Azure Price Sheet 生成失败，状态：{status_payload.get('status')}"
-            )
-        if getattr(status_response, "status", None) not in {200, 202}:
-            raise ValueError(
-                "Azure Price Sheet 状态查询返回非预期状态："
-                f"{status_response.status}"
-            )
-        retry_after = int(status_response.headers.get("Retry-After") or "10")
-
-
-def price_sheet_download_url(result: Any) -> str:
-    """Extract a temporary download URL from direct and wrapped API results."""
-    url = _model_value(result, "download_url", "downloadUrl")
-    if url:
-        return str(url)
-    properties = _model_value(result, "properties") or {}
-    url = _model_value(properties, "report_url", "reportUrl", "downloadUrl")
-    if url:
-        return str(url)
-    published = _model_value(result, "published_entity", "publishedEntity") or {}
-    published_properties = _model_value(published, "properties") or {}
-    return str(
-        _model_value(
-            published_properties, "download_url", "downloadUrl", "reportUrl"
-        )
-        or ""
-    )
-
-
-def download_price_sheet(
-    rows: list[dict[str, str]],
-    invoice_id: str | None = None,
-    billing_account_name: str | None = None,
-    timeout: int = 1800,
-    client: Any | None = None,
-    credential: Any | None = None,
-) -> bytes:
-    """Download the applicable Azure Price Sheet through Cost Management SDK."""
-    def unique(field: str, required: bool = True) -> str:
-        values = {(row.get(field) or "").strip() for row in rows}
-        values.discard("")
-        if len(values) > 1:
-            raise ValueError(f"输入账单包含多个 {field}，请分批处理")
-        if required and not values:
-            raise ValueError(f"输入账单缺少 {field}，无法下载 Azure Price Sheet")
-        return next(iter(values), "")
-
-    billing_account_id = unique("billingAccountId")
-    billing_profile_id = unique("billingProfileId", required=False)
-    selected_invoice_id = (invoice_id or "").strip()
-    if not selected_invoice_id:
-        selected_invoice_id = unique("invoiceId", required=False)
-    usage_dates = {
-        parsed
-        for row in rows
-        if (parsed := _parse_date(row.get("date") or "")) is not None
-    }
-    if not usage_dates:
-        raise ValueError("输入账单缺少 date，无法确定 Azure Price Sheet 账期")
-    periods = {(item.year, item.month) for item in usage_dates}
-    if len(periods) != 1:
-        raise ValueError("输入账单跨多个自然月，请按月分批处理")
-
-    if timeout <= 0:
-        raise ValueError("price_sheet_timeout 必须大于 0")
-    owns_client = client is None
-    if client is None:
-        try:
-            from azure.identity import AzureCliCredential
-            from azure.mgmt.costmanagement import CostManagementClient
-        except ImportError as exc:
-            raise RuntimeError(
-                "自动下载 Azure Price Sheet 需要安装 requirements.txt 中的 Azure SDK"
-            ) from exc
-        credential = credential or AzureCliCredential()
-        client = CostManagementClient(credential=credential)
-
-    try:
-        if billing_profile_id:
-            if selected_invoice_id:
-                account_name = (billing_account_name or "").strip()
-                if not account_name:
-                    if credential is None:
-                        raise ValueError(
-                            "自动解析完整 Billing Account Name 需要 Azure credential；"
-                            "传入自定义 client 时请同时传入 credential，或通过 "
-                            "--billing-account-name 显式指定"
-                        )
-                    account_name = resolve_billing_account_name(
-                        billing_account_id, credential
-                    )
-                print(
-                    f"正在生成 invoiceId={selected_invoice_id} 的 Azure Price Sheet，"
-                    f"最长等待 {timeout} 秒..."
-                )
-                if credential is not None:
-                    result = download_price_sheet_by_invoice(
-                        account_name,
-                        billing_profile_id,
-                        selected_invoice_id,
-                        credential,
-                        timeout,
-                    )
-                else:
-                    poller = client.price_sheet.begin_download_by_invoice(
-                        billing_account_name=account_name,
-                        billing_profile_name=billing_profile_id,
-                        invoice_name=selected_invoice_id,
-                    )
-                    result = wait_for_price_sheet(poller, timeout)
-            else:
-                year_month = next(iter(periods))
-                current = datetime.now(timezone.utc)
-                if year_month != (current.year, current.month):
-                    raise ValueError(
-                        "历史 MCA/MPA 账单没有 invoiceId，无法自动取得对应历史 Price "
-                        "Sheet；请通过 --price-sheet-file 提供该账期价格表"
-                    )
-                poller = client.price_sheet.begin_download_by_billing_profile(
-                    billing_account_name=billing_account_id,
-                    billing_profile_name=billing_profile_id,
-                )
-                result = wait_for_price_sheet(poller, timeout)
-        else:
-            year, month = next(iter(periods))
-            poller = client.price_sheet.begin_download_by_billing_account(
-                billing_account_id=billing_account_id,
-                billing_period_name=f"{year:04d}{month:02d}",
-            )
-            result = wait_for_price_sheet(poller, timeout)
-
-        url = price_sheet_download_url(result)
-        if not url:
-            raise ValueError("Azure Price Sheet API 响应中缺少下载 URL")
-        with urllib.request.urlopen(str(url), timeout=120) as response:
-            return response.read()
-    finally:
-        if owns_client:
-            client.close()
-
-
 def load_price_sheet(
-    rows: list[dict[str, str]],
-    price_sheet_file: str | None,
-    invoice_id: str | None = None,
-    billing_account_name: str | None = None,
-    timeout: int = 1800,
-    save_price_sheet_file: str | None = None,
+    price_sheet_file: str,
 ) -> tuple[dict[str, list[PriceRate]], str]:
-    if price_sheet_file:
-        path = Path(price_sheet_file)
-        if not path.is_file():
-            raise FileNotFoundError(f"找不到 Azure Price Sheet：{path}")
-        return parse_price_sheet(path.read_bytes(), str(path)), str(path)
-    payload = download_price_sheet(
-        rows,
-        invoice_id=invoice_id,
-        billing_account_name=billing_account_name,
-        timeout=timeout,
-    )
-    if save_price_sheet_file:
-        target = Path(save_price_sheet_file)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(payload)
-    return parse_price_sheet(payload, "Azure Cost Management API"), "Azure Cost Management API"
+    path = Path(price_sheet_file)
+    if not path.is_file():
+        raise FileNotFoundError(f"找不到 Azure Price Sheet：{path}")
+    return parse_price_sheet(path.read_bytes(), str(path)), str(path)
 
 
 def is_ri_usage(row: dict[str, str], reservation_ids: set[str]) -> bool:
@@ -1159,14 +852,7 @@ def main() -> None:
                 row["_source_row_number"] = str(source_row_number)
                 rows.append(row)
 
-    price_rates, price_sheet_source = load_price_sheet(
-        rows,
-        args.price_sheet_file,
-        invoice_id=args.invoice_id,
-        billing_account_name=args.billing_account_name,
-        timeout=args.price_sheet_timeout,
-        save_price_sheet_file=args.save_price_sheet_file,
-    )
+    price_rates, price_sheet_source = load_price_sheet(args.price_sheet_file)
     gross_by_index: dict[int, Decimal] = {}
     payg_by_index: dict[int, Decimal] = {}
     gross_by_reservation: defaultdict[str, Decimal] = defaultdict(Decimal)
