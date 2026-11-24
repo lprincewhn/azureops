@@ -37,6 +37,91 @@ class VmResourceIdTests(unittest.TestCase):
 
 
 class MultiServiceReconciliationTests(unittest.TestCase):
+    def test_refund_and_unused_reservation_reconcile_without_usage(self):
+        order = "order-a"
+        actual = [{"path": Path("actual.csv"), "rows": [
+            {"meterCategory": "Azure Database for MySQL", "pricingModel": "Reservation",
+             "chargeType": charge, "reservationId": order,
+             "costInBillingCurrency": amount}
+            for charge, amount in (("Purchase", "493.3"), ("Refund", "-312.4"))
+        ]}]
+        amortized_rows = [
+            {"meterCategory": "Azure Database for MySQL", "pricingModel": "Reservation",
+             "chargeType": "UnusedReservation", "benefitId": f"/reservationOrders/{order}/reservations/ri",
+             "costInBillingCurrency": amount, "quantity": "1"}
+            for amount in ("100", "81.777671232876725")
+        ]
+        amortized = [{"path": Path("amortized.csv"), "fieldnames": list(amortized_rows[0]),
+                      "rows": amortized_rows}]
+        actual_costs, _ = MODULE.collect_actual_costs(actual, "costInBillingCurrency")
+        costs, eligible, unused, _ = MODULE.collect_amortized_data(
+            amortized, "costInBillingCurrency"
+        )
+        self.assertEqual(actual_costs[("mysql", order)], Decimal("180.9"))
+        self.assertEqual(costs[("mysql", order)], Decimal("181.777671232876725"))
+        self.assertEqual(eligible, {})
+        allocations, summary = MODULE.allocate_differences(
+            amortized, actual_costs, costs, eligible, "costInBillingCurrency", unused
+        )
+        self.assertEqual(summary[0][4], Decimal("-0.877671232876725"))
+        self.assertEqual(sum(allocations.values()), summary[0][4])
+        with tempfile.TemporaryDirectory() as root:
+            output = Path(root)
+            MODULE.write_outputs(amortized, output, allocations, "costInBillingCurrency")
+            MODULE.write_changed_rows(output, amortized, allocations, "costInBillingCurrency")
+            with (output / "amortized.csv").open(newline="", encoding="utf-8-sig") as stream:
+                records = list(csv.DictReader(stream))
+            self.assertEqual(
+                sum(Decimal(row["costInBillingCurrencyAfterActualReconciliation"])
+                    for row in records), Decimal("180.9")
+            )
+            self.assertEqual(
+                [row["riActualAmortizedAdjustmentType"] for row in records],
+                ["UnusedReservation", "UnusedReservation"]
+            )
+            with (output / "changed-amortized-ri-rows.csv").open(newline="", encoding="utf-8-sig") as stream:
+                self.assertEqual(
+                    [row["riActualAmortizedAdjustmentType"] for row in csv.DictReader(stream)],
+                    ["UnusedReservation", "UnusedReservation"]
+                )
+
+    def test_usage_precedes_unused_reservation_and_zero_difference_changes_nothing(self):
+        order = "order-b"
+        rows = [
+            {"meterCategory": "Virtual Machines", "pricingModel": "Reservation",
+             "chargeType": charge, "benefitId": f"/reservationOrders/{order}/reservations/ri",
+             "ResourceId": resource, "costInBillingCurrency": "5", "quantity": "1"}
+            for charge, resource in (
+                ("Usage", "/providers/Microsoft.Compute/virtualMachines/vm"),
+                ("UnusedReservation", ""),
+            )
+        ]
+        files = [{"path": Path("bill.csv"), "rows": rows}]
+        costs, eligible, unused, _ = MODULE.collect_amortized_data(files, "costInBillingCurrency")
+        allocations, _ = MODULE.allocate_differences(
+            files, {("vm", order): Decimal("12")}, costs, eligible,
+            "costInBillingCurrency", unused
+        )
+        self.assertEqual(allocations, {(0, 0): Decimal("2")})
+        allocations, _ = MODULE.allocate_differences(
+            files, {("vm", order): Decimal("10")}, costs, eligible,
+            "costInBillingCurrency", unused
+        )
+        self.assertEqual(allocations, {})
+
+    def test_unused_reservation_cannot_become_negative(self):
+        order = "order-c"
+        row = {"meterCategory": "Redis Cache", "pricingModel": "Reservation",
+               "chargeType": "UnusedReservation", "benefitId": f"/reservationOrders/{order}/reservations/ri",
+               "costInBillingCurrency": "5", "quantity": "1"}
+        files = [{"path": Path("bill.csv"), "rows": [row]}]
+        costs, eligible, unused, _ = MODULE.collect_amortized_data(files, "costInBillingCurrency")
+        with self.assertRaisesRegex(ValueError, "negative cost"):
+            MODULE.allocate_differences(
+                files, {("amr", order): Decimal("-1")}, costs, eligible,
+                "costInBillingCurrency", unused
+            )
+
     def test_usage_selection_does_not_depend_on_meter_subcategory(self):
         for category, service, resource in (
             ("Azure Database for MySQL", "mysql",

@@ -13,6 +13,7 @@ from pathlib import Path
 getcontext().prec = 40
 
 ALLOCATION_COLUMN = "riActualAmortizedAdjustment"
+ALLOCATION_TYPE_COLUMN = "riActualAmortizedAdjustmentType"
 ORDER_ID_PATTERN = re.compile(r"/reservationOrders/([^/]+)", re.IGNORECASE)
 ALLOCATION_QUANTUM = Decimal("0.000000000000001")
 
@@ -184,7 +185,7 @@ def collect_actual_costs(files, amount_field):
             service = reservation_service(row)
             if not service:
                 continue
-            if row.get("chargeType", "").casefold() != "purchase":
+            if row.get("chargeType", "").casefold() not in ("purchase", "refund"):
                 continue
 
             order_id = reservation_order_id(row, actual=True)
@@ -210,6 +211,7 @@ def collect_amortized_data(files, amount_field):
             "dates": set(),
             "quantity": Decimal(0),
             "cost": Decimal(0),
+            "rows": [],
         }
     )
 
@@ -234,6 +236,7 @@ def collect_amortized_data(files, amount_field):
 
             if row.get("chargeType", "").casefold() == "unusedreservation":
                 unused = unused_reservations[key]
+                unused["rows"].append((file_index, row_index))
                 unused["name"] = row.get("reservationName", "")
                 unused["row_count"] += 1
                 if row.get("date"):
@@ -258,9 +261,11 @@ def allocate_differences(
     amortized_costs,
     eligible_rows,
     amount_field,
+    unused_reservations=None,
 ):
     allocations = {}
     summary = []
+    unused_reservations = unused_reservations or {}
 
     order_ids = sorted(set(actual_costs) | set(amortized_costs))
     for service, order_id in order_ids:
@@ -269,16 +274,20 @@ def allocate_differences(
         amortized_cost = amortized_costs.get(key, Decimal(0))
         difference = actual_cost - amortized_cost
         targets = eligible_rows.get(key, [])
+        target_type = "Usage"
 
         if difference == 0:
             summary.append((service, order_id, actual_cost, amortized_cost, difference))
             continue
 
         if not targets:
-            raise ValueError(
-                f"{service} RI order {order_id} has a difference of {difference}, "
-                "but no corresponding eligible Usage rows were found"
-            )
+            targets = unused_reservations.get(key, {}).get("rows", [])
+            target_type = "UnusedReservation"
+            if not targets:
+                raise ValueError(
+                    f"{service} RI order {order_id} has a difference of {difference}, "
+                    "but no corresponding eligible Usage or UnusedReservation rows were found"
+                )
 
         weights = []
         for file_index, row_index in targets:
@@ -296,7 +305,7 @@ def allocate_differences(
             total_weight = sum(weights, Decimal(0))
             print(
                 "WARNING: RI order "
-                f"{service} {order_id} has Usage rows but their {amount_field} "
+                f"{service} {order_id} has {target_type} rows but their {amount_field} "
                 "total is zero; falling back to quantity-based allocation "
                 f"(rows={len(targets)}, quantityTotal={decimal_text(total_weight)})",
                 file=sys.stderr,
@@ -319,6 +328,11 @@ def allocate_differences(
                     ALLOCATION_QUANTUM, rounding=ROUND_HALF_UP
                 )
                 allocated += amount
+            row = amortized_files[file_index]["rows"][row_index]
+            if target_type == "UnusedReservation" and decimal_value(row, amount_field) + amount < 0:
+                raise ValueError(
+                    f"RI order {order_id} would give an UnusedReservation row negative cost"
+                )
             allocations[(file_index, row_index)] = amount
 
         summary.append((service, order_id, actual_cost, amortized_cost, difference))
@@ -337,7 +351,7 @@ def write_outputs(files, output_dir, allocations, amount_field):
 
         fieldnames = list(file_data["fieldnames"])
         reallocated_cost_column = reconciled_cost_column(amount_field)
-        for column in (ALLOCATION_COLUMN, reallocated_cost_column):
+        for column in (ALLOCATION_COLUMN, ALLOCATION_TYPE_COLUMN, reallocated_cost_column):
             if column not in fieldnames:
                 fieldnames.append(column)
 
@@ -351,6 +365,7 @@ def write_outputs(files, output_dir, allocations, amount_field):
                 )
                 original_cost = decimal_value(row, amount_field)
                 row[ALLOCATION_COLUMN] = decimal_text(allocation)
+                row[ALLOCATION_TYPE_COLUMN] = row.get("chargeType", "") if allocation else ""
                 row[reallocated_cost_column] = decimal_text(
                     original_cost + allocation
                 )
@@ -372,6 +387,7 @@ def write_changed_rows(output_dir, files, allocations, amount_field):
             "reservationOrderId", "date", "subscriptionName",
             "resourceGroupName", "ResourceId", "originalCost",
             ALLOCATION_COLUMN, reconciled_cost_column(amount_field),
+            ALLOCATION_TYPE_COLUMN,
         ]
         writer.writerow(["resourceType", *header])
         vm_writer.writerow(header)
@@ -385,6 +401,7 @@ def write_changed_rows(output_dir, files, allocations, amount_field):
                 row.get("subscriptionName", ""), row.get("resourceGroupName", ""),
                 row.get("ResourceId", ""), decimal_text(original_cost),
                 decimal_text(allocation), decimal_text(original_cost + allocation),
+                row.get("chargeType", ""),
             ]
             writer.writerow([reservation_service(row), *values])
             if reservation_service(row) == "vm":
@@ -509,6 +526,7 @@ def main():
         amortized_costs,
         eligible_rows,
         args.amortized_amount_field,
+        unused_reservations,
     )
     written_paths = write_outputs(
         amortized_files,
