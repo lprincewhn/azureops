@@ -10,6 +10,35 @@
 
 每个聚合映射为 `azure_platform_metric` **Gauge**，标签为 `resource_id`、`metric_name`、`aggregation`、`unit`、`time_grain` 和所有 `dimension_<规范化原名>`。`Total` 是该时间区间的值，**不是**累计 Counter，不能直接使用 `rate()`；`Count` 也按区间 Gauge 处理。标签名规范化碰撞、非法数值、缺字段会使事件失败且不会提交消费位点。按原始采样时间保留最新序列；同一序列的旧样本/重放不会覆盖新样本。过期序列自动删除，旧到达样本不会复活。`/metrics` 是最新值快照，**不保留补录的历史时间戳**；需要逐分钟历史和乱序回补时须另建 Remote Write 链路。
 
+### 输入与输出样例
+
+以下是**脱敏的示意数据，并非从现场消息直接复制**：字段结构、DCR 多行 JSON 的消息体形式和 `Transactions` 中展示的维度参考单账户试点；资源 ID、时间和数值为示例。Exporter 从 Event Hubs 读取一个消息的 body；此例的同一个 body 含两行独立 JSON 记录（不是包在数组内），每行对应一个指标及其采样时间、聚合值和原始维度。Batch 写入的同格式记录也走相同解析和映射路径。
+
+```jsonl
+{"resourceId":"/subscriptions/<subscription-id>/resourceGroups/<resource-group>/providers/Microsoft.Storage/storageAccounts/<storage-account>","time":"2026-11-25T08:05:00Z","metricName":"Transactions","unit":"Count","timeGrain":"PT1M","dimension":{"ApiName":"GetBlobServiceProperties","Authentication":"OAuth","GeoType":"Primary","ResponseType":"Success","TransactionType":"user"},"Total":"1"}
+{"resourceId":"/subscriptions/<subscription-id>/resourceGroups/<resource-group>/providers/Microsoft.Storage/storageAccounts/<storage-account>","time":"2026-11-25T08:05:00Z","metricName":"Availability","unit":"Percent","timeGrain":"PT1M","dimension":{"ApiName":"GetBlobServiceProperties","Authentication":"OAuth","GeoType":"Primary"},"Average":"100"}
+```
+
+假设上述消息在 `08:06:00Z` 处理、此时请求 `/metrics`，当前 exporter 的 Prometheus text exposition 输出为（仅展示此消息产生的序列及 exporter 自身指标）：
+
+```text
+# HELP azure_platform_metric Latest Azure platform metric interval value.
+# TYPE azure_platform_metric gauge
+azure_platform_metric{aggregation="average",dimension_apiname="GetBlobServiceProperties",dimension_authentication="OAuth",dimension_geotype="Primary",metric_name="Availability",resource_id="/subscriptions/<subscription-id>/resourceGroups/<resource-group>/providers/Microsoft.Storage/storageAccounts/<storage-account>",time_grain="PT1M",unit="Percent"} 100
+azure_platform_metric{aggregation="total",dimension_apiname="GetBlobServiceProperties",dimension_authentication="OAuth",dimension_geotype="Primary",dimension_responsetype="Success",dimension_transactiontype="user",metric_name="Transactions",resource_id="/subscriptions/<subscription-id>/resourceGroups/<resource-group>/providers/Microsoft.Storage/storageAccounts/<storage-account>",time_grain="PT1M",unit="Count"} 1
+# HELP azure_metric_stream_series Current active metric series.
+# TYPE azure_metric_stream_series gauge
+azure_metric_stream_series 2
+# HELP azure_metric_stream_last_event_timestamp_seconds Last accepted Event Hubs event.
+# TYPE azure_metric_stream_last_event_timestamp_seconds gauge
+azure_metric_stream_last_event_timestamp_seconds 1795593960.000
+# HELP azure_metric_stream_healthy Consumer processing health.
+# TYPE azure_metric_stream_healthy gauge
+azure_metric_stream_healthy 1
+```
+
+`dimension` 的原始键名会转换为小写 `dimension_*` 标签；不同指标可有不同维度，一个输入记录中每个非空的聚合值各输出一条序列。Prometheus 样本**不附带原始 `time` 作为时间戳**，抓取时刻才是存储样本的时间；原始 `time` 用来选择每条序列的最新值，并在默认 900 秒无新原始样本后清理。`azure_metric_stream_last_event_timestamp_seconds` 则是消息的处理时间，不是业务指标采样时间。要查交易指标，用 `azure_platform_metric{metric_name="Transactions"}`；源无近期交易时 `/metrics` 不会保留已过期的交易序列，Prometheus 的历史数据仍可按时间范围查询。
+
 ## 构建和本地验证
 
 ```bash
