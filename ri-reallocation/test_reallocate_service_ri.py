@@ -9,7 +9,7 @@ from decimal import Decimal
 from pathlib import Path
 from unittest import mock
 
-import reallocate_vm_ri as allocation
+import ri_reallocation_core as allocation
 
 
 class ServiceAllocationTests(unittest.TestCase):

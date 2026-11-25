@@ -9,8 +9,8 @@ from pathlib import Path
 from unittest import mock
 
 
-MODULE_PATH = Path(__file__).with_name("reallocate_vm_ri.py")
-SPEC = importlib.util.spec_from_file_location("reallocate_vm_ri", MODULE_PATH)
+MODULE_PATH = Path(__file__).with_name("ri_reallocation_core.py")
+SPEC = importlib.util.spec_from_file_location("ri_reallocation_core", MODULE_PATH)
 MODULE = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
 SPEC.loader.exec_module(MODULE)

@@ -10,7 +10,7 @@ import tempfile
 from decimal import Decimal
 from pathlib import Path
 
-from reallocate_vm_ri import parse_tags
+from ri_reallocation_core import parse_tags
 
 
 AMOUNT = "costInBillingCurrencyAfterActualReconciliation"

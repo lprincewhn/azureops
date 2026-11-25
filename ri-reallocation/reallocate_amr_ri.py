@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Reallocate Azure Managed Redis RI benefit to bound projects."""
 
-from reallocate_vm_ri import AMR, main
+from ri_reallocation_core import AMR, main
 
 
 if __name__ == "__main__":

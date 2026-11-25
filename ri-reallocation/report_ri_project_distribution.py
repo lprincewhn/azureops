@@ -335,14 +335,14 @@ def build_distribution(
                     )
                 else:
                     if price_rates is None:
-                        import reallocate_vm_ri
+                        import ri_reallocation_core
 
                         price_path = resolve_price_sheet_path(
                             input_dir,
                             price_sheet_file,
                             summary_price_sheet_source,
                         )
-                        price_rates = reallocate_vm_ri.parse_price_sheet(
+                        price_rates = ri_reallocation_core.parse_price_sheet(
                             price_path.read_bytes(), str(price_path)
                         )
                     quantity = decimal_value(row.get("quantity"), "quantity")
@@ -358,7 +358,7 @@ def build_distribution(
                         "costInBillingCurrencyAfterActualReconciliation",
                     )
                     payg_equivalent = (
-                        reallocate_vm_ri.price_for_row(row, price_rates) * quantity
+                        ri_reallocation_core.price_for_row(row, price_rates) * quantity
                     )
                     gross_savings = payg_equivalent - amortized_cost
                 before[(reservation_id, project)] += gross_savings
