@@ -493,6 +493,80 @@ class ReservationsFileTests(unittest.TestCase):
         self.assertEqual(FakeClient.management_groups.group_name, "ffalcon-us")
         self.assertEqual(resolved[scope], frozenset({"sub-a"}))
 
+    def test_selects_reservation_tenant_without_switching_cli_default(self):
+        path = self._write([{
+            "productType": "vm",
+            "cloudAccountExternalId": "billing-tenant",
+            "appliedScopeType": "ManagementGroup",
+            "bindings": [{"project": "team", "boundQuantity": 1}],
+        }])
+        self.assertEqual(MODULE.billing_tenant_id(path, MODULE.VM, None), "billing-tenant")
+        self.assertEqual(MODULE.billing_tenant_id(path, MODULE.VM, "override"), "override")
+        accounts = [
+            {"id": "sub-default", "tenantId": "other-tenant"},
+            {"id": "sub-billing", "tenantId": "billing-tenant"},
+        ]
+        with mock.patch.object(
+            MODULE.subprocess, "check_output", return_value=json.dumps(accounts).encode()
+        ) as command:
+            self.assertEqual(MODULE.billing_subscription("billing-tenant"), "sub-billing")
+        self.assertEqual(command.call_args.args[0][:3], ["az", "account", "list"])
+        with mock.patch.object(
+            MODULE.subprocess, "check_output", return_value=json.dumps(accounts).encode()
+        ):
+            with self.assertRaisesRegex(RuntimeError, "没有租户"):
+                MODULE.billing_subscription("unknown-tenant")
+
+    def test_does_not_guess_between_multiple_billing_tenants(self):
+        path = self._write([
+            {"productType": "vm", "cloudAccountExternalId": tenant,
+             "appliedScopeType": "ManagementGroup",
+             "bindings": [{"project": "team", "boundQuantity": 1}]}
+            for tenant in ("tenant-a", "tenant-b")
+        ])
+        with self.assertRaisesRegex(ValueError, "多个租户"):
+            MODULE.billing_tenant_id(path, MODULE.VM, None)
+
+    def test_management_group_empty_descendants_is_not_missing_receiver(self):
+        class FakeClient:
+            management_groups = mock.MagicMock()
+            management_groups.get_descendants.return_value = []
+
+        scope = ("managementgroup", "/providers/microsoft.management/managementgroups/example")
+        with self.assertRaisesRegex(RuntimeError, "查询结果没有下属订阅"):
+            MODULE.resolve_management_group_scopes({"ri-a": scope}, client=FakeClient())
+
+    def test_management_group_empty_fallback_reports_original_permission_failure(self):
+        class Credential:
+            def get_token(self, _scope):
+                return argparse.Namespace(token="token")
+
+        scope = ("managementgroup", "/providers/microsoft.management/managementgroups/example")
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = b'{"value":[]}'
+        with mock.patch.object(MODULE.urllib.request, "urlopen", return_value=response):
+            with self.assertRaisesRegex(
+                RuntimeError, "descendants 查询无权限，备用层级查询也未找到任何下属订阅"
+            ):
+                MODULE.resolve_management_group_scopes_from_entities(
+                    {"ri-a": scope}, Credential(), after_permission_denied=True
+                )
+
+    def test_management_group_fallback_permission_denied_is_explicit(self):
+        class Credential:
+            def get_token(self, _scope):
+                return argparse.Namespace(token="token")
+
+        scope = ("managementgroup", "/providers/microsoft.management/managementgroups/example")
+        error = MODULE.urllib.error.HTTPError(
+            "https://management.azure.com/", 403, "Forbidden", {}, None
+        )
+        with mock.patch.object(MODULE.urllib.request, "urlopen", side_effect=error):
+            with self.assertRaisesRegex(RuntimeError, "备用层级查询无权限.*HTTP 403"):
+                MODULE.resolve_management_group_scopes_from_entities(
+                    {"ri-a": scope}, Credential()
+                )
+
     def test_management_group_entities_resolve_parent_chain(self):
         class Credential:
             def get_token(self, _scope):
@@ -581,6 +655,7 @@ class ReservationsReallocationTests(unittest.TestCase):
         reservations,
         amount_field="costInBillingCurrency",
         unit_prices=None,
+        skip_unallocatable=False,
     ):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
@@ -643,6 +718,8 @@ class ReservationsReallocationTests(unittest.TestCase):
             "--amount-field",
             amount_field,
         ]
+        if skip_unallocatable:
+            argv.append("--skip-unallocatable")
         old_argv = sys.argv
         sys.argv = argv
         try:
@@ -657,6 +734,60 @@ class ReservationsReallocationTests(unittest.TestCase):
         ) as f:
             summary["_testAllocationDetails"] = list(csv.DictReader(f))
         return result_rows, summary
+
+    def test_skip_missing_receiver_preserves_unassigned_benefit(self):
+        rows = [
+            self._row(
+                ResourceId="/vm/ri-usage", pricingModel="Reservation",
+                chargeType="Usage", reservationId="ri-a",
+                meterRegion="US West 3",
+                additionalInfo='{"ServiceType":"Standard_D2s_v5"}',
+                tags='{"projname":"source"}', costInBillingCurrency="10",
+            ),
+            self._row(
+                ResourceId="/vm/receiver", pricingModel="OnDemand",
+                chargeType="Usage", reservationId="",
+                meterRegion="US West 3",
+                additionalInfo='{"ServiceType":"Standard_D2s_v5"}',
+                tags='{"projname":"valid"}', costInBillingCurrency="100",
+            ),
+        ]
+        config = [{"externalReservationId": "/reservations/ri-a",
+                   "bindings": [{"project": "valid", "boundQuantity": 1},
+                                {"project": "missing", "boundQuantity": 1}]}]
+        with self.assertRaisesRegex(ValueError, "找不到分摊目标"):
+            self._run(rows, config)
+        result, summary = self._run(rows, config, skip_unallocatable=True)
+        self.assertEqual(MODULE.Decimal(result[0]["riAllocationAmount"]), MODULE.Decimal("5"))
+        self.assertEqual(MODULE.Decimal(result[1]["riAllocationAmount"]), MODULE.Decimal("-5"))
+        self.assertEqual(summary["skippedAllocationAmount"], "5")
+        self.assertEqual(summary["skippedAllocations"][0]["reservationId"], "ri-a")
+        self.assertEqual(summary["skippedAllocations"][0]["target"], "projname=missing")
+        self.assertEqual(sum(MODULE.Decimal(r["riAllocationAmount"]) for r in result), MODULE.Decimal(0))
+        self.assertEqual(len(summary["_testAllocationDetails"]), 2)
+
+    def test_skip_insufficient_receiver_does_not_make_cost_negative(self):
+        rows = [
+            self._row(
+                ResourceId="/vm/ri-usage", pricingModel="Reservation",
+                chargeType="Usage", reservationId="ri-a",
+                additionalInfo='{"ServiceType":"Standard_D2s_v5"}',
+                tags='{"projname":"source"}', costInBillingCurrency="10",
+            ),
+            self._row(
+                ResourceId="/vm/receiver", pricingModel="OnDemand",
+                chargeType="Usage", reservationId="",
+                additionalInfo='{"ServiceType":"Standard_D2s_v5"}',
+                tags='{"projname":"target"}', costInBillingCurrency="2",
+            ),
+        ]
+        config = [{"externalReservationId": "/reservations/ri-a",
+                   "bindings": [{"project": "target", "boundQuantity": 1}]}]
+        result, summary = self._run(rows, config, skip_unallocatable=True)
+        self.assertEqual([MODULE.Decimal(r["riAllocationAmount"]) for r in result],
+                         [MODULE.Decimal(0), MODULE.Decimal(0)])
+        self.assertEqual(summary["skippedAllocationAmount"], "10")
+        self.assertIn("小于待分摊", summary["skippedAllocations"][0]["reason"])
 
     def test_single_ri_split_to_two_projects_by_weight(self):
         rows = [
@@ -1072,7 +1203,7 @@ class ReservationsReallocationTests(unittest.TestCase):
 
     def test_management_group_scope_only_allocates_to_descendant_subscription(self):
         original_resolver = MODULE.resolve_management_group_scopes
-        MODULE.resolve_management_group_scopes = lambda scopes: {
+        MODULE.resolve_management_group_scopes = lambda scopes, **_kwargs: {
             next(iter(scopes.values())): frozenset({"sub-a"})
         }
         self.addCleanup(

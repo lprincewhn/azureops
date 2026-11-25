@@ -258,6 +258,18 @@ def build_distribution(
         summary_gross_by_reservation,
         summary_price_sheet_source,
     ) = load_summary(input_dir)
+    summary_payload = json.loads(
+        (input_dir / "ri-summary.json").read_text(encoding="utf-8")
+    )
+    skipped_entries = summary_payload.get("skippedAllocations", [])
+    if not isinstance(skipped_entries, list):
+        raise ValueError("ri-summary.json 的 skippedAllocations 不是数组")
+    skipped_by_reservation: defaultdict[str, list[dict[str, str]]] = defaultdict(list)
+    for entry in skipped_entries:
+        if not isinstance(entry, dict) or not entry.get("reservationId"):
+            raise ValueError("ri-summary.json 的 skippedAllocations 条目缺少 RI ID")
+        decimal_value(entry.get("riAmount"), "skippedAllocations.riAmount")
+        skipped_by_reservation[entry["reservationId"]].append(entry)
     allocated_paths = discover_allocated_csvs(input_dir)
     all_reservation_ids, valid_binding_ids = load_reservations_config(
         input_dir, reservations_file, reservation_orders_from_bills(allocated_paths)
@@ -418,14 +430,15 @@ def build_distribution(
 
     usage_reservation_ids = set(gross_by_reservation)
     unknown_usage_ids = usage_reservation_ids - all_reservation_ids
-    if unknown_usage_ids:
+    if unknown_usage_ids and not summary_payload.get("skipUnallocatable"):
         raise ValueError(
             "账单存在 reservations.json 未定义的 RI："
             + ", ".join(sorted(unknown_usage_ids))
         )
     classification_counts = {
         "valid_with_usage": len(valid_binding_ids & usage_reservation_ids),
-        "invalid_with_usage": len(usage_reservation_ids - valid_binding_ids),
+        "invalid_with_usage": len((usage_reservation_ids - valid_binding_ids) - unknown_usage_ids),
+        "unknown_with_usage": len(unknown_usage_ids),
         "valid_without_usage": len(valid_binding_ids - usage_reservation_ids),
         "invalid_without_usage": len(
             all_reservation_ids - valid_binding_ids - usage_reservation_ids
@@ -482,13 +495,22 @@ def build_distribution(
         )
         if not projects:
             projects = [""]
+        has_assigned = any(
+            current_id == reservation_id and amount != ZERO
+            for (current_id, _project), amount in assigned_to_target.items()
+        )
         allocation_status = (
-            "ALLOCATED"
-            if any(
-                current_id == reservation_id and amount != ZERO
-                for (current_id, _project), amount in assigned_to_target.items()
-            )
-            else "NOT_ALLOCATED"
+            "PARTIALLY_ALLOCATED" if has_assigned else "SKIPPED"
+        ) if skipped_by_reservation[reservation_id] else (
+            "ALLOCATED" if has_assigned else "NOT_ALLOCATED"
+        )
+        skipped_amount = sum(
+            (decimal_value(entry["riAmount"], "skippedAllocations.riAmount")
+             for entry in skipped_by_reservation[reservation_id]), ZERO
+        )
+        skipped_reason = "；".join(
+            f"{entry['target']} ({entry['matchKey']}, {entry['region']}): {entry['reason']}"
+            for entry in skipped_by_reservation[reservation_id]
         )
         for project in projects:
             before_amount = before.get((reservation_id, project), ZERO)
@@ -500,10 +522,14 @@ def build_distribution(
                     "resourceType": reservation_types.get(reservation_id, ""),
                     "classification": (
                         "VALID_BINDING_WITH_USAGE"
-                        if reservation_id in valid_binding_ids
-                        else "NO_VALID_BINDING_WITH_USAGE"
+                        if reservation_id in valid_binding_ids else (
+                            "UNDEFINED_RI_WITH_USAGE" if reservation_id in unknown_usage_ids
+                            else "NO_VALID_BINDING_WITH_USAGE"
+                        )
                     ),
                     "allocationStatus": allocation_status,
+                    "skippedAllocationAmount": str(skipped_amount),
+                    "skippedAllocationReason": skipped_reason,
                     "project": project,
                     "paygEquivalentCost": str(payg_by_reservation[reservation_id]),
                     "riAmortizedCostBeforeActualReconciliation": str(
@@ -528,6 +554,8 @@ def build_distribution(
         "resourceType",
         "classification",
         "allocationStatus",
+        "skippedAllocationAmount",
+        "skippedAllocationReason",
         "project",
         "paygEquivalentCost",
         "riAmortizedCostBeforeActualReconciliation",
@@ -601,7 +629,13 @@ def write_html_report(
         amortized_cost_after = Decimal(
             ri_rows[0]["riAmortizedCostAfterActualReconciliation"]
         )
-        allocated = ri_rows[0]["allocationStatus"] == "ALLOCATED"
+        allocation_status = ri_rows[0]["allocationStatus"]
+        status_label = {
+            "ALLOCATED": "已分摊",
+            "PARTIALLY_ALLOCATED": "部分分摊",
+            "SKIPPED": "未承接（已跳过）",
+            "NOT_ALLOCATED": "未分摊",
+        }[allocation_status]
         title = html.escape(reservation_id)
         if name:
             title += f" · {html.escape(name)}"
@@ -637,8 +671,14 @@ def write_html_report(
             f"<span>差额调整前 RI 摊销成本<strong>{amortized_cost_before:,.4f}</strong></span>"
             f"<span>差额调整后 RI 摊销成本<strong>{amortized_cost_after:,.4f}</strong></span>"
             f"<span>RI 净收益/损失<strong>{total:,.4f}</strong></span>"
-            f"<span>状态<strong>{'已分摊' if allocated else '未分摊'}</strong></span>"
+            f"<span>状态<strong>{status_label}</strong></span>"
             "</div>"
+            + (
+                "<p class=\"empty\">未分摊金额 "
+                f"{html.escape(ri_rows[0]['skippedAllocationAmount'])}；"
+                f"{html.escape(ri_rows[0]['skippedAllocationReason'])}</p>"
+                if allocation_status in ("SKIPPED", "PARTIALLY_ALLOCATED") else ""
+            )
             + (
                 "<p class=\"empty\">该 RI 没有发生项目收益分摊。</p>"
                 if not distribution_rows
@@ -678,6 +718,7 @@ th{background:#f0f3f8}.number{text-align:right;font-variant-numeric:tabular-nums
 <tbody>
 <tr><td>有有效 binding 且有实际 Usage</td><td>""" + str(classification_counts["valid_with_usage"]) + """</td><td>展示</td></tr>
 <tr><td>无有效 binding 但有实际 Usage</td><td>""" + str(classification_counts["invalid_with_usage"]) + """</td><td>展示，分摊前后不变</td></tr>
+<tr><td>配置未定义但账单有 Usage</td><td>""" + str(classification_counts["unknown_with_usage"]) + """</td><td>展示，分摊前后不变；需补充配置</td></tr>
 <tr><td>有有效 binding 但本账期无 Usage</td><td>""" + str(classification_counts["valid_without_usage"]) + """</td><td>不展示</td></tr>
 <tr><td>无有效 binding 且本账期无 Usage</td><td>""" + str(classification_counts["invalid_without_usage"]) + """</td><td>不展示</td></tr>
 </tbody></table>

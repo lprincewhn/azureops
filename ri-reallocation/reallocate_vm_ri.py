@@ -24,6 +24,9 @@ import glob
 import io
 import json
 import re
+import subprocess
+import sys
+import urllib.error
 import urllib.request
 import zipfile
 from collections import defaultdict
@@ -104,6 +107,15 @@ def parse_args(profile: ResourceProfile = VM) -> argparse.Namespace:
         "--summary-only",
         action="store_true",
         help="只生成汇总文件，不生成明细副本",
+    )
+    parser.add_argument(
+        "--skip-unallocatable",
+        action="store_true",
+        help="跳过没有接收行或接收费用不足的分摊池，并在汇总与报告中标记",
+    )
+    parser.add_argument(
+        "--tenant-id",
+        help="ManagementGroup 查询所属的 Azure 租户；默认读取预留定义的 cloudAccountExternalId",
     )
     return parser.parse_args()
 
@@ -212,8 +224,70 @@ def _management_group_name(scope_id: str) -> str:
     return normalized
 
 
+def billing_tenant_id(path: Path, profile: ResourceProfile, configured: str | None) -> str | None:
+    if configured is not None:
+        tenant_id = configured.strip()
+        if not tenant_id:
+            raise ValueError("--tenant-id 不能为空")
+        return tenant_id
+    data = json.loads(path.read_text(encoding="utf-8-sig"))
+    items = data.get("reservations", [data]) if isinstance(data, dict) else data
+    tenant_ids = {
+        str(item.get("cloudAccountExternalId") or "").strip().lower()
+        for item in items
+        if isinstance(item, dict)
+        and (profile == VM and item.get("productType") in (None, "vm")
+             or profile != VM and item.get("productType") == profile.product_type)
+        and str(item.get("appliedScopeType") or "").lower() == "managementgroup"
+        and item.get("bindings")
+        and item.get("cloudAccountExternalId")
+    }
+    if len(tenant_ids) > 1:
+        raise ValueError("ManagementGroup 预留属于多个租户；请按租户分别运行")
+    return next(iter(tenant_ids), None)
+
+
+def billing_subscription(tenant_id: str) -> str:
+    try:
+        accounts = json.loads(subprocess.check_output(
+            ["az", "account", "list", "--all", "--output", "json"]
+        ))
+    except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+        raise RuntimeError("无法读取 Azure CLI 账户列表以选择 ManagementGroup 查询租户") from exc
+    subscriptions = sorted(
+        str(account["id"]) for account in accounts
+        if isinstance(account, dict)
+        and str(account.get("tenantId") or "").lower() == tenant_id.lower()
+        and account.get("id")
+    )
+    if not subscriptions:
+        raise RuntimeError(
+            f"Azure CLI 中没有租户 {tenant_id!r} 的可用订阅；"
+            "请登录该租户或通过 --tenant-id 指定正确的租户"
+        )
+    return subscriptions[0]
+
+
+def _require_scope_subscriptions(
+    scope: tuple[str, str], subscription_ids: set[str] | frozenset[str],
+    *, after_permission_denied: bool = False,
+) -> frozenset[str]:
+    if not subscription_ids:
+        detail = (
+            "descendants 查询无权限，备用层级查询也未找到任何下属订阅；"
+            "无法确认管理组成员关系"
+            if after_permission_denied else
+            "查询结果没有下属订阅；请核实管理组、租户和查询权限"
+        )
+        raise RuntimeError(
+            f"ManagementGroup scope {scope[1]!r} {detail}，停止分摊；"
+            "不能按无接收行跳过。"
+        )
+    return frozenset(subscription_ids)
+
+
 def resolve_management_group_scopes_from_entities(
-    scopes: RiScopes, credential: Any
+    scopes: RiScopes, credential: Any, *, after_permission_denied: bool = False
 ) -> dict[tuple[str, str], frozenset[str]]:
     """Resolve management-group membership through the tenant entity hierarchy."""
     token = credential.get_token("https://management.azure.com/.default").token
@@ -227,8 +301,16 @@ def resolve_management_group_scopes_from_entities(
         },
         method="POST",
     )
-    with urllib.request.urlopen(request, timeout=120) as response:
-        payload = json.load(response)
+    try:
+        with urllib.request.urlopen(request, timeout=120) as response:
+            payload = json.load(response)
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403):
+            raise RuntimeError(
+                "ManagementGroup scope 备用层级查询无权限"
+                f"（HTTP {exc.code}）；无法确认管理组成员关系，停止分摊。"
+            ) from exc
+        raise
     subscriptions: list[tuple[str, set[str]]] = []
     for entity in payload.get("value", []):
         if not isinstance(entity, dict):
@@ -247,18 +329,20 @@ def resolve_management_group_scopes_from_entities(
     result: dict[tuple[str, str], frozenset[str]] = {}
     for scope in {item for item in scopes.values() if item[0] == "managementgroup"}:
         group_name = _management_group_name(scope[1]).lower()
-        result[scope] = frozenset(
+        result[scope] = _require_scope_subscriptions(scope, {
             subscription_id
             for subscription_id, parent_chain in subscriptions
             if group_name in parent_chain
-        )
+        }, after_permission_denied=after_permission_denied)
     return result
 
 
 def resolve_management_group_scopes(
-    scopes: RiScopes, client: Any | None = None
+    scopes: RiScopes, client: Any | None = None, tenant_id: str | None = None
 ) -> dict[tuple[str, str], frozenset[str]]:
     """Resolve ManagementGroup scopes to descendant subscription IDs via Azure SDK."""
+    from azure.core.exceptions import HttpResponseError
+
     management_group_scopes = {
         scope for scope in scopes.values() if scope[0] == "managementgroup"
     }
@@ -270,13 +354,14 @@ def resolve_management_group_scopes(
     if client is None:
         try:
             from azure.identity import AzureCliCredential
-            from azure.core.exceptions import HttpResponseError
             from azure.mgmt.managementgroups import ManagementGroupsMgmtClient
         except ImportError as exc:
             raise RuntimeError(
                 "ManagementGroup scope 需要安装 requirements.txt 中的 Azure SDK"
             ) from exc
-        credential = AzureCliCredential()
+        credential = AzureCliCredential(
+            subscription=billing_subscription(tenant_id)
+        ) if tenant_id else AzureCliCredential()
         client = ManagementGroupsMgmtClient(credential=credential)
 
     result: dict[tuple[str, str], frozenset[str]] = {}
@@ -308,7 +393,7 @@ def resolve_management_group_scopes(
                     ).strip()
                     if name:
                         subscription_ids.add(name.lower())
-                result[scope] = frozenset(subscription_ids)
+                result[scope] = _require_scope_subscriptions(scope, subscription_ids)
         except HttpResponseError as exc:
             if (
                 not owns_client
@@ -317,7 +402,7 @@ def resolve_management_group_scopes(
             ):
                 raise
             result = resolve_management_group_scopes_from_entities(
-                scopes, credential
+                scopes, credential, after_permission_denied=True
             )
     finally:
         if owns_client:
@@ -362,6 +447,7 @@ def load_reservations_config(
     path: Path, project_tag_key: str,
     profile: ResourceProfile = VM,
     order_reservations: dict[str, set[str]] | None = None,
+    allow_empty: bool = False,
 ) -> tuple[RiTargets, RiModes, RiDenominators, RiScopes]:
     """读取 reservations.json，构建 reservationId → [(目标, 权重)] 映射、匹配模式及权重分母。
 
@@ -460,7 +546,7 @@ def load_reservations_config(
             )
             scopes[reservation_id] = _normalize_ri_scope(item)
             denominators[reservation_id] = bound_total
-    if not result:
+    if not result and not allow_empty:
         raise ValueError(
             f"reservations 文件没有可用的 {profile.name} RI 分摊定义"
             "（缺少有效 bindings）"
@@ -870,9 +956,18 @@ def main(profile: ResourceProfile = VM) -> None:
             if order_id:
                 order_reservations[order_id].add(reservation_id)
     ri_targets, ri_modes, ri_denominators, ri_scopes = load_reservations_config(
-        Path(args.reservations_file), args.project_tag_key, profile, order_reservations
+        Path(args.reservations_file), args.project_tag_key, profile, order_reservations,
+        allow_empty=args.skip_unallocatable,
     )
-    management_group_subscriptions = resolve_management_group_scopes(ri_scopes)
+    if not ri_targets:
+        print(f"WARNING: {profile.name} 没有有效项目绑定，保留原始费用且不分摊",
+              file=sys.stderr)
+    tenant_id = billing_tenant_id(
+        Path(args.reservations_file), profile, args.tenant_id
+    ) if any(scope[0] == "managementgroup" for scope in ri_scopes.values()) else None
+    management_group_subscriptions = resolve_management_group_scopes(
+        ri_scopes, tenant_id=tenant_id
+    )
     reservation_ids = set(ri_targets)
     targets = sorted(
         {target for entries in ri_targets.values() for target, _weight in entries}
@@ -916,6 +1011,7 @@ def main(profile: ResourceProfile = VM) -> None:
     ri_amount_by_reservation_key: defaultdict[
         tuple[pool_key_type, str], Decimal
     ] = defaultdict(Decimal)
+    contributions_by_index: dict[int, list[tuple[pool_key_type, Decimal]]] = {}
     ri_service_types: defaultdict[str, set[str]] = defaultdict(set)
     # RI 使用记录加回后的信息：加回金额、目标标签、以及作为接收方时的全价基数。
     ri_usage_indexes: set[int] = set()
@@ -994,13 +1090,16 @@ def main(profile: ResourceProfile = VM) -> None:
             ri_add_back_by_index[row_index] = add_back
             ri_label_by_index[row_index] = label
             alloc_key = resource_key(row, ri_modes[reservation_id], profile)
+            row_contributions = []
             for target, contribution in contributions:
                 pool_key = (ri_scopes[reservation_id], target, alloc_key)
+                row_contributions.append((pool_key, contribution))
                 ri_amount_by_key[pool_key] += contribution
                 if contribution != 0:
                     ri_amount_by_reservation_key[
                         (pool_key, reservation_id)
                     ] += contribution
+            contributions_by_index[row_index] = row_contributions
             matched = [t for t in targets if has_target_tag(row, t)]
             if len(matched) > 1:
                 labels = "、".join("=".join(t) for t in matched)
@@ -1049,28 +1148,78 @@ def main(profile: ResourceProfile = VM) -> None:
     target_non_ri_total = sum(
         target_non_ri_total_by_key.values(), Decimal("0")
     )
-    if profile != VM and not ri_usage_rows:
+    if profile != VM and not ri_usage_rows and ri_targets:
         raise ValueError(f"输入账单中没有已绑定的 {profile.name} RI Usage 明细")
 
-    for pool_key, key_ri_amount in ri_amount_by_key.items():
-        scope, target, alloc_key = pool_key
-        target_label = "=".join(target)
-        # RI 金额为 0 时无需分摊，跳过校验，避免对零成本 RI 记录误报。
-        if key_ri_amount == 0:
-            continue
-        key_target_total = target_non_ri_total_by_key.get(pool_key, Decimal("0"))
-        if key_target_total == 0:
-            raise ValueError(
-                f"找不到分摊目标 {target_label!r} 与 RI 机型和区域 {alloc_key!r} "
-                f"且符合 RI scope {scope!r} 的 {profile.name} 明细"
-                "（含加回后的 RI 使用记录）。"
+    skipped_pools: dict[pool_key_type, str] = {}
+    while True:
+        # A skipped pool must also stop adding its benefit back to RI usage rows.
+        for index in ri_usage_indexes:
+            ri_add_back_by_index[index] = sum(
+                (value for pool, value in contributions_by_index[index]
+                 if pool not in skipped_pools), Decimal("0")
             )
-        if key_ri_amount > 0 and key_target_total < key_ri_amount:
-            raise ValueError(
-                f"分摊目标 {target_label!r} 的匹配机型和区域 {alloc_key!r} "
-                f"{profile.name} 全价费用 {key_target_total} 小于待分摊 RI 净收益 "
-                f"{key_ri_amount}，无法按比例分摊后保持非负费用。"
+            receiver_basis_by_index[index] = (
+                decimal_from_row(rows[index], args.amount_field)
+                + ri_add_back_by_index[index]
             )
+        for pool, indexes in target_non_ri_indexes.items():
+            target_non_ri_total_by_key[pool] = sum(
+                (receiver_basis_by_index[index] for index in indexes), Decimal("0")
+            )
+        newly_skipped = {}
+        for pool_key, key_ri_amount in ri_amount_by_key.items():
+            if pool_key in skipped_pools or key_ri_amount == 0:
+                continue
+            scope, target, alloc_key = pool_key
+            target_label = "=".join(target)
+            key_target_total = target_non_ri_total_by_key.get(pool_key, Decimal("0"))
+            if not target_non_ri_indexes.get(pool_key) or key_target_total == 0:
+                reason = (
+                    f"找不到分摊目标 {target_label!r} 与 RI 机型和区域 {alloc_key!r} "
+                    f"且符合 RI scope {scope!r} 的 {profile.name} 明细"
+                    "（含加回后的 RI 使用记录）。"
+                )
+            elif key_ri_amount > 0 and key_target_total < key_ri_amount:
+                reason = (
+                    f"分摊目标 {target_label!r} 的匹配机型和区域 {alloc_key!r} "
+                    f"{profile.name} 全价费用 {key_target_total} 小于待分摊 RI 净收益 "
+                    f"{key_ri_amount}，无法按比例分摊后保持非负费用。"
+                )
+            else:
+                continue
+            if not args.skip_unallocatable:
+                raise ValueError(reason)
+            newly_skipped[pool_key] = reason
+        if not newly_skipped:
+            break
+        skipped_pools.update(newly_skipped)
+
+    skipped_allocations = [
+        {
+            "reservationId": reservation_id,
+            "appliedScopeType": pool[0][0],
+            "appliedScopeId": pool[0][1],
+            "target": "=".join(pool[1]),
+            "matchKey": pool[2][0],
+            "region": pool[2][1],
+            "riAmount": str(amount),
+            "reason": skipped_pools[pool],
+        }
+        for (pool, reservation_id), amount in sorted(ri_amount_by_reservation_key.items())
+        if pool in skipped_pools and amount != 0
+    ]
+    for pool in skipped_pools:
+        ri_amount_by_key[pool] = Decimal("0")
+    for key in list(ri_amount_by_reservation_key):
+        if key[0] in skipped_pools:
+            del ri_amount_by_reservation_key[key]
+    project_ri.clear()
+    ri_amount = Decimal("0")
+    for index in ri_usage_indexes:
+        add_back = ri_add_back_by_index[index]
+        ri_amount += add_back
+        project_ri[project_of(rows[index], args.project_tag_key)] += add_back
 
     # RI 使用记录先加回自身 RI 金额（体现未人为分配前的原始资源成本）；若其标签命中
     # 某个分摊目标，则加回后再以全价参与该目标收益分摊，净额为加回金额减去应摊份额。
@@ -1387,6 +1536,11 @@ def main(profile: ResourceProfile = VM) -> None:
             }
             for (scope, target, alloc_key) in sorted(ri_amount_by_key)
         ],
+        "skippedAllocations": skipped_allocations,
+        "skipUnallocatable": args.skip_unallocatable,
+        "skippedAllocationAmount": str(sum(
+            (Decimal(item["riAmount"]) for item in skipped_allocations), Decimal("0")
+        )),
         "sourceFilesModified": False,
         "resourceTagsModified": False,
         "resourceIdsModified": False,
@@ -1408,6 +1562,9 @@ def main(profile: ResourceProfile = VM) -> None:
     print(f"RI 未使用成本：{ri_unused_cost_total}")
     print(f"RI 组合净收益（仅汇总）：{ri_gross_savings_total - ri_unused_cost_total}")
     print(f"按 binding 待分摊使用收益：{ri_amount}")
+    if skipped_allocations:
+        print(f"WARNING: 跳过 {len(skipped_allocations)} 条 RI/目标分摊，"
+              f"未分摊金额 {summary['skippedAllocationAmount']}", file=sys.stderr)
     print(f"目标项目 {profile.name} 接收费用：{target_non_ri_total}")
     print(f"输出目录：{output_dir}")
     print(f"汇总文件：{summary_path}")

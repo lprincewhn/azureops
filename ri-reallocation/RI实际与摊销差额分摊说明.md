@@ -18,7 +18,8 @@ Azure Actual 成本导出与 Amortized 成本导出采用不同的 RI 记账方�
 1. 按 Reservation Order ID 汇总每个虚拟机 RI 的 Actual 金额。
 2. 汇总同一 RI 在 Amortized 账单中的已有摊销金额。
 3. 计算 Actual 与 Amortized 的 RI 差额。
-4. 将差额按比例分配到实际使用该 RI 的虚拟机 Usage 行。
+4. 将差额按比例分配到实际使用该 RI 的 Usage 行；若完全没有 Usage，
+   则由同一订单的 UnusedReservation 行承接。
 5. 输出带有调整金额和调整后金额的新 CSV 文件。
 
 以下原始字段保持不变：
@@ -45,22 +46,24 @@ AMR: meterCategory = Redis Cache
 下文 VM 示意同样适用于 MySQL 和 AMR：各自的 Usage 行需分别有
 `Microsoft.DBforMySQL/flexibleServers` 和 `Microsoft.Cache/redisEnterprise`
 资源 ID；RI Usage 识别不按 `meterSubCategory` 筛选。无对应 Usage 的非零
-差额仍会报错停止，不能凭空分摊。
+差额仅在没有对应 Usage 且没有 UnusedReservation 时才报错；
+未使用成本不作为项目使用收益。
 输出 `ri-allocation-summary.csv` 和 `changed-amortized-ri-rows.csv`
 增加 `resourceType`，以便核对三类资源。SQL Database、Cosmos DB、
 Synapse、App Service 等其他服务不参与计算。
 
 ### 2.2 Actual 账单中的 RI 金额
 
-同时满足以下条件的记录被识别为虚拟机 RI Purchase：
+同时满足以下条件的记录被识别为虚拟机 RI 购买或退款：
 
 ```text
 pricingModel = Reservation
 meterCategory = Virtual Machines
-chargeType = Purchase
+chargeType = Purchase 或 Refund
 ```
 
-Actual 侧直接使用 `reservationId` 作为 Reservation Order ID，并按 Order ID 汇总命令行指定的金额字段。
+Actual 侧直接使用 `reservationId` 作为 Reservation Order ID，并按 Order ID
+汇总指定金额字段的购买和退款净额（退款为负数）。
 
 ### 2.3 Amortized 账单中的 RI 金额
 
@@ -89,22 +92,26 @@ ResourceId 包含 /virtualMachines/
 Reservation Order ID 与待处理 RI 相同
 ```
 
-Purchase、UnusedReservation、磁盘、网络及其他非虚拟机费用不会被作为分摊目标。
+优先选择 Usage；只有同一订单完全没有符合条件的 Usage 时，才选择该订单的
+`UnusedReservation` 行承接差额，并标记为未使用预留成本调整。
+Purchase、磁盘、网络及其他费用不会被作为分摊目标。
 
 ## 3. 处理流程
 
 ```mermaid
 flowchart TD
     A[读取 Actual 与 Amortized CSV] --> B[识别虚拟机 Reservation 记录]
-    B --> C[Actual 按 reservationId 汇总 Purchase]
+    B --> C[Actual 按 reservationId 汇总 Purchase 和 Refund 净额]
     B --> D[Amortized 从 benefitId 提取 Order ID 并汇总]
     C --> E[取两侧 Order ID 并集]
     D --> E
     E --> F[逐 RI 计算 Actual 减 Amortized]
     F --> G{差额是否为零}
     G -- 是 --> H[保留原金额 不分摊]
-    G -- 否 --> I{存在对应 VM Usage 行}
-    I -- 否 --> J[报错停止]
+    G -- 否 --> I{存在对应 Usage 行}
+    I -- 否 --> J{存在同订单 UnusedReservation 行}
+    J -- 否 --> Q[报错停止]
+    J -- 是 --> K
     I -- 是 --> K[按原摊销金额比例分配]
     K --> L{原摊销金额合计是否为零}
     L -- 是 --> M[改用 quantity 比例]
@@ -122,7 +129,7 @@ flowchart TD
 
 ```text
 RI 待分摊金额
-= Actual 中该 RI 的 Purchase 金额
+= Actual 中该 RI 的 Purchase 与 Refund 净额
 − Amortized 中该 RI 的全部摊销金额
 ```
 
@@ -130,8 +137,8 @@ Amortized 全部摊销金额包含 Usage 与 UnusedReservation。
 
 | 场景 | 差额 | 处理方式 |
 |---|---:|---|
-| Actual 大于 Amortized | 正数 | 按比例增加对应 VM Usage 行费用 |
-| Actual 小于 Amortized | 负数 | 按比例降低对应 VM Usage 行费用 |
+| Actual 大于 Amortized | 正数 | 优先增加对应 Usage 行费用，无 Usage 则调整 UnusedReservation |
+| Actual 小于 Amortized | 负数 | 优先降低对应 Usage 行费用，无 Usage 则调整 UnusedReservation |
 | Actual 等于 Amortized | 0 | 直接跳过，即使没有 VM Usage 行也不会报错 |
 
 ### 4.2 Order ID 并集
@@ -142,17 +149,19 @@ Amortized 全部摊销金额包含 Usage 与 UnusedReservation。
 待处理 RI 集合 = Actual Order ID 集合 ∪ Amortized Order ID 集合
 ```
 
-如果某个 RI 只存在于 Amortized，则 Actual 金额按 0 处理，差额为负数，并从对应虚拟机 Usage 行中按比例扣减。
+如果某个 RI 只存在于 Amortized，则 Actual 金额按 0 处理，差额为负数；
+优先从对应 Usage 行扣减，无 Usage 时仅从同订单 UnusedReservation 行扣减，
+且不允许调整后未使用费用为负。
 
 ### 4.3 分摊权重
 
-默认按每条目标虚拟机行的原摊销金额比例分配：
+默认按每条目标行的原摊销金额比例分配：
 
 ```text
 某行调整金额
 = RI 待分摊金额
 × 该行原摊销金额
-÷ 该 RI 全部目标 VM 行原摊销金额合计
+÷ 该 RI 全部目标行原摊销金额合计
 ```
 
 如果目标行原摊销金额合计为 0，则回退到 `quantity` 比例：
@@ -161,10 +170,11 @@ Amortized 全部摊销金额包含 Usage 与 UnusedReservation。
 某行调整金额
 = RI 待分摊金额
 × 该行 quantity
-÷ 该 RI 全部目标 VM 行 quantity 合计
+÷ 该 RI 全部目标行 quantity 合计
 ```
 
 如果金额与 quantity 合计都为 0，脚本会报错，不会静默漏分。
+对于 UnusedReservation 行，调整后费用也必须非负，否则报错。
 
 ### 4.4 精度与尾差
 
@@ -172,13 +182,16 @@ Amortized 全部摊销金额包含 Usage 与 UnusedReservation。
 
 ### 4.5 无可承接虚拟机记录
 
-如果差额不为 0，但同一 Order ID 下没有符合条件的虚拟机 Usage 行，脚本会报错停止：
+如果差额不为 0，而同一 Order ID 下既无符合条件的 Usage 行也无
+UnusedReservation 行，脚本才会报错停止：
 
 ```text
-RI order ... has a difference of ..., but no corresponding VM Usage rows were found
+RI order ... has a difference of ..., but no corresponding eligible Usage or UnusedReservation rows were found
 ```
 
-脚本不会把完全未使用的 RI 成本强行分配给购买订阅中的普通虚拟机。
+脚本不会把完全未使用的 RI 成本强行分配给购买订阅中的普通使用资源。
+输出账单和变更明细的 `riActualAmortizedAdjustmentType` 列标识本次调整
+承接在 `Usage` 还是 `UnusedReservation`；未调整行该列为空。
 
 ## 5. 未使用 RI 检测
 
