@@ -135,6 +135,16 @@ def combine(input_paths, branches, output_dir, project_tag_key):
     for field in ("riServiceTypes", "matchModeByReservation"):
         summary[field] = {key: value for item in summaries for key, value in item[field].items()}
     summary["riSavingsByReservation"] = savings
+    summary["skippedAllocations"] = [
+        entry for item in summaries for entry in item.get("skippedAllocations", [])
+    ]
+    summary["skipUnallocatable"] = any(
+        item.get("skipUnallocatable", False) for item in summaries
+    )
+    summary["skippedAllocationAmount"] = str(sum(
+        (Decimal(item.get("skippedAllocationAmount", "0")) for item in summaries),
+        Decimal(0),
+    ))
     summary["assignedByTarget"] = {
         project: str(value) for project, value in sorted(assigned.items())
     }
@@ -155,6 +165,8 @@ def main():
     parser.add_argument("--reservations-file", required=True, type=Path)
     parser.add_argument("--price-sheet-file", required=True, type=Path)
     parser.add_argument("--project-tag-key", required=True)
+    parser.add_argument("--skip-unallocatable", action="store_true",
+                        help="Report unallocatable target pools instead of stopping")
     args = parser.parse_args()
     inputs = sorted(path.resolve() for path in args.input_dir.glob("*.csv")
                     if path.name not in ("ri-allocation-summary.csv", "changed-amortized-ri-rows.csv",
@@ -181,7 +193,8 @@ def main():
                  "--project-tag-key", args.project_tag_key,
                  "--amount-field", AMOUNT,
                  "--price-sheet-file", str(args.price_sheet_file.resolve()),
-                 "--output-dir", str(branch)],
+                 "--output-dir", str(branch),
+                 *(["--skip-unallocatable"] if args.skip_unallocatable else [])],
                 check=True,
             )
         output.mkdir(parents=True, exist_ok=True)

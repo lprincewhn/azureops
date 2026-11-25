@@ -581,6 +581,7 @@ class ReservationsReallocationTests(unittest.TestCase):
         reservations,
         amount_field="costInBillingCurrency",
         unit_prices=None,
+        skip_unallocatable=False,
     ):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
@@ -643,6 +644,8 @@ class ReservationsReallocationTests(unittest.TestCase):
             "--amount-field",
             amount_field,
         ]
+        if skip_unallocatable:
+            argv.append("--skip-unallocatable")
         old_argv = sys.argv
         sys.argv = argv
         try:
@@ -657,6 +660,60 @@ class ReservationsReallocationTests(unittest.TestCase):
         ) as f:
             summary["_testAllocationDetails"] = list(csv.DictReader(f))
         return result_rows, summary
+
+    def test_skip_missing_receiver_preserves_unassigned_benefit(self):
+        rows = [
+            self._row(
+                ResourceId="/vm/ri-usage", pricingModel="Reservation",
+                chargeType="Usage", reservationId="ri-a",
+                meterRegion="US West 3",
+                additionalInfo='{"ServiceType":"Standard_D2s_v5"}',
+                tags='{"projname":"source"}', costInBillingCurrency="10",
+            ),
+            self._row(
+                ResourceId="/vm/receiver", pricingModel="OnDemand",
+                chargeType="Usage", reservationId="",
+                meterRegion="US West 3",
+                additionalInfo='{"ServiceType":"Standard_D2s_v5"}',
+                tags='{"projname":"valid"}', costInBillingCurrency="100",
+            ),
+        ]
+        config = [{"externalReservationId": "/reservations/ri-a",
+                   "bindings": [{"project": "valid", "boundQuantity": 1},
+                                {"project": "missing", "boundQuantity": 1}]}]
+        with self.assertRaisesRegex(ValueError, "找不到分摊目标"):
+            self._run(rows, config)
+        result, summary = self._run(rows, config, skip_unallocatable=True)
+        self.assertEqual(MODULE.Decimal(result[0]["riAllocationAmount"]), MODULE.Decimal("5"))
+        self.assertEqual(MODULE.Decimal(result[1]["riAllocationAmount"]), MODULE.Decimal("-5"))
+        self.assertEqual(summary["skippedAllocationAmount"], "5")
+        self.assertEqual(summary["skippedAllocations"][0]["reservationId"], "ri-a")
+        self.assertEqual(summary["skippedAllocations"][0]["target"], "projname=missing")
+        self.assertEqual(sum(MODULE.Decimal(r["riAllocationAmount"]) for r in result), MODULE.Decimal(0))
+        self.assertEqual(len(summary["_testAllocationDetails"]), 2)
+
+    def test_skip_insufficient_receiver_does_not_make_cost_negative(self):
+        rows = [
+            self._row(
+                ResourceId="/vm/ri-usage", pricingModel="Reservation",
+                chargeType="Usage", reservationId="ri-a",
+                additionalInfo='{"ServiceType":"Standard_D2s_v5"}',
+                tags='{"projname":"source"}', costInBillingCurrency="10",
+            ),
+            self._row(
+                ResourceId="/vm/receiver", pricingModel="OnDemand",
+                chargeType="Usage", reservationId="",
+                additionalInfo='{"ServiceType":"Standard_D2s_v5"}',
+                tags='{"projname":"target"}', costInBillingCurrency="2",
+            ),
+        ]
+        config = [{"externalReservationId": "/reservations/ri-a",
+                   "bindings": [{"project": "target", "boundQuantity": 1}]}]
+        result, summary = self._run(rows, config, skip_unallocatable=True)
+        self.assertEqual([MODULE.Decimal(r["riAllocationAmount"]) for r in result],
+                         [MODULE.Decimal(0), MODULE.Decimal(0)])
+        self.assertEqual(summary["skippedAllocationAmount"], "10")
+        self.assertIn("小于待分摊", summary["skippedAllocations"][0]["reason"])
 
     def test_single_ri_split_to_two_projects_by_weight(self):
         rows = [

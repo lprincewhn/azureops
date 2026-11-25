@@ -18,6 +18,56 @@ SPEC.loader.exec_module(MODULE)
 
 
 class DistributionReportTests(unittest.TestCase):
+    def test_skipped_allocation_appears_in_csv_and_html(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_result(
+                root,
+                [{"reservationId": "ri-1", "reservationName": "RI One",
+                  "tags": '{"projname":"source"}', "riBenefitOrLoss": "30"}],
+                [],
+            )
+            path = root / "ri-summary.json"
+            payload = json.loads(path.read_text())
+            payload["skippedAllocations"] = [{
+                "reservationId": "ri-1", "target": "projname=target-a",
+                "matchKey": "D2s_v5", "region": "US West 3",
+                "riAmount": "30", "reason": "No matching receiver",
+            }]
+            path.write_text(json.dumps(payload))
+            result = MODULE.build_distribution(root, root / "report", "projname")
+            with result.csv_path.open(encoding="utf-8-sig", newline="") as stream:
+                row = next(csv.DictReader(stream))
+            self.assertEqual(row["allocationStatus"], "SKIPPED")
+            self.assertEqual(row["skippedAllocationAmount"], "30")
+            self.assertIn("No matching receiver", row["skippedAllocationReason"])
+            self.assertIn("未承接（已跳过）", result.html_path.read_text())
+            self.assertIn("No matching receiver", result.html_path.read_text())
+
+    def test_skip_mode_reports_usage_missing_from_reservation_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_result(
+                root,
+                [{"reservationId": "ri-2", "reservationName": "Unknown RI",
+                  "tags": '{"projname":"source"}', "riBenefitOrLoss": "30"}],
+                [],
+            )
+            path = root / "ri-summary.json"
+            payload = json.loads(path.read_text())
+            payload["reservationIds"] = []
+            payload["riSavingsByReservation"] = {}
+            with self.assertRaisesRegex(ValueError, "未定义的 RI"):
+                MODULE.build_distribution(root, root / "strict", "projname")
+            payload["skipUnallocatable"] = True
+            path.write_text(json.dumps(payload))
+            result = MODULE.build_distribution(root, root / "partial", "projname")
+            with result.csv_path.open(encoding="utf-8-sig", newline="") as stream:
+                row = next(csv.DictReader(stream))
+            self.assertEqual(row["classification"], "UNDEFINED_RI_WITH_USAGE")
+            self.assertEqual(row["allocationStatus"], "NOT_ALLOCATED")
+            self.assertIn("配置未定义但账单有 Usage", result.html_path.read_text())
+
     def _write_result(
         self,
         root: Path,

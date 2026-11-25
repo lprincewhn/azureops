@@ -166,6 +166,17 @@ work/02-economic-reallocated/
 - `project-allocation.csv`：项目分摊前后金额汇总。
 - `ri-summary.json`：RI 收益、超额成本、未使用成本及分摊范围汇总。
 
+默认仍对目标缺失或收益超过接收费用报错。业务明确接受部分分摊时，
+可给单类脚本或 `reallocate_all_ri.py` 增加 `--skip-unallocatable`：
+仅跳过没有接收行或接收费用不足的目标池，不向其他项目转嫁其金额；
+该部分留在 RI 原使用项目，原始账单和全账单调整守恒。`ri-summary.json`
+的 `skippedAllocations` 逐条列出 RI ID、目标项目、机型/区域、scope、
+待分摊金额及原因，`skippedAllocationAmount` 汇总跳过金额。
+项目报告 CSV 的 `allocationStatus` 标为 `SKIPPED` 或 `PARTIALLY_ALLOCATED`，
+并给出 `skippedAllocationAmount`、`skippedAllocationReason`；HTML 同样提示。
+未绑定或配置未定义的 RI 在跳过模式下保留原成本，并在报告分类中标识；
+缺失价目表或无效输入仍明确报错，不能用跳过模式替代数据补全。
+
 > 不要在流水线中使用 `--summary-only`。最终报告同时依赖分摊后账单副本和
 > `ri-allocation-details.csv`。
 
@@ -197,8 +208,10 @@ python3 reallocate_amr_ri.py "input/amortized/Amortized_*.csv" \
 配置分别只选取 `productType=mysql`、`productType=redis` 且有有效
 `bindings` 的预留；对于 `externalReservationId=order:<订单 GUID>`，
 通过 Usage 行 `additionalInfo.ReservationOrderId` 找到账单 `reservationId`。
-若没有绑定、订单无法匹配或没有对应 RI Usage，脚本会报错，不会生成
-“成功但没有实际分摊”的报告。输入和输出必须分开，避免将另一个脚本的
+默认若没有绑定、订单无法匹配或没有对应 RI Usage，脚本会报错。
+`--skip-unallocatable` 下无有效绑定的资源类别按原账单输出，
+报告列为未分摊；已配置但找不到订单或 Usage 仍报错。
+输入和输出必须分开，避免将另一个脚本的
 `allocatedCostInBillingCurrency` 当作本脚本的基准；当前第一步
 `allocate_ri_difference.py` 现已对齐三类资源；在统一流水线中应将其输出作为
 共同成本基准，并统一指定 `--amount-field
