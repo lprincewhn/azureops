@@ -57,13 +57,27 @@ def normalize_batch(response, aggregation, query_window):
 
 
 def parse_event(payload):
-    """A DCR event is an object; some Event Hubs producers send an array."""
-    event = json.loads(payload)
-    if isinstance(event, dict):
-        return [event]
-    if isinstance(event, list) and all(isinstance(item, dict) for item in event):
-        return event
-    raise ValueError("Event Hubs body must contain metric objects")
+    """Accept JSON objects, arrays, and newline-delimited DCR metric objects."""
+    decoder = json.JSONDecoder()
+    records = []
+    offset = 0
+    while offset < len(payload):
+        while offset < len(payload) and payload[offset].isspace():
+            offset += 1
+        if offset == len(payload):
+            break
+        event, offset = decoder.raw_decode(payload, offset)
+        if isinstance(event, dict):
+            records.append(event)
+        elif isinstance(event, list) and all(isinstance(item, dict) for item in event):
+            records.extend(event)
+        else:
+            raise ValueError("Event Hubs body must contain metric objects")
+        if offset < len(payload) and not payload[offset].isspace():
+            raise ValueError("Event Hubs metric objects must be separated by whitespace")
+    if not records:
+        raise ValueError("Event Hubs body must contain metric objects")
+    return records
 
 
 def samples(record):

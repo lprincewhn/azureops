@@ -79,10 +79,42 @@ class ContractTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             parse_event('"invalid"')
         with self.assertRaises(ValueError):
+            parse_event('{"Total": 1}{"Total": 2}')
+        with self.assertRaises(ValueError):
+            parse_event('{"Total": 1}\nnot-json')
+        with self.assertRaises(ValueError):
+            parse_event(" \n ")
+        with self.assertRaises(ValueError):
             samples({**item, "dimension": {}, "Total": "NaN"})
         with self.assertRaises(ValueError):
             normalize_batch({"values": [{"resourceid": RESOURCE, "value": [
                 {"errorCode": "BadRequest"}]}]}, "total", {})
+
+    def test_newline_delimited_dcr_records_checkpoint_as_one_event(self):
+        first = {
+            "resourceId": RESOURCE, "time": TIME, "unit": "Count",
+            "metricName": "Transactions", "timeGrain": "PT1M",
+            "dimension": {"ApiName": "GetBlob"}, "Total": 2,
+        }
+        second = {**first, "dimension": {"ApiName": "PutBlob"}, "Total": 3}
+        payload = json.dumps(first) + "\r\n" + json.dumps(second) + "\n"
+        self.assertEqual(parse_event(payload), [first, second])
+
+        class Context:
+            updates = 0
+
+            def update_checkpoint(self, event):
+                self.updates += 1
+
+        class Event:
+            def body_as_str(self):
+                return payload
+
+        store = Store()
+        context = Context()
+        process_event(store, context, Event())
+        self.assertEqual(context.updates, 1)
+        self.assertIsNone(store.error)
 
     def test_checkpoint_only_on_success(self):
         class Context:

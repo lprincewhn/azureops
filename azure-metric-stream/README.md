@@ -6,7 +6,7 @@
 
 ## 消息与语义
 
-每条事件是一个 JSON 对象，至少包含 `resourceId`、`metricName`、`unit`、`time`（带时区的 ISO 8601）、`timeGrain`、`dimension`（原始维度名值对象）和 `Average` / `Count` / `Maximum` / `Minimum` / `Total` 中一个或多个聚合值。Batch 生成的事件额外携带 `schemaVersion: 1` 和 `queryWindow`；DCR 原始事件可以不含这两个字段。兼容官方 [Event Hubs 示例格式](https://learn.microsoft.com/en-us/azure/azure-monitor/data-collection/metrics-export-create#event-hubs)，**尚未用目标订阅真实 Storage DCR 事件回放验证**，部署前必须取经过授权、脱敏的真实事件核对结构并补测试。
+每条指标记录是一个 JSON 对象，至少包含 `resourceId`、`metricName`、`unit`、`time`（带时区的 ISO 8601）、`timeGrain`、`dimension`（原始维度名值对象）和 `Average` / `Count` / `Maximum` / `Minimum` / `Total` 中一个或多个聚合值。一个 Event Hubs 消息可包含单个对象、对象数组，或多行以换行分隔的 JSON 对象（DCR 实际投递格式）；所有记录解析成功后才推进该消息的检查点。Batch 生成的记录额外携带 `schemaVersion: 1` 和 `queryWindow`；DCR 原始记录可以不含这两个字段。兼容官方 [Event Hubs 示例格式](https://learn.microsoft.com/en-us/azure/azure-monitor/data-collection/metrics-export-create#event-hubs)；真实记录的完整字段和维度仍须核对。
 
 每个聚合映射为 `azure_platform_metric` **Gauge**，标签为 `resource_id`、`metric_name`、`aggregation`、`unit`、`time_grain` 和所有 `dimension_<规范化原名>`。`Total` 是该时间区间的值，**不是**累计 Counter，不能直接使用 `rate()`；`Count` 也按区间 Gauge 处理。标签名规范化碰撞、非法数值、缺字段会使事件失败且不会提交消费位点。按原始采样时间保留最新序列；同一序列的旧样本/重放不会覆盖新样本。过期序列自动删除，旧到达样本不会复活。`/metrics` 是最新值快照，**不保留补录的历史时间戳**；需要逐分钟历史和乱序回补时须另建 Remote Write 链路。
 
