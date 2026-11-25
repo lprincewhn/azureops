@@ -25,6 +25,7 @@ import io
 import json
 import re
 import sys
+import urllib.error
 import urllib.request
 import zipfile
 from collections import defaultdict
@@ -218,8 +219,26 @@ def _management_group_name(scope_id: str) -> str:
     return normalized
 
 
+def _require_scope_subscriptions(
+    scope: tuple[str, str], subscription_ids: set[str] | frozenset[str],
+    *, after_permission_denied: bool = False,
+) -> frozenset[str]:
+    if not subscription_ids:
+        detail = (
+            "descendants 查询无权限，备用层级查询也未找到任何下属订阅；"
+            "无法确认管理组成员关系"
+            if after_permission_denied else
+            "查询结果没有下属订阅；请核实管理组、租户和查询权限"
+        )
+        raise RuntimeError(
+            f"ManagementGroup scope {scope[1]!r} {detail}，停止分摊；"
+            "不能按无接收行跳过。"
+        )
+    return frozenset(subscription_ids)
+
+
 def resolve_management_group_scopes_from_entities(
-    scopes: RiScopes, credential: Any
+    scopes: RiScopes, credential: Any, *, after_permission_denied: bool = False
 ) -> dict[tuple[str, str], frozenset[str]]:
     """Resolve management-group membership through the tenant entity hierarchy."""
     token = credential.get_token("https://management.azure.com/.default").token
@@ -233,8 +252,16 @@ def resolve_management_group_scopes_from_entities(
         },
         method="POST",
     )
-    with urllib.request.urlopen(request, timeout=120) as response:
-        payload = json.load(response)
+    try:
+        with urllib.request.urlopen(request, timeout=120) as response:
+            payload = json.load(response)
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403):
+            raise RuntimeError(
+                "ManagementGroup scope 备用层级查询无权限"
+                f"（HTTP {exc.code}）；无法确认管理组成员关系，停止分摊。"
+            ) from exc
+        raise
     subscriptions: list[tuple[str, set[str]]] = []
     for entity in payload.get("value", []):
         if not isinstance(entity, dict):
@@ -253,11 +280,11 @@ def resolve_management_group_scopes_from_entities(
     result: dict[tuple[str, str], frozenset[str]] = {}
     for scope in {item for item in scopes.values() if item[0] == "managementgroup"}:
         group_name = _management_group_name(scope[1]).lower()
-        result[scope] = frozenset(
+        result[scope] = _require_scope_subscriptions(scope, {
             subscription_id
             for subscription_id, parent_chain in subscriptions
             if group_name in parent_chain
-        )
+        }, after_permission_denied=after_permission_denied)
     return result
 
 
@@ -265,6 +292,8 @@ def resolve_management_group_scopes(
     scopes: RiScopes, client: Any | None = None
 ) -> dict[tuple[str, str], frozenset[str]]:
     """Resolve ManagementGroup scopes to descendant subscription IDs via Azure SDK."""
+    from azure.core.exceptions import HttpResponseError
+
     management_group_scopes = {
         scope for scope in scopes.values() if scope[0] == "managementgroup"
     }
@@ -276,7 +305,6 @@ def resolve_management_group_scopes(
     if client is None:
         try:
             from azure.identity import AzureCliCredential
-            from azure.core.exceptions import HttpResponseError
             from azure.mgmt.managementgroups import ManagementGroupsMgmtClient
         except ImportError as exc:
             raise RuntimeError(
@@ -314,7 +342,7 @@ def resolve_management_group_scopes(
                     ).strip()
                     if name:
                         subscription_ids.add(name.lower())
-                result[scope] = frozenset(subscription_ids)
+                result[scope] = _require_scope_subscriptions(scope, subscription_ids)
         except HttpResponseError as exc:
             if (
                 not owns_client
@@ -323,7 +351,7 @@ def resolve_management_group_scopes(
             ):
                 raise
             result = resolve_management_group_scopes_from_entities(
-                scopes, credential
+                scopes, credential, after_permission_denied=True
             )
     finally:
         if owns_client:

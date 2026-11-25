@@ -493,6 +493,46 @@ class ReservationsFileTests(unittest.TestCase):
         self.assertEqual(FakeClient.management_groups.group_name, "ffalcon-us")
         self.assertEqual(resolved[scope], frozenset({"sub-a"}))
 
+    def test_management_group_empty_descendants_is_not_missing_receiver(self):
+        class FakeClient:
+            management_groups = mock.MagicMock()
+            management_groups.get_descendants.return_value = []
+
+        scope = ("managementgroup", "/providers/microsoft.management/managementgroups/example")
+        with self.assertRaisesRegex(RuntimeError, "查询结果没有下属订阅"):
+            MODULE.resolve_management_group_scopes({"ri-a": scope}, client=FakeClient())
+
+    def test_management_group_empty_fallback_reports_original_permission_failure(self):
+        class Credential:
+            def get_token(self, _scope):
+                return argparse.Namespace(token="token")
+
+        scope = ("managementgroup", "/providers/microsoft.management/managementgroups/example")
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = b'{"value":[]}'
+        with mock.patch.object(MODULE.urllib.request, "urlopen", return_value=response):
+            with self.assertRaisesRegex(
+                RuntimeError, "descendants 查询无权限，备用层级查询也未找到任何下属订阅"
+            ):
+                MODULE.resolve_management_group_scopes_from_entities(
+                    {"ri-a": scope}, Credential(), after_permission_denied=True
+                )
+
+    def test_management_group_fallback_permission_denied_is_explicit(self):
+        class Credential:
+            def get_token(self, _scope):
+                return argparse.Namespace(token="token")
+
+        scope = ("managementgroup", "/providers/microsoft.management/managementgroups/example")
+        error = MODULE.urllib.error.HTTPError(
+            "https://management.azure.com/", 403, "Forbidden", {}, None
+        )
+        with mock.patch.object(MODULE.urllib.request, "urlopen", side_effect=error):
+            with self.assertRaisesRegex(RuntimeError, "备用层级查询无权限.*HTTP 403"):
+                MODULE.resolve_management_group_scopes_from_entities(
+                    {"ri-a": scope}, Credential()
+                )
+
     def test_management_group_entities_resolve_parent_chain(self):
         class Credential:
             def get_token(self, _scope):

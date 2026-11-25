@@ -176,6 +176,9 @@ work/02-economic-reallocated/
 并给出 `skippedAllocationAmount`、`skippedAllocationReason`；HTML 同样提示。
 未绑定或配置未定义的 RI 在跳过模式下保留原成本，并在报告分类中标识；
 缺失价目表或无效输入仍明确报错，不能用跳过模式替代数据补全。
+ManagementGroup scope 必须先解析出非空下属订阅集合：若 Azure descendants
+查询无权限，脚本尝试备用层级查询；备用查询无权限或返回空集合时明确报出
+scope 无法确认并停止，不把权限/查询问题误判为没有匹配接收行。
 
 > 不要在流水线中使用 `--summary-only`。最终报告同时依赖分摊后账单副本和
 > `ri-allocation-details.csv`。
