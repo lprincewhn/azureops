@@ -65,7 +65,8 @@ class Store:
             f"azure_metric_stream_series {len(entries)}",
             "# HELP azure_metric_stream_last_event_timestamp_seconds Last accepted Event Hubs event.",
             "# TYPE azure_metric_stream_last_event_timestamp_seconds gauge",
-            f"azure_metric_stream_last_event_timestamp_seconds {last_event.timestamp() if last_event else 0:g}",
+            f"azure_metric_stream_last_event_timestamp_seconds {last_event.timestamp():.3f}" if last_event
+            else "azure_metric_stream_last_event_timestamp_seconds 0",
             "# HELP azure_metric_stream_healthy Consumer processing health.",
             "# TYPE azure_metric_stream_healthy gauge",
             f"azure_metric_stream_healthy {0 if error else 1}",

@@ -50,6 +50,7 @@ class ContractTests(unittest.TestCase):
         self.assertIn('aggregation="total"', output)
         self.assertIn("azure_platform_metric{", output)
         self.assertEqual(output.count("azure_platform_metric{"), 2)
+        self.assertIn(f"azure_metric_stream_last_event_timestamp_seconds {now.timestamp():.3f}", output)
 
     def test_age_dedup_and_cardinality(self):
         item = {

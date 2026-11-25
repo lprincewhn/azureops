@@ -25,6 +25,8 @@ docker build -f Dockerfile.batch -t azure-metric-batch:local .
 
 `EVENTHUB_NAMESPACE`（完整 `<namespace>.servicebus.windows.net`）、`EVENTHUB_NAME`、`EVENTHUB_CONSUMER_GROUP`（独立）、`CHECKPOINT_STORAGE_ACCOUNT`、`CHECKPOINT_CONTAINER` 为必填；可选 `PORT=8000`、`SERIES_TTL_SECONDS=900`、`MAX_SERIES=10000`。通过 `DefaultAzureCredential` 使用 Container App 托管身份；读取身份需要 Hub 范围 `Azure Event Hubs Data Receiver` 与检查点 Blob 容器范围 `Storage Blob Data Contributor`。检查点容器须先创建且允许该身份访问。认证与网络错误由 SDK 报错；处理失败时 `/health` 返回 503、`azure_metric_stream_healthy` 变 0，错误事件不提交 checkpoint。告警至少覆盖健康、`azure_metric_stream_last_event_timestamp_seconds` 与 Event Hubs 消费积压。
 
+`azure_metric_stream_last_event_timestamp_seconds` 精确到毫秒，表示转换器最近**处理**事件的时间，不等于源指标原始采样时间；稀疏流量下不可单凭该指标告警业务中断。
+
 **抓取必须只指向单副本：**Container App 设 `minReplicas=maxReplicas=1`，不可缩零；多个副本共享同一个负载均衡 `/metrics` 地址会随机得到不完整序列。使用私有入口、VNet 与受控 DNS/网络路径使 jump-server 可达；只允许该 Prometheus 抓取。不可将示例开放为不受限的公网入口。Azure 凭据由托管身份提供，不用 Event Hubs 连接字符串。
 
 ## Batch 采集器配置
