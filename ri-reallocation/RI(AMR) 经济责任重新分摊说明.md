@@ -4,7 +4,7 @@
 
 将 Azure Managed Redis（AMR）RI 实际使用产生的收益或超额成本，按
 `reservations.json` 中的项目绑定权重重新分摊。
-`reallocate_amr_ri.py` 复用 `reallocate_vm_ri.py` 的分摊核心，
+`reallocate_amr_ri.py` 复用 `ri_reallocation_core.py` 的分摊核心，
 但只处理 `Redis Cache` 类别。脚本输出新的账单副本，不修改原始
 `tags`、`ResourceId`、`pricingModel` 或 `costInBillingCurrency`；
 推荐先通过 `allocate_ri_difference.py` 对齐 Actual 与 Amortized。
@@ -109,7 +109,7 @@ RI Usage 既作为源又作为目标时，此行 `riAllocationAmount` 是两种
 ## 5. 脚本文件
 
 使用 `reallocate_amr_ri.py`（`AMR` profile），实际分摊逻辑位于
-`reallocate_vm_ri.py`；不应使用 VM 入口代跑 Redis 分摊。
+`ri_reallocation_core.py`；不应使用 VM 入口代跑 Redis 分摊。
 
 ## 6. 执行方法
 

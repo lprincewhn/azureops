@@ -193,7 +193,8 @@ scope 无法确认并停止，不把权限/查询问题误判为没有匹配接�
 
 ### MySQL 与 Azure Managed Redis 独立分摊
 
-`reallocate_mysql_ri.py` 与 `reallocate_amr_ri.py` 复用 VM 的价格匹配、
+三个独立入口 `reallocate_vm_ri.py`、`reallocate_mysql_ri.py`、
+`reallocate_amr_ri.py` 均调用 `ri_reallocation_core.py` 的价格匹配、
 `boundQuantity / boundTotal` 权重、RI scope、金额守恒及非负费用校验。
 RI Usage 仅按各自的 `meterCategory`、`pricingModel=Reservation`、
 `chargeType=Usage` 及已绑定 `reservationId` 选择，**不按

@@ -4,7 +4,7 @@
 
 将 Azure Database for MySQL RI 的实际使用净收益或超额成本，按预留定义
 `reservations.json` 中的 `bindings[].boundQuantity / boundTotal` 分配给绑定项目。
-`reallocate_mysql_ri.py` 调用 `reallocate_vm_ri.py` 的共用分摊逻辑，但只处理
+`reallocate_mysql_ri.py` 调用 `ri_reallocation_core.py` 的共用分摊逻辑，但只处理
 MySQL 类别；输出新的账单副本，不覆盖原始账单的 `tags`、`ResourceId`、
 `pricingModel` 或 `costInBillingCurrency`。可先运行 `allocate_ri_difference.py`
 将 Actual 与 Amortized 成本对齐，再做经济责任分摊。
@@ -111,8 +111,8 @@ RI Usage 净调整额 = 加回金额 − 该行作为目标接收行时应承担
 
 ## 5. 脚本文件
 
-`reallocate_mysql_ri.py` 是 MySQL 入口，调用共用的
-`reallocate_vm_ri.py`（`MYSQL` profile）；无需改用 VM 命令运行。
+`reallocate_mysql_ri.py` 是 MySQL 薄入口，使用 `ri_reallocation_core.py`
+中的 `MYSQL` profile 和共用分摊逻辑；无需改用 VM 命令运行。
 
 ## 6. 执行方法
 
