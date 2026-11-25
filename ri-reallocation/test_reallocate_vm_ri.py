@@ -493,6 +493,40 @@ class ReservationsFileTests(unittest.TestCase):
         self.assertEqual(FakeClient.management_groups.group_name, "ffalcon-us")
         self.assertEqual(resolved[scope], frozenset({"sub-a"}))
 
+    def test_selects_reservation_tenant_without_switching_cli_default(self):
+        path = self._write([{
+            "productType": "vm",
+            "cloudAccountExternalId": "billing-tenant",
+            "appliedScopeType": "ManagementGroup",
+            "bindings": [{"project": "team", "boundQuantity": 1}],
+        }])
+        self.assertEqual(MODULE.billing_tenant_id(path, MODULE.VM, None), "billing-tenant")
+        self.assertEqual(MODULE.billing_tenant_id(path, MODULE.VM, "override"), "override")
+        accounts = [
+            {"id": "sub-default", "tenantId": "other-tenant"},
+            {"id": "sub-billing", "tenantId": "billing-tenant"},
+        ]
+        with mock.patch.object(
+            MODULE.subprocess, "check_output", return_value=json.dumps(accounts).encode()
+        ) as command:
+            self.assertEqual(MODULE.billing_subscription("billing-tenant"), "sub-billing")
+        self.assertEqual(command.call_args.args[0][:3], ["az", "account", "list"])
+        with mock.patch.object(
+            MODULE.subprocess, "check_output", return_value=json.dumps(accounts).encode()
+        ):
+            with self.assertRaisesRegex(RuntimeError, "没有租户"):
+                MODULE.billing_subscription("unknown-tenant")
+
+    def test_does_not_guess_between_multiple_billing_tenants(self):
+        path = self._write([
+            {"productType": "vm", "cloudAccountExternalId": tenant,
+             "appliedScopeType": "ManagementGroup",
+             "bindings": [{"project": "team", "boundQuantity": 1}]}
+            for tenant in ("tenant-a", "tenant-b")
+        ])
+        with self.assertRaisesRegex(ValueError, "多个租户"):
+            MODULE.billing_tenant_id(path, MODULE.VM, None)
+
     def test_management_group_empty_descendants_is_not_missing_receiver(self):
         class FakeClient:
             management_groups = mock.MagicMock()
@@ -1169,7 +1203,7 @@ class ReservationsReallocationTests(unittest.TestCase):
 
     def test_management_group_scope_only_allocates_to_descendant_subscription(self):
         original_resolver = MODULE.resolve_management_group_scopes
-        MODULE.resolve_management_group_scopes = lambda scopes: {
+        MODULE.resolve_management_group_scopes = lambda scopes, **_kwargs: {
             next(iter(scopes.values())): frozenset({"sub-a"})
         }
         self.addCleanup(

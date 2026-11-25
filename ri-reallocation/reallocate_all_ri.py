@@ -165,6 +165,8 @@ def main():
     parser.add_argument("--reservations-file", required=True, type=Path)
     parser.add_argument("--price-sheet-file", required=True, type=Path)
     parser.add_argument("--project-tag-key", required=True)
+    parser.add_argument("--tenant-id",
+                        help="Azure tenant for ManagementGroup lookup; passed to each RI branch")
     parser.add_argument("--skip-unallocatable", action="store_true",
                         help="Report unallocatable target pools instead of stopping")
     args = parser.parse_args()
@@ -194,6 +196,7 @@ def main():
                  "--amount-field", AMOUNT,
                  "--price-sheet-file", str(args.price_sheet_file.resolve()),
                  "--output-dir", str(branch),
+                 *(["--tenant-id", args.tenant_id] if args.tenant_id is not None else []),
                  *(["--skip-unallocatable"] if args.skip_unallocatable else [])],
                 check=True,
             )

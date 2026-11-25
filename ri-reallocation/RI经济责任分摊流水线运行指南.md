@@ -176,6 +176,12 @@ work/02-economic-reallocated/
 并给出 `skippedAllocationAmount`、`skippedAllocationReason`；HTML 同样提示。
 未绑定或配置未定义的 RI 在跳过模式下保留原成本，并在报告分类中标识；
 缺失价目表或无效输入仍明确报错，不能用跳过模式替代数据补全。
+ManagementGroup scope 查询默认从预留定义的 `cloudAccountExternalId` 推断租户，
+从 `az account list --all` 选择该租户已有登录订阅供 AzureCliCredential 使用，
+**不修改**本机 Azure CLI 默认订阅。无租户字段时可显式传
+`--tenant-id <账单租户ID>`（单类/统一入口均支持）；须先确保该租户至少有
+一个已登录订阅和管理组读取权限。单次输入中包含多个管理组租户时应按租户
+分开运行，不自动混用身份。
 ManagementGroup scope 必须先解析出非空下属订阅集合：若 Azure descendants
 查询无权限，脚本尝试备用层级查询；备用查询无权限或返回空集合时明确报出
 scope 无法确认并停止，不把权限/查询问题误判为没有匹配接收行。

@@ -24,6 +24,7 @@ import glob
 import io
 import json
 import re
+import subprocess
 import sys
 import urllib.error
 import urllib.request
@@ -111,6 +112,10 @@ def parse_args(profile: ResourceProfile = VM) -> argparse.Namespace:
         "--skip-unallocatable",
         action="store_true",
         help="跳过没有接收行或接收费用不足的分摊池，并在汇总与报告中标记",
+    )
+    parser.add_argument(
+        "--tenant-id",
+        help="ManagementGroup 查询所属的 Azure 租户；默认读取预留定义的 cloudAccountExternalId",
     )
     return parser.parse_args()
 
@@ -219,6 +224,50 @@ def _management_group_name(scope_id: str) -> str:
     return normalized
 
 
+def billing_tenant_id(path: Path, profile: ResourceProfile, configured: str | None) -> str | None:
+    if configured is not None:
+        tenant_id = configured.strip()
+        if not tenant_id:
+            raise ValueError("--tenant-id 不能为空")
+        return tenant_id
+    data = json.loads(path.read_text(encoding="utf-8-sig"))
+    items = data.get("reservations", [data]) if isinstance(data, dict) else data
+    tenant_ids = {
+        str(item.get("cloudAccountExternalId") or "").strip().lower()
+        for item in items
+        if isinstance(item, dict)
+        and (profile == VM and item.get("productType") in (None, "vm")
+             or profile != VM and item.get("productType") == profile.product_type)
+        and str(item.get("appliedScopeType") or "").lower() == "managementgroup"
+        and item.get("bindings")
+        and item.get("cloudAccountExternalId")
+    }
+    if len(tenant_ids) > 1:
+        raise ValueError("ManagementGroup 预留属于多个租户；请按租户分别运行")
+    return next(iter(tenant_ids), None)
+
+
+def billing_subscription(tenant_id: str) -> str:
+    try:
+        accounts = json.loads(subprocess.check_output(
+            ["az", "account", "list", "--all", "--output", "json"]
+        ))
+    except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+        raise RuntimeError("无法读取 Azure CLI 账户列表以选择 ManagementGroup 查询租户") from exc
+    subscriptions = sorted(
+        str(account["id"]) for account in accounts
+        if isinstance(account, dict)
+        and str(account.get("tenantId") or "").lower() == tenant_id.lower()
+        and account.get("id")
+    )
+    if not subscriptions:
+        raise RuntimeError(
+            f"Azure CLI 中没有租户 {tenant_id!r} 的可用订阅；"
+            "请登录该租户或通过 --tenant-id 指定正确的租户"
+        )
+    return subscriptions[0]
+
+
 def _require_scope_subscriptions(
     scope: tuple[str, str], subscription_ids: set[str] | frozenset[str],
     *, after_permission_denied: bool = False,
@@ -289,7 +338,7 @@ def resolve_management_group_scopes_from_entities(
 
 
 def resolve_management_group_scopes(
-    scopes: RiScopes, client: Any | None = None
+    scopes: RiScopes, client: Any | None = None, tenant_id: str | None = None
 ) -> dict[tuple[str, str], frozenset[str]]:
     """Resolve ManagementGroup scopes to descendant subscription IDs via Azure SDK."""
     from azure.core.exceptions import HttpResponseError
@@ -310,7 +359,9 @@ def resolve_management_group_scopes(
             raise RuntimeError(
                 "ManagementGroup scope 需要安装 requirements.txt 中的 Azure SDK"
             ) from exc
-        credential = AzureCliCredential()
+        credential = AzureCliCredential(
+            subscription=billing_subscription(tenant_id)
+        ) if tenant_id else AzureCliCredential()
         client = ManagementGroupsMgmtClient(credential=credential)
 
     result: dict[tuple[str, str], frozenset[str]] = {}
@@ -911,7 +962,12 @@ def main(profile: ResourceProfile = VM) -> None:
     if not ri_targets:
         print(f"WARNING: {profile.name} 没有有效项目绑定，保留原始费用且不分摊",
               file=sys.stderr)
-    management_group_subscriptions = resolve_management_group_scopes(ri_scopes)
+    tenant_id = billing_tenant_id(
+        Path(args.reservations_file), profile, args.tenant_id
+    ) if any(scope[0] == "managementgroup" for scope in ri_scopes.values()) else None
+    management_group_subscriptions = resolve_management_group_scopes(
+        ri_scopes, tenant_id=tenant_id
+    )
     reservation_ids = set(ri_targets)
     targets = sorted(
         {target for entries in ri_targets.values() for target, _weight in entries}
