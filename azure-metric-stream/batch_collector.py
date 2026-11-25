@@ -41,7 +41,7 @@ RESOURCE_PATTERN = re.compile(
 AGGREGATIONS = {"average", "minimum", "maximum", "total", "count"}
 SPEC_KEYS = {
     "resourceType", "metricNamespace", "metricNames", "aggregation",
-    "interval", "dimensions", "filter", "top",
+    "interval", "dimensions", "filter", "top", "resourceIds",
 }
 
 
@@ -121,6 +121,16 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         resource_type = spec.get("resourceType")
         if not isinstance(resource_type, str) or resource_type.lower() not in types:
             raise ValueError("Each metric spec must match a configured resourceType")
+        if "resourceIds" in spec:
+            ids = spec["resourceIds"]
+            matching = {
+                resource["id"].lower() for resource in resources
+                if RESOURCE_PATTERN.fullmatch(resource["id"]).group(2).lower() == resource_type.lower()
+            }
+            if (not isinstance(ids, list) or not ids
+                    or any(not isinstance(item, str) or item.lower() not in matching for item in ids)
+                    or len({item.lower() for item in ids}) != len(ids)):
+                raise ValueError("resourceIds must be distinct configured resources of resourceType")
         namespace = spec.setdefault("metricNamespace", resource_type)
         if not isinstance(namespace, str) or not namespace:
             raise ValueError("metricNamespace must be a nonempty string")
@@ -159,9 +169,12 @@ def plan_batches(config: dict[str, Any]) -> Iterable[tuple[dict[str, Any], str, 
     """Partition by spec, subscription, region and resource type; never exceed 50 IDs."""
     for spec in config["metricSpecs"]:
         groups: dict[tuple[str, str, str], list[str]] = {}
+        selected = {item.lower() for item in spec["resourceIds"]} if "resourceIds" in spec else None
         for resource in config["resources"]:
             subscription, resource_type = RESOURCE_PATTERN.fullmatch(resource["id"]).groups()
-            if resource_type.lower() != spec["resourceType"].lower():
+            if resource_type.lower() != spec["resourceType"].lower() or (
+                selected is not None and resource["id"].lower() not in selected
+            ):
                 continue
             groups.setdefault((subscription.lower(), resource["region"].lower(), resource_type.lower()), []).append(resource["id"])
         for (subscription, region, _), ids in groups.items():

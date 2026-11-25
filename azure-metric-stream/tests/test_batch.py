@@ -113,6 +113,22 @@ def normalize(response, aggregation, window):
 
 
 class ConfigTests(unittest.TestCase):
+    def test_metric_spec_limits_heterogeneous_resource_sets(self):
+        cfg = config("state.json")
+        cfg["resources"].append({"id": resource(2), "region": "eastus"})
+        cfg["metricSpecs"][0]["resourceIds"] = [resource(2)]
+        validate_config(cfg)
+        self.assertEqual(list(plan_batches(cfg))[0][3], [resource(2)])
+        cfg["metricSpecs"][0]["resourceIds"] = [resource(2), resource(2)]
+        with self.assertRaisesRegex(ValueError, "resourceIds"):
+            validate_config(cfg)
+        cfg["metricSpecs"][0]["resourceIds"] = [resource(3)]
+        with self.assertRaisesRegex(ValueError, "resourceIds"):
+            validate_config(cfg)
+        cfg["metricSpecs"][0]["resourceIds"] = [resource(1, "applicationGateways")]
+        with self.assertRaisesRegex(ValueError, "resourceIds"):
+            validate_config(cfg)
+
     def test_blob_config_excludes_local_state_and_validates_fields(self):
         cfg = config("state.json")
         cfg.pop("statePath")
