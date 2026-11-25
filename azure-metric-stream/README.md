@@ -53,13 +53,17 @@ docker build -f Dockerfile.batch -t azure-metric-batch:local .
     "fullyQualifiedNamespace": "<namespace>.servicebus.windows.net",
     "name": "<hub-name>"
   },
-  "statePath": "/data/state.json"
+  "stateBlob": {
+    "accountName": "<storage-account>",
+    "containerName": "<checkpoint-container>",
+    "blobName": "batch/state.json"
+  }
 }
 ```
 
 App Gateway 需另配 `Microsoft.Network/applicationGateways` 资源和对应 metricSpec。以目标资源 `metricDefinitions` 核对指标名、聚合和可用维度；每条 spec 仅支持一种聚合和 `PT1M`，维度须显式 wildcard 过滤，`top` 取 1–10000。**达到 `top` 即拒绝推进高水位**：缩小维度过滤器、按维度值拆分查询或调整经过验证的上限后再重放，不能把它当分页。按订阅/区域/类型每批至多 50 个 ID；写失败或 429/5xx 经重试仍失败时不推进高水位，重叠窗口重放在 exporter 端去重。
 
-可选参数：`pollSeconds=60`、`initialLookbackSeconds=600`、`overlapSeconds=180`、`ingestLagSeconds=120`、`maxWindowSeconds=3600`、`httpTimeoutSeconds=30`、`httpMaxAttempts=5`。可选环境变量 `AZURE_CLIENT_ID` 指定用户分配身份、`LOG_LEVEL` 调整日志。Batch 身份须有被查询订阅的 `Monitoring Reader` 和 Event Hub 的 `Azure Event Hubs Data Sender`；OAuth audience 为 Metrics Batch 专用地址。`statePath` 必须为**持久单写入卷**，Batch 容器同样锁定单副本；资源/指标配置变更会触发高水位指纹校验失败，必须事先规划状态迁移/重放。告警包括周期失败、`top` 触顶、限流、Event Hubs 发送失败与消费积压；轮询服务日志不能替代告警。
+可选参数：`pollSeconds=60`、`initialLookbackSeconds=600`、`overlapSeconds=180`、`ingestLagSeconds=120`、`maxWindowSeconds=3600`、`httpTimeoutSeconds=30`、`httpMaxAttempts=5`。可选环境变量 `AZURE_CLIENT_ID` 指定用户分配身份、`LOG_LEVEL` 调整日志。Batch 身份须有被查询订阅的 `Monitoring Reader`、Event Hub 的 `Azure Event Hubs Data Sender`，以及检查点 Blob 容器的 `Storage Blob Data Contributor`；OAuth audience 为 Metrics Batch 专用地址。`stateBlob` 与 `statePath` 二选一：推荐前者以无 Azure Files 卷部署，需预建 Blob 容器、为容器应用配置到 Blob 的网络和私有 DNS 路径，并使用托管身份而非密钥；启动时创建空白检查点 Blob（如果尚不存在）并验证访问。每轮在 Blob 上获取 60 秒独占租约、每 20 秒续租，并在带租约和 ETag 条件的写入成功后推进水位；租约、鉴权、网络、发送或写入失败将使进程报错退出，由 Container Apps 重启，重复发送须依赖 exporter 去重。旧的 `statePath` 模式仍支持，但必须使用**持久单写入卷**。Batch Container App 配置 `minReplicas=maxReplicas=1`，不可缩零；额外副本不能同时持有 Blob 租约。资源/指标配置变更会触发高水位指纹校验失败，必须事先规划状态迁移/重放。告警包括容器重启、周期失败、`top` 触顶、限流、Event Hubs 发送失败与消费积压；轮询服务日志不能替代告警。
 
 ## 审批前检查与回滚
 

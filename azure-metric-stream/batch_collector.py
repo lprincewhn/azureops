@@ -1,14 +1,15 @@
 """Poll regional Azure Metrics Batch endpoints and publish normalized Event Hubs records.
 
 Set BATCH_CONFIG_JSON or BATCH_CONFIG_PATH to a JSON object with resources,
-metricSpecs, eventHub, and statePath. For example, each resource is
+metricSpecs, eventHub, and either statePath or stateBlob. For example, each resource is
 {"id": "/subscriptions/.../resourceGroups/.../providers/Microsoft.Network/loadBalancers/...",
  "region": "eastus"}; a metric spec is
 {"resourceType": "Microsoft.Network/loadBalancers",
  "metricNames": ["DipAvailability"], "aggregation": "Average",
  "dimensions": ["BackendIPAddress"], "filter": "BackendIPAddress eq '*'",
  "top": 100}. The eventHub object has fullyQualifiedNamespace and name.
-The statePath must reside on a persistent, single-writer volume.
+The statePath must reside on a persistent, single-writer volume; stateBlob uses
+Azure Blob Storage with a renewable, cycle-scoped lease instead.
 """
 
 from __future__ import annotations
@@ -19,11 +20,13 @@ import json
 import logging
 import os
 import re
+import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -66,8 +69,22 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("resources must be a nonempty array")
     if not isinstance(specs, list) or not specs:
         raise ValueError("metricSpecs must be a nonempty array")
-    if not isinstance(hub, dict) or not isinstance(state_path, str) or not state_path:
-        raise ValueError("eventHub and persistent statePath are required")
+    state_blob = config.get("stateBlob")
+    if not isinstance(hub, dict):
+        raise ValueError("eventHub is required")
+    if (isinstance(state_path, str) and bool(state_path)) == (state_blob is not None):
+        raise ValueError("Configure exactly one of statePath and stateBlob")
+    if state_blob is not None:
+        if not isinstance(state_blob, dict) or set(state_blob) != {"accountName", "containerName", "blobName"}:
+            raise ValueError("stateBlob requires accountName, containerName and blobName")
+        if not isinstance(state_blob["accountName"], str) or not re.fullmatch(r"[a-z0-9]{3,24}", state_blob["accountName"]):
+            raise ValueError("stateBlob.accountName must be an Azure Storage account name")
+        if not isinstance(state_blob["containerName"], str) or not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{1,61}[a-z0-9])?", state_blob["containerName"]):
+            raise ValueError("stateBlob.containerName must be a valid container name")
+        if not isinstance(state_blob["blobName"], str) or not state_blob["blobName"] or state_blob["blobName"].startswith("/"):
+            raise ValueError("stateBlob.blobName must be a nonempty relative blob name")
+    elif not isinstance(state_path, str) or not state_path:
+        raise ValueError("statePath must be a nonempty path")
     if not re.fullmatch(r"[a-zA-Z0-9.-]+\.servicebus\.windows\.net", str(hub.get("fullyQualifiedNamespace", ""))):
         raise ValueError("eventHub.fullyQualifiedNamespace must be an Azure Event Hubs namespace")
     if not isinstance(hub.get("name"), str) or not hub["name"]:
@@ -284,15 +301,10 @@ def config_fingerprint(config: dict[str, Any]) -> str:
 
 def read_watermark(path: Path, fingerprint: str | None = None) -> datetime | None:
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return None
-    if fingerprint is not None and payload.get("configHash") != fingerprint:
-        raise ValueError("Resource or metric configuration changed; migrate/reset the watermark explicitly")
-    stamp = datetime.fromisoformat(payload["endTime"].replace("Z", "+00:00"))
-    if stamp.tzinfo is None:
-        raise ValueError("State watermark must be timezone aware")
-    return stamp.astimezone(timezone.utc)
+    return parse_watermark(payload, fingerprint)
 
 
 def write_watermark(path: Path, watermark: datetime, fingerprint: str | None = None) -> None:
@@ -324,36 +336,133 @@ def single_writer(path: Path) -> Iterable[None]:
             fcntl.flock(lock, fcntl.LOCK_UN)
 
 
+class BlobState:
+    """Lease the checkpoint through each publish cycle; condition writes on its ETag."""
+
+    def __init__(self, config: dict[str, str], credential: Any) -> None:
+        from azure.core.exceptions import ResourceExistsError, ResourceNotFoundError
+        from azure.storage.blob import BlobLeaseClient, BlobServiceClient
+
+        service = BlobServiceClient(
+            f"https://{config['accountName']}.blob.core.windows.net", credential=credential,
+        )
+        self.blob = service.get_blob_client(config["containerName"], config["blobName"])
+        self.lease_factory = BlobLeaseClient
+        try:
+            self.blob.get_blob_properties()
+        except ResourceNotFoundError:
+            try:
+                self.blob.upload_blob(b"", overwrite=False, if_none_match="*")
+            except ResourceExistsError:
+                pass
+            self.blob.get_blob_properties()
+
+    @contextmanager
+    def cycle(self) -> Iterable[None]:
+        lease = self.lease_factory(self.blob)
+        lease.acquire(lease_duration=60)
+        stopped = threading.Event()
+        failures: list[Exception] = []
+
+        def renew() -> None:
+            while not stopped.wait(20):
+                try:
+                    lease.renew()
+                except Exception as error:
+                    failures.append(error)
+                    LOG.exception("Blob checkpoint lease renewal failed")
+                    return
+
+        worker = threading.Thread(target=renew, name="checkpoint-lease-renewal", daemon=True)
+        self._failures = failures
+        self._lease = lease
+        try:
+            worker.start()
+            yield
+            self.check_lease()
+        finally:
+            stopped.set()
+            if worker.ident is not None:
+                worker.join()
+            active_error = sys.exc_info()[0]
+            try:
+                lease.release()
+            except Exception:
+                if active_error is not None:
+                    LOG.exception("Blob checkpoint lease release failed")
+                else:
+                    raise
+            finally:
+                self._lease = None
+
+    def check_lease(self) -> None:
+        if self._failures:
+            raise RuntimeError("Blob checkpoint lease renewal failed") from self._failures[0]
+
+    def read(self, fingerprint: str) -> datetime | None:
+        self.check_lease()
+        props = self.blob.get_blob_properties(lease=self._lease)
+        self.etag = props.etag
+        payload = self.blob.download_blob(lease=self._lease, if_match=self.etag).readall()
+        self.check_lease()
+        if not payload:
+            return None
+        return parse_watermark(payload, fingerprint)
+
+    def write(self, watermark: datetime, fingerprint: str) -> None:
+        self.check_lease()
+        self.blob.upload_blob(
+            json.dumps({"endTime": utc_stamp(watermark), "configHash": fingerprint}).encode("utf-8"),
+            overwrite=True, if_match=self.etag, lease=self._lease,
+        )
+        self.check_lease()
+
+
+def parse_watermark(payload: str | bytes, fingerprint: str | None = None) -> datetime:
+    data = json.loads(payload)
+    if fingerprint is not None and data.get("configHash") != fingerprint:
+        raise ValueError("Resource or metric configuration changed; migrate/reset the watermark explicitly")
+    stamp = datetime.fromisoformat(data["endTime"].replace("Z", "+00:00"))
+    if stamp.tzinfo is None:
+        raise ValueError("State watermark must be timezone aware")
+    return stamp.astimezone(timezone.utc)
+
+
 def collect_once(
     config: dict[str, Any], client: MetricsBatchClient, producer: Any,
     normalizer: Callable[[dict[str, Any], str, dict[str, str]], Iterable[dict[str, Any]]],
-    event_data_class: type, *, now: datetime | None = None,
+    event_data_class: type, *, now: datetime | None = None, state: BlobState | None = None,
 ) -> int:
     """Advance the durable high-water mark only after every Event Hubs send succeeds."""
-    state_path = Path(config["statePath"])
     now = now or datetime.now(timezone.utc)
     target_end = (now - timedelta(seconds=config["ingestLagSeconds"])).replace(second=0, microsecond=0)
     fingerprint = config_fingerprint(config)
-    watermark = read_watermark(state_path, fingerprint)
-    if watermark is not None and target_end <= watermark:
-        return 0
-    start = (
-        watermark - timedelta(seconds=config["overlapSeconds"]) if watermark
-        else target_end - timedelta(seconds=config["initialLookbackSeconds"])
-    )
-    end = min(target_end, start + timedelta(seconds=config["maxWindowSeconds"]))
-    window = {"startTime": utc_stamp(start), "endTime": utc_stamp(end)}
-    sent = 0
-    for spec, subscription, region, resource_ids in plan_batches(config):
-        response = client.query(request_url(spec, subscription, region, window), resource_ids)
-        guard_batch_response(response, resource_ids, spec)
-        # A normalizer may be a generator: materialize before the first send to catch
-        # malformed records in this API response without publishing part of it.
-        records = list(normalizer(response, spec["aggregation"], window))
-        sent += publish_records(producer, records, event_data_class)
-    write_watermark(state_path, end, fingerprint)
-    LOG.info("Metrics Batch window %s to %s: published %d records", window["startTime"], window["endTime"], sent)
-    return sent
+    with state.cycle() if state is not None else nullcontext():
+        watermark = state.read(fingerprint) if state is not None else read_watermark(Path(config["statePath"]), fingerprint)
+        if watermark is not None and target_end <= watermark:
+            return 0
+        start = (
+            watermark - timedelta(seconds=config["overlapSeconds"]) if watermark
+            else target_end - timedelta(seconds=config["initialLookbackSeconds"])
+        )
+        end = min(target_end, start + timedelta(seconds=config["maxWindowSeconds"]))
+        window = {"startTime": utc_stamp(start), "endTime": utc_stamp(end)}
+        sent = 0
+        for spec, subscription, region, resource_ids in plan_batches(config):
+            if state is not None:
+                state.check_lease()
+            response = client.query(request_url(spec, subscription, region, window), resource_ids)
+            guard_batch_response(response, resource_ids, spec)
+            records = list(normalizer(response, spec["aggregation"], window))
+            if state is not None:
+                state.check_lease()
+            sent += publish_records(producer, records, event_data_class)
+        if state is not None:
+            state.write(end, fingerprint)
+        else:
+            write_watermark(Path(config["statePath"]), end, fingerprint)
+        LOG.info("Metrics Batch window %s to %s: published %d records", window["startTime"], window["endTime"], sent)
+        return sent
 
 
 def main() -> None:
@@ -364,6 +473,7 @@ def main() -> None:
     logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
     config = load_config()
     credential = ManagedIdentityCredential(client_id=os.environ.get("AZURE_CLIENT_ID") or None)
+    state = BlobState(config["stateBlob"], credential) if "stateBlob" in config else None
     client = MetricsBatchClient(
         credential, timeout=config["httpTimeoutSeconds"], attempts=config["httpMaxAttempts"],
     )
@@ -371,12 +481,13 @@ def main() -> None:
         fully_qualified_namespace=config["eventHub"]["fullyQualifiedNamespace"],
         eventhub_name=config["eventHub"]["name"], credential=credential,
     )
-    with single_writer(Path(config["statePath"])), producer:
+    with (nullcontext() if state is not None else single_writer(Path(config["statePath"]))), producer:
         while True:
             try:
-                collect_once(config, client, producer, normalize_batch, EventData)
+                collect_once(config, client, producer, normalize_batch, EventData, state=state)
             except Exception:
-                LOG.exception("Metrics Batch cycle failed; high-water mark retained")
+                LOG.exception("Metrics Batch cycle failed; exiting without advancing the high-water mark")
+                raise
             time.sleep(config["pollSeconds"])
 
 

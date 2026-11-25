@@ -1,14 +1,17 @@
 import io
 import json
+import sys
 import tempfile
+import types
 import unittest
 import urllib.error
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from batch_collector import (
+    BlobState,
     MetricsBatchClient,
     SCOPE,
     collect_once,
@@ -110,6 +113,19 @@ def normalize(response, aggregation, window):
 
 
 class ConfigTests(unittest.TestCase):
+    def test_blob_config_excludes_local_state_and_validates_fields(self):
+        cfg = config("state.json")
+        cfg.pop("statePath")
+        cfg["stateBlob"] = {"accountName": "exampleaccount", "containerName": "checkpoints", "blobName": "batch/state.json"}
+        self.assertEqual(validate_config(cfg)["stateBlob"]["blobName"], "batch/state.json")
+        cfg["statePath"] = "state.json"
+        with self.assertRaisesRegex(ValueError, "exactly one"):
+            validate_config(cfg)
+        cfg.pop("statePath")
+        cfg["stateBlob"]["accountName"] = "bad.account"
+        with self.assertRaisesRegex(ValueError, "accountName"):
+            validate_config(cfg)
+
     def test_partition_by_subscription_region_type_and_50(self):
         cfg = config("state.json")
         cfg["resources"] = [
@@ -311,6 +327,116 @@ class CollectorTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "configuration changed"):
                 collect_once(cfg, client, producer, normalize, EventData,
                              now=initial_now + timedelta(hours=5))
+
+
+class BlobStateTests(unittest.TestCase):
+    def setUp(self):
+        self.cfg = config("unused.json")
+        self.cfg.pop("statePath")
+        self.cfg["stateBlob"] = {
+            "accountName": "exampleaccount", "containerName": "checkpoints", "blobName": "batch/state.json",
+        }
+        self.client = Mock(query=Mock(return_value=batch_response([resource(1)])))
+        self.producer = FakeProducer()
+        self.now = datetime(2026, 11, 25, 4, 0, tzinfo=timezone.utc)
+        self.blob = Mock()
+        self.blob.get_blob_properties.return_value = SimpleNamespace(etag='"etag-1"')
+        self.blob.download_blob.return_value.readall.return_value = b""
+        self.lease = Mock()
+        self.state = object.__new__(BlobState)
+        self.state.blob = self.blob
+        self.state.lease_factory = Mock(return_value=self.lease)
+
+    def collect(self, now=None):
+        return collect_once(
+            self.cfg, self.client, self.producer, normalize, EventData,
+            now=now or self.now, state=self.state,
+        )
+
+    def test_conditional_checkpoint_and_cycle_lease(self):
+        self.assertEqual(self.collect(), 1)
+        self.lease.acquire.assert_called_once_with(lease_duration=60)
+        self.blob.get_blob_properties.assert_called_once_with(lease=self.lease)
+        self.blob.download_blob.assert_called_once_with(lease=self.lease, if_match='"etag-1"')
+        self.blob.upload_blob.assert_called_once()
+        args, kwargs = self.blob.upload_blob.call_args
+        self.assertEqual(kwargs, {"overwrite": True, "if_match": '"etag-1"', "lease": self.lease})
+        self.assertEqual(json.loads(args[0])["endTime"], "2026-11-25T03:58:00.000Z")
+        self.lease.release.assert_called_once()
+
+    def test_send_failure_cannot_write_checkpoint(self):
+        self.producer.fail = True
+        with self.assertRaisesRegex(RuntimeError, "Event Hubs unavailable"):
+            self.collect()
+        self.blob.upload_blob.assert_not_called()
+        self.lease.release.assert_called_once()
+
+    def test_release_failure_does_not_hide_send_failure(self):
+        self.producer.fail = True
+        self.lease.release.side_effect = RuntimeError("release failed")
+        with patch("batch_collector.LOG") as log:
+            with self.assertRaisesRegex(RuntimeError, "Event Hubs unavailable"):
+                self.collect()
+            log.exception.assert_called_once()
+        self.blob.upload_blob.assert_not_called()
+
+    def test_lease_acquisition_and_storage_failure_are_not_hidden(self):
+        self.lease.acquire.side_effect = RuntimeError("lease held")
+        with self.assertRaisesRegex(RuntimeError, "lease held"):
+            self.collect()
+        self.client.query.assert_not_called()
+        self.lease.acquire.side_effect = None
+        self.blob.upload_blob.side_effect = RuntimeError("conditional write rejected")
+        with self.assertRaisesRegex(RuntimeError, "conditional write rejected"):
+            self.collect()
+        self.lease.release.assert_called_once()
+
+    def test_fingerprint_mismatch_and_renewal_failure_fail_closed(self):
+        self.blob.download_blob.return_value.readall.return_value = json.dumps({
+            "endTime": "2026-11-25T03:58:00Z", "configHash": "old",
+        }).encode()
+        with self.assertRaisesRegex(ValueError, "configuration changed"):
+            self.collect()
+        self.client.query.assert_not_called()
+        self.blob.download_blob.return_value.readall.return_value = b""
+        def lose_lease(*args):
+            self.state._failures.append(RuntimeError("renewal lost"))
+            return batch_response([resource(1)])
+
+        self.client.query.side_effect = lose_lease
+        with self.assertRaisesRegex(RuntimeError, "lease renewal failed"):
+            self.collect()
+        self.blob.upload_blob.assert_not_called()
+
+    def test_startup_creates_missing_blob_and_surfaces_auth_errors(self):
+        class NotFound(Exception):
+            pass
+
+        class Exists(Exception):
+            pass
+
+        service = Mock()
+        service.get_blob_client.return_value = self.blob
+        self.blob.get_blob_properties.side_effect = [NotFound(), SimpleNamespace(etag='"etag-1"')]
+        azure = types.ModuleType("azure")
+        core = types.ModuleType("azure.core")
+        exceptions = types.ModuleType("azure.core.exceptions")
+        exceptions.ResourceNotFoundError = NotFound
+        exceptions.ResourceExistsError = Exists
+        storage = types.ModuleType("azure.storage")
+        blob_module = types.ModuleType("azure.storage.blob")
+        blob_module.BlobServiceClient = Mock(return_value=service)
+        blob_module.BlobLeaseClient = Mock()
+        with patch.dict(sys.modules, {
+            "azure": azure, "azure.core": core, "azure.core.exceptions": exceptions,
+            "azure.storage": storage, "azure.storage.blob": blob_module,
+        }):
+            state = BlobState(self.cfg["stateBlob"], Mock())
+            self.assertIs(state.blob, self.blob)
+            self.blob.upload_blob.assert_called_once_with(b"", overwrite=False, if_none_match="*")
+            self.blob.get_blob_properties.side_effect = RuntimeError("authentication or network unavailable")
+            with self.assertRaisesRegex(RuntimeError, "authentication or network"):
+                BlobState(self.cfg["stateBlob"], Mock())
 
 
 if __name__ == "__main__":
